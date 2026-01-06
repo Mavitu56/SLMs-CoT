@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -21,14 +19,39 @@ from stats import StatisticalAnalyst
 
 
 def _tokenizer_compat_key(tokenizer) -> str:
-    """Conservative compatibility key.
+    """Tokenizer compatibility fingerprint.
 
     Scientific validity fix: logits-based KD assumes teacher forward-pass uses the
-    exact same token IDs as the student. We therefore treat tokenizers as
-    compatible only when their `name_or_path` matches.
+    exact same token IDs as the student.
+
+    `name_or_path` differs across model sizes even when the tokenizer is
+    identical (e.g., Qwen2.5 7B vs 3B), so we compare a stable hash of the full
+    vocabulary mapping.
     """
 
-    return str(getattr(tokenizer, "name_or_path", ""))
+    cached = getattr(tokenizer, "_slm_tokenizer_hash", None)
+    if isinstance(cached, str) and cached:
+        return cached
+
+    import hashlib
+
+    vocab = tokenizer.get_vocab()  # token -> id
+    h = hashlib.sha256()
+    h.update(tokenizer.__class__.__name__.encode("utf-8"))
+    h.update(str(len(vocab)).encode("utf-8"))
+    for k in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"):
+        h.update(f"|{k}={getattr(tokenizer, k, None)}".encode("utf-8"))
+    for token, idx in sorted(vocab.items(), key=lambda kv: kv[0]):
+        h.update(token.encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+        h.update(str(int(idx)).encode("utf-8"))
+        h.update(b"\n")
+    digest = h.hexdigest()[:16]
+    try:
+        setattr(tokenizer, "_slm_tokenizer_hash", digest)
+    except Exception:
+        pass
+    return digest
 
 
 def assert_tokenizer_compatible_for_logits_kd(teacher_tokenizer, student_tokenizer, *, context: str) -> None:
@@ -37,9 +60,11 @@ def assert_tokenizer_compatible_for_logits_kd(teacher_tokenizer, student_tokeniz
     if not t or not s or t != s:
         raise ValueError(
             "Configuração cientificamente inválida para logits-KD: "
-            f"tokenizers incompatdveis ({context}). "
-            f"teacher_tokenizer='{t}', student_tokenizer='{s}'. "
-            "Use student compatdvel com o teacher, ou desative logits-KD (--no_logits_kd)."
+            f"tokenizers incompatíveis ({context}). "
+            f"teacher_tokenizer_hash='{t}', student_tokenizer_hash='{s}'. "
+            f"teacher_tokenizer_name='{getattr(teacher_tokenizer, 'name_or_path', None)}', "
+            f"student_tokenizer_name='{getattr(student_tokenizer, 'name_or_path', None)}'. "
+            "Use student compatível com o teacher, ou desative logits-KD (--no_logits_kd)."
         )
 
 
@@ -235,6 +260,7 @@ def run_experiment(
                         max_length=cfg.max_length,
                     )
                     state["teacher_logits_reasoning_dir"] = str(logits_dir_reason)
+
         del teacher_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -249,11 +275,11 @@ def run_experiment(
         for seed in cfg.seeds:
             run_key = f"{cond_name}_seed{seed}"
             if state.get("completed", {}).get(run_key):
-                print(f" Pulando run j completado: {run_key}")
+                print(f" Pulando run já completado: {run_key}")
                 cond_runs.append(state["completed"][run_key])
                 continue
 
-            print(f"\n Condio {cond_name} | seed={seed}")
+            print(f"\n Condição {cond_name} | seed={seed}")
             set_seed(seed)
 
             # Load models
@@ -275,18 +301,25 @@ def run_experiment(
                 cache_dir = teacher_logits_traditional_dir if cond_cfg["mode"] == "traditional" else teacher_logits_reasoning_dir
                 if cache_dir:
                     meta = read_cache_metadata(Path(cache_dir)) or {}
-                    cache_tok = str(meta.get("tokenizer") or "")
-                    stud_tok = _tokenizer_compat_key(student_tok)
-                    if cache_tok and stud_tok and cache_tok != stud_tok:
+                    cache_hash = str(meta.get("tokenizer_hash") or "")
+                    stud_hash = _tokenizer_compat_key(student_tok)
+                    if cache_hash and stud_hash and cache_hash != stud_hash:
                         raise ValueError(
                             "Configuração cientificamente inválida: cache de logits foi gerado com tokenizer diferente do student. "
-                            f"cache_tokenizer='{cache_tok}', student_tokenizer='{stud_tok}'."
+                            f"cache_tokenizer_hash='{cache_hash}', student_tokenizer_hash='{stud_hash}'."
                         )
+                    # Backward-compat for older caches.
+                    if not cache_hash:
+                        cache_tok = str(meta.get("tokenizer") or "")
+                        stud_name = str(getattr(student_tok, "name_or_path", ""))
+                        if cache_tok and stud_name and cache_tok != stud_name:
+                            raise ValueError(
+                                "Configuração cientificamente inválida: cache antigo de logits foi gerado com tokenizer name_or_path diferente. "
+                                f"cache_tokenizer='{cache_tok}', student_tokenizer='{stud_name}'."
+                            )
                 else:
                     if teacher_tok is None:
                         # Load teacher tokenizer just for compatibility check.
-                        from transformers import AutoTokenizer
-
                         teacher_tok = AutoTokenizer.from_pretrained(cfg.model_hierarchy["teacher_medium"])
                     assert_tokenizer_compatible_for_logits_kd(
                         teacher_tok,
@@ -325,7 +358,7 @@ def run_experiment(
                 if not use_logits_kd:
                     raise ValueError(
                         "KD tradicional (logits-based) exige logits-KD habilitado. "
-                        "Desabilitar logits-KD tornaria esta condio um SFT answer-only, "
+                        "Desabilitar logits-KD tornaria esta condição um SFT answer-only, "
                         "o que foge do desenho experimental atual."
                     )
                 distiller = TraditionalKDDistiller(cfg, cache_dir=teacher_logits_traditional_dir)
@@ -394,7 +427,7 @@ def run_experiment(
 
         results["conditions"][cond_name] = {"description": cond_cfg["description"], "runs": cond_runs}
 
-    # Hypothesis testing: compare overall_score across runs (paired by seed)
+    # Hypothesis testing: compare metric across runs (paired by seed)
     if "kd_traditional" in results["conditions"] and "kd_with_reasoning" in results["conditions"]:
         trad = results["conditions"]["kd_traditional"]["runs"]
         reas = results["conditions"]["kd_with_reasoning"]["runs"]
@@ -437,7 +470,7 @@ def run_experiment(
     write_report_json(report_json, results)
     write_summary_txt(summary_txt, results)
 
-    print(" Relatrios salvos:")
+    print(" Relatórios salvos:")
     print(f"   - JSON: {report_json}")
     print(f"   - TXT:  {summary_txt}")
 
@@ -509,7 +542,9 @@ def main(argv: Optional[Sequence[str]] = None):
     cfg.max_length = args.max_length
 
     cfg.eval_generation = GenerationConfig(max_new_tokens=args.eval_max_new_tokens, temperature=args.eval_temperature, do_sample=False)
-    cfg.teacher_cot_generation = GenerationConfig(max_new_tokens=args.teacher_cot_max_new_tokens, temperature=args.teacher_cot_temperature, do_sample=False)
+    cfg.teacher_cot_generation = GenerationConfig(
+        max_new_tokens=args.teacher_cot_max_new_tokens, temperature=args.teacher_cot_temperature, do_sample=False
+    )
 
     enable_gsm8k_train = True
     if args.enable_gsm8k_train:

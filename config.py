@@ -31,9 +31,11 @@ class EvidenceBasedConfig:
 
     model_hierarchy: Dict[str, str] = field(
         default_factory=lambda: {
-            "teacher_medium": "mistralai/Mistral-7B-Instruct-v0.2",
-            "student_primary": "mistralai/Mistral-7B-Instruct-v0.2",
-            "student_small": "google/gemma-2b-it",
+            # Default to a single family to keep logits-KD scientifically valid
+            # (token IDs must match across teacher/student).
+            "teacher_medium": "Qwen/Qwen2.5-7B-Instruct",
+            "student_primary": "Qwen/Qwen2.5-3B-Instruct",
+            "student_small": "Qwen/Qwen2.5-1.5B-Instruct",
         }
     )
 

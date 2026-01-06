@@ -14,6 +14,40 @@ from tqdm.auto import tqdm
 from config import GenerationConfig, ensure_tokenizer_has_pad, get_safe_tokenizer_length, resolve_device, safe_model_to
 
 
+def _tokenizer_fingerprint(tokenizer) -> str:
+    """Stable tokenizer identity hash.
+
+    Scientific validity fix: logits-KD requires token IDs to match between
+    teacher and student. For families like Qwen/Gemma/Llama, different model
+    sizes often share an identical tokenizer even though `name_or_path` differs.
+    """
+
+    cached = getattr(tokenizer, "_slm_tokenizer_hash", None)
+    if isinstance(cached, str) and cached:
+        return cached
+
+    vocab = tokenizer.get_vocab()  # token -> id
+    h = hashlib.sha256()
+    h.update(tokenizer.__class__.__name__.encode("utf-8"))
+    h.update(str(len(vocab)).encode("utf-8"))
+    for k in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"):
+        h.update(f"|{k}={getattr(tokenizer, k, None)}".encode("utf-8"))
+
+    # Full mapping hash (deterministic order).
+    for token, idx in sorted(vocab.items(), key=lambda kv: kv[0]):
+        h.update(token.encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+        h.update(str(int(idx)).encode("utf-8"))
+        h.update(b"\n")
+
+    digest = h.hexdigest()[:16]
+    try:
+        setattr(tokenizer, "_slm_tokenizer_hash", digest)
+    except Exception:
+        pass
+    return digest
+
+
 def _dataset_fingerprint(dataset: Any, *, text_key: str = "text", max_examples: int = 128) -> str:
     """Best-effort dataset fingerprint for cache invalidation.
 
@@ -132,6 +166,9 @@ def cache_teacher_logits(
         "kind": "teacher_logits",
         "teacher": getattr(teacher_model, "name_or_path", None),
         "tokenizer": getattr(tokenizer, "name_or_path", None),
+        "tokenizer_hash": _tokenizer_fingerprint(tokenizer),
+        "tokenizer_class": tokenizer.__class__.__name__,
+        "tokenizer_vocab_size": int(len(tokenizer.get_vocab())),
         "max_length": effective_max_len,
         "batch_size": batch_size,
         "device": device,
@@ -214,6 +251,9 @@ def cache_teacher_cot(
         "kind": "teacher_cot",
         "teacher": getattr(teacher_model, "name_or_path", None),
         "tokenizer": getattr(tokenizer, "name_or_path", None),
+        "tokenizer_hash": _tokenizer_fingerprint(tokenizer),
+        "tokenizer_class": tokenizer.__class__.__name__,
+        "tokenizer_vocab_size": int(len(tokenizer.get_vocab())),
         "batch_size": batch_size,
         "device": device,
         "split": split,
