@@ -397,9 +397,28 @@ class ReasoningAwareDistiller:
 
         tok_vocab = len(student_tokenizer)
         model_vocab = student_model.get_input_embeddings().weight.size(0)
-        if tok_vocab != model_vocab:
-            print(f" Resizing student embeddings: tokenizer={tok_vocab}, model={model_vocab}")
+        # Only resize when tokenizer requires *more* tokens than the model provides.
+        # Many HF models reserve extra logits rows; shrinking can be unsupported and
+        # can desync output vocab size vs embeddings.
+        if tok_vocab > model_vocab:
+            print(f" Resizing student embeddings (expand): tokenizer={tok_vocab}, model={model_vocab}")
             student_model.resize_token_embeddings(tok_vocab)
+
+        # Training stability + memory: disable KV cache and enable gradient checkpointing.
+        try:
+            student_model.config.use_cache = False
+        except Exception:
+            pass
+        try:
+            student_model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+
+        # If the base model is 4-bit/8-bit, use PEFT k-bit preparation (QLoRA style).
+        if getattr(student_model, "is_loaded_in_4bit", False) or getattr(student_model, "is_loaded_in_8bit", False):
+            from peft import prepare_model_for_kbit_training
+
+            student_model = prepare_model_for_kbit_training(student_model)
 
         lora_cfg = LoraConfig(
             r=self.config.kd_params["lora_rank"],
@@ -415,8 +434,15 @@ class ReasoningAwareDistiller:
         if teacher_model is not None:
             teacher_model.eval()
             teacher_model = safe_model_to(teacher_model, device)
+            try:
+                teacher_model.config.use_cache = False
+            except Exception:
+                pass
 
-        dataloader = DataLoader(dataset, batch_size=self.config.kd_params["batch_size"], shuffle=True, pin_memory=True, num_workers=2)
+        batch_size = int(self.config.kd_params.get("batch_size", 2))
+        grad_accum_steps = int(self.config.kd_params.get("grad_accum_steps", 1))
+        num_workers = int(self.config.kd_params.get("dataloader_num_workers", 0))
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=num_workers)
 
         num_epochs = self.config.kd_params["epochs"]
         num_training_steps = num_epochs * len(dataloader)
@@ -440,7 +466,9 @@ class ReasoningAwareDistiller:
             temperature = get_schedule_value(temperature_schedule, epoch, default=1.0)
             alpha = get_schedule_value(alpha_schedule, epoch, default=0.5)
 
-            for batch in tqdm(dataloader, desc=f"CoT KD Epoch {epoch}"):
+            optimizer.zero_grad(set_to_none=True)
+
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"CoT KD Epoch {epoch}")):
                 inputs = {
                     "input_ids": batch["input_ids"].to(device),
                     "attention_mask": batch["attention_mask"].to(device),
@@ -448,20 +476,21 @@ class ReasoningAwareDistiller:
                 labels = batch["labels"].to(device)
                 reasoning_mask = batch["reasoning_mask"].to(device)
 
-                vocab_size = student_model.get_input_embeddings().weight.size(0)
-                labels = labels.long().clamp(min=-100, max=vocab_size - 1)
-                labels, _san = sanitize_labels_for_ce(labels, vocab_size)
-
-                if "teacher_logits" in batch:
-                    teacher_logits = self._align_teacher_logits(batch["teacher_logits"].to(device), vocab_size)
-                else:
-                    with torch.inference_mode():
-                        teacher_logits = teacher_model(**inputs).logits
-
                 with autocast():
                     s_logits = student_model(**inputs).logits
                     vocab_size = s_logits.size(-1)
-                    ce_loss = F.cross_entropy(s_logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=-100)
+
+                    labels_ce = labels.long().clamp(min=-100, max=vocab_size - 1)
+                    labels_ce, _san = sanitize_labels_for_ce(labels_ce, vocab_size)
+
+                    if "teacher_logits" in batch:
+                        teacher_logits = batch["teacher_logits"].to(device)
+                    else:
+                        with torch.inference_mode():
+                            teacher_logits = teacher_model(**inputs).logits
+                    teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
+
+                    ce_loss = F.cross_entropy(s_logits.reshape(-1, vocab_size), labels_ce.reshape(-1), ignore_index=-100)
                     t_probs = F.softmax(teacher_logits / temperature, dim=-1)
                     s_logp = F.log_softmax(s_logits / temperature, dim=-1)
                     token_kl = F.kl_div(s_logp, t_probs, reduction="none")
@@ -470,13 +499,19 @@ class ReasoningAwareDistiller:
                     kd_loss *= temperature**2
                     loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
 
+                    if grad_accum_steps > 1:
+                        loss = loss / float(grad_accum_steps)
+
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+
+                do_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(dataloader))
+                if do_step:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                 metrics["losses"].append(float(loss.item()))
                 metrics["kd_losses"].append(float(kd_loss.item()))
