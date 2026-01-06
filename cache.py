@@ -147,10 +147,10 @@ def cache_teacher_logits(
 
     out_dir = resolve_versioned_cache_dir(cache_root, "teacher_logits", metadata)
     if (out_dir / "metadata.json").exists() and list(out_dir.glob("teacher_logits_shard_*.pt")):
-        print(f" Reutilizando cache de logits: {out_dir}")
+        print(f" Reutilizando cache de logits: {out_dir}")
         return out_dir
 
-    print(f" Gerando cache de logits: {out_dir}")
+    print(f" Gerando cache de logits: {out_dir}")
     write_cache_metadata(out_dir, metadata)
 
     target_device = resolve_device(device)
@@ -228,10 +228,10 @@ def cache_teacher_cot(
     out_file = out_dir / "teacher_cot.jsonl"
 
     if out_file.exists() and (out_dir / "metadata.json").exists():
-        print(f" Reutilizando cache de CoT: {out_file}")
+        print(f" Reutilizando cache de CoT: {out_file}")
         return out_file
 
-    print(f" Gerando cache de CoT: {out_file}")
+    print(f" Gerando cache de CoT: {out_file}")
     write_cache_metadata(out_dir, metadata)
 
     target_device = resolve_device(device)

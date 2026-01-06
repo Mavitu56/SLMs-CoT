@@ -211,7 +211,7 @@ def run_experiment(
             # Reasoning-aware mode cache requires teacher CoT first.
             if "reasoning" in kd_modes:
                 if not state.get("teacher_cot_file"):
-                    print(" (info) cache_logits para reasoning exige cache_cot; pulando logits do reasoning.")
+                    print(" (info) cache_logits para reasoning exige cache_cot; pulando logits do reasoning.")
                 else:
                     from distill import build_reasoning_full_sequences_from_cot
 
@@ -249,11 +249,11 @@ def run_experiment(
         for seed in cfg.seeds:
             run_key = f"{cond_name}_seed{seed}"
             if state.get("completed", {}).get(run_key):
-                print(f" Pulando run j  completado: {run_key}")
+                print(f" Pulando run j  completado: {run_key}")
                 cond_runs.append(state["completed"][run_key])
                 continue
 
-            print(f"\n Condi o {cond_name} | seed={seed}")
+            print(f"\n Condi o {cond_name} | seed={seed}")
             set_seed(seed)
 
             # Load models
@@ -372,7 +372,7 @@ def run_experiment(
             save_dir.mkdir(parents=True, exist_ok=True)
             trained_model.save_pretrained(save_dir)
             student_tok.save_pretrained(save_dir)
-            print(f" Modelo salvo em: {save_dir}")
+            print(f" Modelo salvo em: {save_dir}")
 
             run_payload = {
                 "seed": seed,
@@ -437,7 +437,7 @@ def run_experiment(
     write_report_json(report_json, results)
     write_summary_txt(summary_txt, results)
 
-    print(" Relat rios salvos:")
+    print(" Relat rios salvos:")
     print(f"   - JSON: {report_json}")
     print(f"   - TXT:  {summary_txt}")
 
