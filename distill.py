@@ -145,6 +145,22 @@ class TraditionalKDDistiller:
         tokenized = preprocess_and_tokenize(raw_dataset, student_tokenizer, max_length=self.config.max_length)
         student_model = self._ensure_vocab_alignment(student_model, student_tokenizer)
 
+        # Training stability + memory: disable KV cache and enable gradient checkpointing.
+        try:
+            student_model.config.use_cache = False
+        except Exception:
+            pass
+        try:
+            student_model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+
+        # If the base model is 4-bit/8-bit, use PEFT k-bit preparation (QLoRA style).
+        if getattr(student_model, "is_loaded_in_4bit", False) or getattr(student_model, "is_loaded_in_8bit", False):
+            from peft import prepare_model_for_kbit_training
+
+            student_model = prepare_model_for_kbit_training(student_model)
+
         lora_cfg = LoraConfig(
             r=self.config.kd_params["lora_rank"],
             lora_alpha=32,
@@ -160,10 +176,16 @@ class TraditionalKDDistiller:
         if teacher_model is not None:
             teacher_model.eval()
             teacher_model = safe_model_to(teacher_model, device)
+            try:
+                teacher_model.config.use_cache = False
+            except Exception:
+                pass
 
-        batch_size = self.config.kd_params["batch_size"]
+        batch_size = int(self.config.kd_params.get("batch_size", 2))
+        grad_accum_steps = int(self.config.kd_params.get("grad_accum_steps", 1))
+        num_workers = int(self.config.kd_params.get("dataloader_num_workers", 0))
         shuffle_data = not cache_available
-        dataloader = DataLoader(tokenized, batch_size=batch_size, shuffle=shuffle_data, pin_memory=True, num_workers=2)
+        dataloader = DataLoader(tokenized, batch_size=batch_size, shuffle=shuffle_data, pin_memory=True, num_workers=num_workers)
 
         teacher_logits_cache = None
         shard_iter = None
@@ -185,6 +207,7 @@ class TraditionalKDDistiller:
             num_warmup_steps=warmup_steps,
             num_training_steps=num_training_steps,
         )
+        # AMP: keep existing fp16 scaler behavior for compatibility.
         scaler = GradScaler()
 
         temperature_schedule = self.config.kd_params.get("temperature_schedule") or [3.0]
@@ -197,6 +220,7 @@ class TraditionalKDDistiller:
             temperature = get_schedule_value(temperature_schedule, epoch, default=3.0)
             alpha = get_schedule_value(alpha_schedule, epoch, default=0.7)
 
+            optimizer.zero_grad(set_to_none=True)
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"KD Tradicional Epoch {epoch}")):
                 inputs = {k: v.to(device) for k, v in batch.items() if k in ("input_ids", "attention_mask")}
                 labels = batch["labels"].to(device)
@@ -230,18 +254,25 @@ class TraditionalKDDistiller:
                     kd_loss *= temperature**2
                     loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
 
+                    if grad_accum_steps > 1:
+                        loss = loss / float(grad_accum_steps)
+
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+
+                do_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(dataloader))
+                if do_step:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                 metrics["losses"].append(float(loss.item()))
                 metrics["kd_losses"].append(float(kd_loss.item()))
                 metrics["ce_losses"].append(float(ce_loss.item()))
-                epoch_loss += float(loss.item())
+                # Track unscaled loss for reporting.
+                epoch_loss += float((loss.item() * grad_accum_steps) if grad_accum_steps > 1 else loss.item())
 
             print(f" KD Tradicional - poca {epoch}: Loss = {epoch_loss / max(1, len(dataloader)):.4f}")
 

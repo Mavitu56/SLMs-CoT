@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -486,6 +487,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--train_limit", type=int, default=None)
     p.add_argument("--max_length", type=int, default=512)
 
+    p.add_argument("--batch_size", type=int, default=None, help="Micro-batch size (default from config)")
+    p.add_argument("--grad_accum_steps", type=int, default=None, help="Gradient accumulation steps (default from config)")
+    p.add_argument("--epochs", type=int, default=None, help="Training epochs (default from config)")
+
+    p.add_argument("--load_in_4bit", action="store_true", help="Enable 4-bit loading (QLoRA-style when combined with LoRA)")
+    p.add_argument("--no_load_in_4bit", action="store_true", help="Disable 4-bit loading")
+
     # Scientific control fix: explicit enable/disable flags; no default=True store_true.
     p.add_argument("--enable_gsm8k_train", action="store_true", help="Use GSM8K train split for training")
     p.add_argument("--disable_gsm8k_train", action="store_true", help="Disable GSM8K training")
@@ -532,6 +540,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None):
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args = build_arg_parser().parse_args(argv)
     cfg = EvidenceBasedConfig()
 
@@ -540,6 +549,18 @@ def main(argv: Optional[Sequence[str]] = None):
     if args.train_limit is not None:
         cfg.train_limit = args.train_limit
     cfg.max_length = args.max_length
+
+    if args.batch_size is not None:
+        cfg.kd_params["batch_size"] = int(args.batch_size)
+    if args.grad_accum_steps is not None:
+        cfg.kd_params["grad_accum_steps"] = int(args.grad_accum_steps)
+    if args.epochs is not None:
+        cfg.kd_params["epochs"] = int(args.epochs)
+
+    if args.load_in_4bit:
+        cfg.quantization["load_in_4bit"] = True
+    if args.no_load_in_4bit:
+        cfg.quantization["load_in_4bit"] = False
 
     cfg.eval_generation = GenerationConfig(max_new_tokens=args.eval_max_new_tokens, temperature=args.eval_temperature, do_sample=False)
     cfg.teacher_cot_generation = GenerationConfig(

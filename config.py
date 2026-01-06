@@ -58,7 +58,10 @@ class EvidenceBasedConfig:
             "learning_rates": {"kd": 5e-5},
             "lora_rank": 16,
             "epochs": 4,
-            "batch_size": 12,
+            # Qwen vocab (~150k) makes (B,T,V) losses memory-heavy; keep micro-batch small.
+            "batch_size": 2,
+            "grad_accum_steps": 6,
+            "dataloader_num_workers": 0,
         }
     )
 
