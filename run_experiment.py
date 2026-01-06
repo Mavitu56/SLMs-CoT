@@ -249,11 +249,11 @@ def run_experiment(
         for seed in cfg.seeds:
             run_key = f"{cond_name}_seed{seed}"
             if state.get("completed", {}).get(run_key):
-                print(f" Pulando run j  completado: {run_key}")
+                print(f" Pulando run j completado: {run_key}")
                 cond_runs.append(state["completed"][run_key])
                 continue
 
-            print(f"\n Condi o {cond_name} | seed={seed}")
+            print(f"\n Condio {cond_name} | seed={seed}")
             set_seed(seed)
 
             # Load models
@@ -325,7 +325,7 @@ def run_experiment(
                 if not use_logits_kd:
                     raise ValueError(
                         "KD tradicional (logits-based) exige logits-KD habilitado. "
-                        "Desabilitar logits-KD tornaria esta condi o um SFT answer-only, "
+                        "Desabilitar logits-KD tornaria esta condio um SFT answer-only, "
                         "o que foge do desenho experimental atual."
                     )
                 distiller = TraditionalKDDistiller(cfg, cache_dir=teacher_logits_traditional_dir)
@@ -437,7 +437,7 @@ def run_experiment(
     write_report_json(report_json, results)
     write_summary_txt(summary_txt, results)
 
-    print(" Relat rios salvos:")
+    print(" Relatrios salvos:")
     print(f"   - JSON: {report_json}")
     print(f"   - TXT:  {summary_txt}")
 
