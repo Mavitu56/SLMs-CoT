@@ -389,6 +389,13 @@ def run_experiment(
                     use_logits_cache=bool(use_logits_kd and teacher_logits_reasoning_dir),
                 )
 
+            # Save model immediately after training (before potentially long eval).
+            save_dir = cfg.models_dir / exp_id / f"{cond_name}_seed{seed}"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            trained_model.save_pretrained(save_dir)
+            student_tok.save_pretrained(save_dir)
+            print(f" Modelo salvo em: {save_dir}")
+
             # Eval
             eval_results = evaluator.evaluate(
                 trained_model,
@@ -400,13 +407,6 @@ def run_experiment(
                 use_cot_prompt=use_cot_prompt_eval,
                 generation_cfg=cfg.eval_generation,
             )
-
-            # Save model (single save)
-            save_dir = cfg.models_dir / exp_id / f"{cond_name}_seed{seed}"
-            save_dir.mkdir(parents=True, exist_ok=True)
-            trained_model.save_pretrained(save_dir)
-            student_tok.save_pretrained(save_dir)
-            print(f" Modelo salvo em: {save_dir}")
 
             run_payload = {
                 "seed": seed,

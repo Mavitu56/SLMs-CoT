@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -22,12 +21,23 @@ def _iter_model_dirs(paths: Sequence[str], recursive: bool) -> List[Path]:
     out: List[Path] = []
     for p in paths:
         root = Path(p)
-        if root.is_dir() and (root / "config.json").exists():
+        if not root.exists():
+            continue
+        if root.is_dir() and ((root / "config.json").exists() or (root / "adapter_config.json").exists()):
             out.append(root)
             continue
 
+        if root.is_dir():
+            # Common case: a root directory containing many model subfolders.
+            for cand in root.glob("*/config.json"):
+                out.append(cand.parent)
+            for cand in root.glob("*/adapter_config.json"):
+                out.append(cand.parent)
+
         if root.is_dir() and recursive:
             for cand in root.rglob("config.json"):
+                out.append(cand.parent)
+            for cand in root.rglob("adapter_config.json"):
                 out.append(cand.parent)
 
     # De-dup while preserving order
@@ -43,6 +53,8 @@ def _iter_model_dirs(paths: Sequence[str], recursive: bool) -> List[Path]:
 
 
 def _load_model_and_tokenizer(model_dir: Path, device: torch.device, load_dtype: str) -> Tuple[Any, Any]:
+    """Load either a full HF model dir (config.json) or a PEFT adapter dir (adapter_config.json)."""
+
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
     model_kwargs: Dict[str, Any] = {}
@@ -54,11 +66,42 @@ def _load_model_and_tokenizer(model_dir: Path, device: torch.device, load_dtype:
         elif load_dtype == "fp32":
             model_kwargs["torch_dtype"] = torch.float32
 
-    model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
-    model = model.to(device)
-    ensure_tokenizer_has_pad(tokenizer, model)
-    model.eval()
-    return model, tokenizer
+    if (model_dir / "config.json").exists():
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
+        model = model.to(device)
+        ensure_tokenizer_has_pad(tokenizer, model)
+        model.eval()
+        return model, tokenizer
+
+    if (model_dir / "adapter_config.json").exists():
+        # Adapter-only save (PEFT/LoRA). Load base model and attach adapter.
+        import json
+
+        adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+        base_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+        if not base_name:
+            raise ValueError(
+                f"adapter_config.json em {model_dir} não contém 'base_model_name_or_path'. "
+                "Não é possível carregar o modelo base para avaliação."
+            )
+
+        base_model = AutoModelForCausalLM.from_pretrained(base_name, **model_kwargs)
+        try:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(base_model, model_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                "Falha ao carregar adapter PEFT. Instale 'peft' e verifique compatibilidade do adapter com o modelo base. "
+                f"Erro: {exc}"
+            )
+
+        model = model.to(device)
+        ensure_tokenizer_has_pad(tokenizer, model)
+        model.eval()
+        return model, tokenizer
+
+    raise ValueError(f"Diretório não parece ser um modelo HF nem um adapter PEFT: {model_dir}")
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -145,10 +188,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model_paths.append(args.models_root)
 
     model_dirs = _iter_model_dirs(model_paths, recursive=bool(args.recursive))
+
+    # Friendly fallback: if user passed a models_root but forgot --recursive, try it.
+    if not model_dirs and args.models_root and not args.recursive:
+        print("[eval] Nenhum model_dir encontrado sem --recursive; tentando busca recursiva...")
+        model_dirs = _iter_model_dirs(model_paths, recursive=True)
+
     if not model_dirs:
-        raise SystemExit(
-            "Nenhum model_dir encontrado. Use --model_dir /path/to/model ou --models_root /path/to/models --recursive."
-        )
+        debug_lines = ["Nenhum model_dir encontrado.", "Paths inspecionados:"]
+        for p in model_paths:
+            root = Path(p)
+            debug_lines.append(f"  - {root} (exists={root.exists()}, is_dir={root.is_dir()})")
+        debug_lines.append("")
+        debug_lines.append("Dicas:")
+        debug_lines.append("  - Se você passou uma pasta raiz com vários modelos, use --models_root <pasta> --recursive")
+        debug_lines.append("  - Um model_dir válido é uma pasta que contém config.json (save_pretrained do HF)")
+        raise SystemExit("\n".join(debug_lines))
 
     # Flags (match run_experiment defaults unless overridden)
     eval_gsm8k = True
