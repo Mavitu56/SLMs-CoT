@@ -10,6 +10,32 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 
 
+def _default_drive_root() -> Path:
+    env = os.environ.get("SLM_DRIVE_ROOT")
+    if env:
+        return Path(env)
+
+    # Colab convention.
+    colab_drive = Path("/content/drive/MyDrive")
+    if colab_drive.exists():
+        return colab_drive / "SLM_results"
+
+    # Fallbacks for non-Colab runs (e.g., local dev/Windows).
+    if os.name == "nt":
+        return Path.cwd() / "SLM_results"
+    if Path("/content").exists():
+        return Path("/content/SLM_results")
+    return Path.cwd() / "SLM_results"
+
+
+def _is_colab_drive_mounted() -> bool:
+    # In Colab, /content/drive is a mount point when Drive is mounted.
+    try:
+        return os.path.ismount("/content/drive") and Path("/content/drive/MyDrive").is_dir()
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class GenerationConfig:
     """Explicit generation parameters to make runs & caches traceable."""
@@ -82,7 +108,7 @@ class EvidenceBasedConfig:
     )
 
     # Output
-    drive_root: Path = Path("/content/drive/MyDrive/SLM_results")
+    drive_root: Path = field(default_factory=_default_drive_root)
     output_dir: Path = field(init=False)
     models_dir: Path = field(init=False)
     reports_dir: Path = field(init=False)
@@ -110,6 +136,19 @@ class EvidenceBasedConfig:
 
     def __post_init__(self) -> None:
         self.drive_root = Path(self.drive_root)
+
+        # If user points to Colab Drive but it isn't mounted, don't silently
+        # pretend it is Drive (it becomes ephemeral storage under /content).
+        drive_str = str(self.drive_root)
+        if drive_str.startswith("/content/drive") and not _is_colab_drive_mounted():
+            fallback = Path("/content/SLM_results")
+            print(
+                "[WARN] Google Drive não parece estar montado em /content/drive. "
+                f"Resultados NÃO serão sincronizados com o Drive. Salvando em: {fallback}. "
+                "Para salvar no Drive: from google.colab import drive; drive.mount('/content/drive')"
+            )
+            self.drive_root = fallback
+
         self.output_dir = self.drive_root / "scientific_results"
         self.models_dir = self.output_dir / "models"
         self.reports_dir = self.output_dir / "reports"
@@ -122,13 +161,24 @@ class EvidenceBasedConfig:
             self.cache_dir,
             self.experiments_dir,
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                raise RuntimeError(f"Falha ao criar diretório de saída: {path}. Erro: {e}")
 
     def to_metadata(self) -> Dict[str, Any]:
         """Metadata snapshot for reports and cache versioning."""
 
         return {
             "timestamp": datetime.now().isoformat(),
+            "output_paths": {
+                "drive_root": str(self.drive_root),
+                "output_dir": str(self.output_dir),
+                "models_dir": str(self.models_dir),
+                "reports_dir": str(self.reports_dir),
+                "cache_dir": str(self.cache_dir),
+                "experiments_dir": str(self.experiments_dir),
+            },
             "model_hierarchy": dict(self.model_hierarchy),
             "max_length": self.max_length,
             "train_limit": self.train_limit,

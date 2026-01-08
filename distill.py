@@ -8,7 +8,6 @@ import os
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from tqdm.auto import tqdm
 from transformers import get_scheduler
@@ -19,6 +18,43 @@ from config import (
     safe_model_to,
     set_seed,
 )
+
+
+def _resolve_amp_device_type(device: torch.device) -> str:
+    try:
+        dtype = getattr(device, "type", None)
+        return str(dtype) if dtype else "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def make_grad_scaler(device: torch.device):
+    device_type = _resolve_amp_device_type(device)
+    enabled = device_type == "cuda"
+    try:
+        from torch import amp as torch_amp
+
+        try:
+            return torch_amp.GradScaler(device_type=device_type, enabled=enabled)
+        except TypeError:
+            return torch_amp.GradScaler(device_type, enabled=enabled)
+    except Exception:
+        from torch.cuda.amp import GradScaler as CudaGradScaler
+
+        return CudaGradScaler(enabled=enabled)
+
+
+def autocast_ctx(device: torch.device):
+    device_type = _resolve_amp_device_type(device)
+    enabled = device_type == "cuda"
+    try:
+        from torch import amp as torch_amp
+
+        return torch_amp.autocast(device_type=device_type, enabled=enabled)
+    except Exception:
+        from torch.cuda.amp import autocast as cuda_autocast
+
+        return cuda_autocast(enabled=enabled)
 
 
 def preprocess_and_tokenize(raw_dataset, tokenizer, max_length: int):
@@ -207,8 +243,8 @@ class TraditionalKDDistiller:
             num_warmup_steps=warmup_steps,
             num_training_steps=num_training_steps,
         )
-        # AMP: keep existing fp16 scaler behavior for compatibility.
-        scaler = GradScaler()
+        # AMP: prefer torch.amp (new API) with backward-compatible fallback.
+        scaler = make_grad_scaler(device)
 
         temperature_schedule = self.config.kd_params.get("temperature_schedule") or [3.0]
         alpha_schedule = self.config.kd_params.get("alpha_schedule") or [0.7]
@@ -242,7 +278,7 @@ class TraditionalKDDistiller:
                         t_out = teacher_model(**inputs)
                         teacher_logits = self._align_teacher_logits(t_out.logits, vocab_size)
 
-                with autocast():
+                with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
                     vocab_size = s_logits.size(-1)
                     ce_loss = F.cross_entropy(s_logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=-100)
@@ -455,7 +491,7 @@ class ReasoningAwareDistiller:
             num_warmup_steps=warmup_steps,
             num_training_steps=num_training_steps,
         )
-        scaler = GradScaler()
+        scaler = make_grad_scaler(device)
 
         temperature_schedule = self.config.kd_params.get("temperature_schedule") or [1.0]
         alpha_schedule = self.config.kd_params.get("alpha_schedule") or [0.5]
@@ -476,7 +512,7 @@ class ReasoningAwareDistiller:
                 labels = batch["labels"].to(device)
                 reasoning_mask = batch["reasoning_mask"].to(device)
 
-                with autocast():
+                with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
                     vocab_size = s_logits.size(-1)
 

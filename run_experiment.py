@@ -15,7 +15,7 @@ from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_p
 from data import load_training_dataset
 from distill import ReasoningAwareDistiller, TraditionalKDDistiller
 from eval import StandardizedEvaluator
-from report import ScientificLogger, write_report_json, write_summary_txt
+from report import ScientificLogger, write_plots, write_report_json, write_summary_txt
 from stats import StatisticalAnalyst
 
 
@@ -402,7 +402,7 @@ def run_experiment(
             )
 
             # Save model (single save)
-            save_dir = cfg.models_dir / f"{cond_name}_seed{seed}"
+            save_dir = cfg.models_dir / exp_id / f"{cond_name}_seed{seed}"
             save_dir.mkdir(parents=True, exist_ok=True)
             trained_model.save_pretrained(save_dir)
             student_tok.save_pretrained(save_dir)
@@ -465,21 +465,47 @@ def run_experiment(
         }
 
     # Reports
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     report_json = cfg.reports_dir / f"comprehensive_report_{exp_id}_{timestamp}.json"
     summary_txt = cfg.reports_dir / f"results_summary_{exp_id}_{timestamp}.txt"
+
+    results.setdefault("artifacts", {})
+    results["artifacts"].update(
+        {
+            "experiment_id": exp_id,
+            "experiment_dir": str(exp_dir),
+            "report_json": str(report_json),
+            "summary_txt": str(summary_txt),
+        }
+    )
+
     write_report_json(report_json, results)
     write_summary_txt(summary_txt, results)
+
+    plot_paths = write_plots(cfg.reports_dir, results, prefix=f"plots_{exp_id}_{timestamp}")
+    results["artifacts"]["plots"] = [str(p) for p in plot_paths]
+    # Update JSON to include plot artifacts.
+    write_report_json(report_json, results)
 
     print(" Relatórios salvos:")
     print(f"   - JSON: {report_json}")
     print(f"   - TXT:  {summary_txt}")
+    if plot_paths:
+        print("   - PLOTS:")
+        for p in plot_paths:
+            print(f"     * {p}")
 
     return results
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="H1 experiment: KD traditional vs CoT-aware KD")
+    p.add_argument(
+        "--drive_root",
+        type=str,
+        default=None,
+        help="Output root directory. In Colab, use /content/drive/MyDrive/SLM_results (requires drive.mount).",
+    )
     p.add_argument("--kd_modes", nargs="+", default=["traditional", "reasoning"], choices=["traditional", "reasoning"])
     p.add_argument("--student", default="student_primary", choices=["student_primary", "student_small"])
 
@@ -542,7 +568,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None):
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args = build_arg_parser().parse_args(argv)
-    cfg = EvidenceBasedConfig()
+    cfg = EvidenceBasedConfig(drive_root=Path(args.drive_root)) if args.drive_root else EvidenceBasedConfig()
 
     if args.seeds:
         cfg.seeds = list(args.seeds)
