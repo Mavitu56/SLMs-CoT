@@ -56,6 +56,7 @@ def _load_model_and_tokenizer(model_dir: Path, device: torch.device, load_dtype:
     """Load either a full HF model dir (config.json) or a PEFT adapter dir (adapter_config.json)."""
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer_len = len(tokenizer)
 
     model_kwargs: Dict[str, Any] = {}
     if load_dtype and load_dtype != "auto":
@@ -86,6 +87,17 @@ def _load_model_and_tokenizer(model_dir: Path, device: torch.device, load_dtype:
             )
 
         base_model = AutoModelForCausalLM.from_pretrained(base_name, **model_kwargs)
+
+        # If the adapter was saved with resized embeddings (PEFT may do this when
+        # tokenizer/model vocab sizes diverge), ensure the base model matches the
+        # tokenizer *before* loading adapter weights.
+        try:
+            emb = base_model.get_input_embeddings()
+            if emb is not None and emb.weight.shape[0] != tokenizer_len:
+                base_model.resize_token_embeddings(tokenizer_len)
+        except Exception:
+            # Best-effort; if resize isn't supported, loading may still fail.
+            pass
         try:
             from peft import PeftModel
 
