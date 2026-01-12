@@ -17,6 +17,83 @@ from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_p
 from prompts import build_cascod_answer_prompt, build_cascod_rationale_prompt
 
 
+def _batched_generate_continuations(
+    model,
+    tokenizer,
+    prompts: List[str],
+    *,
+    device: torch.device,
+    max_length: int,
+    gen_cfg: GenerationConfig,
+    max_new_tokens: int,
+    pad_token_id: Optional[int],
+    batch_size: int,
+) -> Tuple[List[str], List[int]]:
+    """Generate continuations for a list of prompts in micro-batches.
+
+    Returns:
+      - continuations: decoded text of generated tokens *after* the prompt
+      - cont_token_lens: generated token counts (output_len - input_len)
+
+    This avoids per-example Python overhead and avoids brittle substring slicing
+    by using token-level prompt lengths.
+    """
+
+    if not prompts:
+        return [], []
+
+    batch_size = max(1, int(batch_size or 1))
+    continuations: List[str] = []
+    cont_token_lens: List[int] = []
+
+    # Ensure eval mode.
+    try:
+        model.eval()
+    except Exception:
+        pass
+
+    for start in range(0, len(prompts), batch_size):
+        chunk = prompts[start : start + batch_size]
+        enc = tokenizer(
+            chunk,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=int(max_length),
+        )
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        input_lens = None
+        if attention_mask is not None:
+            input_lens = attention_mask.sum(dim=1)
+
+        with torch.inference_mode():
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=int(max_new_tokens),
+                temperature=float(gen_cfg.temperature),
+                do_sample=bool(gen_cfg.do_sample),
+                top_p=gen_cfg.top_p,
+                top_k=gen_cfg.top_k,
+                pad_token_id=pad_token_id,
+                repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
+            )
+
+        # Slice continuations using per-row prompt length.
+        for row in range(int(outputs.shape[0])):
+            in_len = int(input_lens[row].item()) if input_lens is not None else int(input_ids.shape[1])
+            out_row = outputs[row]
+            cont_ids = out_row[in_len:]
+            cont_token_lens.append(int(cont_ids.numel()))
+            continuations.append(tokenizer.decode(cont_ids, skip_special_tokens=True).strip())
+
+    return continuations, cont_token_lens
+
+
 def _stable_example_key(ex: Dict[str, Any]) -> str:
     return str(ex.get("input") or ex.get("prompt") or ex.get("question") or ex.get("text") or "")
 
@@ -418,7 +495,12 @@ class StandardizedEvaluator:
         generated_token_lens: List[int] = []
         answer_first: List[int] = []
 
-        for idx in tqdm(indices, desc="Eval OBQA"):
+        # Build prompts once, then batch-generate.
+        prompts: List[str] = []
+        golds: List[str] = []
+        valid_letters_list: List[str] = []
+
+        for idx in indices:
             ex = ds[int(idx)]
             stem = str(ex.get("question_stem", ""))
             choices_obj = ex.get("choices") or {}
@@ -426,7 +508,6 @@ class StandardizedEvaluator:
             labels = list(choices_obj.get("label") or [])
             gold = str(ex.get("answerKey", "")).strip().upper()
 
-            # Build map label->text and keep stable order A,B,C,D when possible.
             pairs = []
             for lab, txt in zip(labels, texts):
                 lab_u = str(lab).strip().upper()
@@ -435,37 +516,35 @@ class StandardizedEvaluator:
             if not pairs:
                 continue
 
-            # Stable ordering by label.
             pairs = sorted(pairs, key=lambda p: p[0])
             valid_letters = "".join([p[0] for p in pairs])
-
             lines = [f"Q: {stem}", "Choices:"]
             for lab, txt in pairs:
                 lines.append(f"{lab}) {txt}")
             prompt = "\n".join(lines) + "\nAnswer:"
 
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
-            with torch.inference_mode():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=min(8, int(gen_cfg.max_new_tokens)),
-                    temperature=float(gen_cfg.temperature),
-                    do_sample=bool(gen_cfg.do_sample),
-                    top_p=gen_cfg.top_p,
-                    top_k=gen_cfg.top_k,
-                    pad_token_id=getattr(tokenizer, "eos_token_id", None),
-                    repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
-                )
+            prompts.append(prompt)
+            golds.append(gold)
+            valid_letters_list.append(valid_letters)
 
-            try:
-                input_len = int(inputs["input_ids"].shape[1])
-                out_len = int(outputs.shape[1])
-                generated_token_lens.append(max(0, out_len - input_len))
-            except Exception:
-                pass
+        batch_size = int(os.environ.get("SLM_EVAL_BATCH_SIZE", "4") or 4)
+        conts, cont_lens = _batched_generate_continuations(
+            model,
+            tokenizer,
+            prompts,
+            device=self.config.device,
+            max_length=int(self.config.max_length),
+            gen_cfg=gen_cfg,
+            max_new_tokens=min(8, int(gen_cfg.max_new_tokens)),
+            pad_token_id=getattr(tokenizer, "eos_token_id", None),
+            batch_size=batch_size,
+        )
 
-            generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            gen_answer = generated[len(prompt) :].strip() if len(generated) > len(prompt) else generated.strip()
+        for gen_answer, gold, valid_letters, clen in tqdm(
+            list(zip(conts, golds, valid_letters_list, cont_lens)),
+            desc="Eval OBQA",
+        ):
+            generated_token_lens.append(int(clen))
             answer_first.append(1 if _starts_with_answer_like(gen_answer, mode="letter") else 0)
             pred = _extract_choice_letter(gen_answer, choices=valid_letters)
             if pred and gold and pred == gold:
@@ -505,128 +584,106 @@ class StandardizedEvaluator:
         cot_token_lens: List[int] = []
         answer_first: List[int] = []
         consistency: List[int] = []
-        for idx in tqdm(indices, desc="Eval GSM8K"):
+        questions: List[str] = []
+        golds: List[str] = []
+        for idx in indices:
             ex = ds[int(idx)]
-            question = ex.get("question", "")
-            gold = extract_gsm8k_answer(ex.get("answer", "") or ex.get("output", ""))
+            questions.append(str(ex.get("question", "")))
+            golds.append(extract_gsm8k_answer(ex.get("answer", "") or ex.get("output", "")))
 
-            if bool(cascod_two_stage):
-                prompt_r = build_cascod_rationale_prompt(question, granularity_level=0)
-                inputs_r = tokenizer(prompt_r, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
-                with torch.inference_mode():
-                    out_r = model.generate(
-                        **inputs_r,
-                        max_new_tokens=int(gen_cfg.max_new_tokens),
-                        temperature=float(gen_cfg.temperature),
-                        do_sample=bool(gen_cfg.do_sample),
-                        top_p=gen_cfg.top_p,
-                        top_k=gen_cfg.top_k,
-                        pad_token_id=tokenizer.eos_token_id,
-                        repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
-                    )
+        batch_size = int(os.environ.get("SLM_EVAL_BATCH_SIZE", "4") or 4)
 
-                rationale = ""
-                r_cont_len = 0
-                try:
-                    in_len = int(inputs_r["input_ids"].shape[1])
-                    out_len = int(out_r.shape[1])
-                    r_cont_len = max(0, out_len - in_len)
-                except Exception:
-                    r_cont_len = 0
+        if bool(cascod_two_stage):
+            # Stage 1 (q -> r)
+            prompts_r = [build_cascod_rationale_prompt(q, granularity_level=0) for q in questions]
+            conts_r, lens_r = _batched_generate_continuations(
+                model,
+                tokenizer,
+                prompts_r,
+                device=self.config.device,
+                max_length=int(self.config.max_length),
+                gen_cfg=gen_cfg,
+                max_new_tokens=int(gen_cfg.max_new_tokens),
+                pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                batch_size=batch_size,
+            )
 
-                r_full = tokenizer.decode(out_r[0], skip_special_tokens=True)
-                rationale = r_full[len(prompt_r) :].strip() if len(r_full) > len(prompt_r) else r_full.strip()
+            # Stage 2 (q,r -> a)
+            prompts_a = [build_cascod_answer_prompt(q, r) for q, r in zip(questions, conts_r)]
+            conts_a, lens_a = _batched_generate_continuations(
+                model,
+                tokenizer,
+                prompts_a,
+                device=self.config.device,
+                max_length=int(self.config.max_length),
+                gen_cfg=gen_cfg,
+                max_new_tokens=min(32, int(gen_cfg.max_new_tokens)),
+                pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                batch_size=batch_size,
+            )
 
-                prompt_a = build_cascod_answer_prompt(question, rationale)
-                inputs_a = tokenizer(prompt_a, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
-                with torch.inference_mode():
-                    out_a = model.generate(
-                        **inputs_a,
-                        max_new_tokens=min(32, int(gen_cfg.max_new_tokens)),
-                        temperature=float(gen_cfg.temperature),
-                        do_sample=bool(gen_cfg.do_sample),
-                        top_p=gen_cfg.top_p,
-                        top_k=gen_cfg.top_k,
-                        pad_token_id=tokenizer.eos_token_id,
-                        repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
-                    )
-
-                a_cont_len = 0
-                try:
-                    in_len = int(inputs_a["input_ids"].shape[1])
-                    out_len = int(out_a.shape[1])
-                    a_cont_len = max(0, out_len - in_len)
-                except Exception:
-                    a_cont_len = 0
-
-                generated_token_lens.append(int(r_cont_len) + int(a_cont_len))
-
-                a_full = tokenizer.decode(out_a[0], skip_special_tokens=True)
-                cont_text = a_full[len(prompt_a) :].strip() if len(a_full) > len(prompt_a) else a_full.strip()
+            for rationale, cont_text, gold, r_len, a_len in tqdm(
+                list(zip(conts_r, conts_a, golds, lens_r, lens_a)),
+                desc="Eval GSM8K",
+            ):
+                generated_token_lens.append(int(r_len) + int(a_len))
                 pred = extract_gsm8k_answer(cont_text)
-
-                # Answer-first: numeric-looking continuation for stage 2.
                 answer_first.append(1 if _starts_with_answer_like(cont_text, mode="numeric") else 0)
 
-                # CoT token proxy: total continuation minus tokens for extracted final answer.
-                if (int(r_cont_len) + int(a_cont_len)) > 0:
+                if (int(r_len) + int(a_len)) > 0:
                     try:
                         ans_ids = tokenizer(pred or "", add_special_tokens=False).get("input_ids") or []
                         ans_len = int(len(ans_ids))
                     except Exception:
                         ans_len = 0
-                    cot_token_lens.append(max(0, int(r_cont_len) + int(a_cont_len) - int(ans_len)))
+                    cot_token_lens.append(max(0, int(r_len) + int(a_len) - int(ans_len)))
 
-                # Simple rationale/answer consistency: compare last number in rationale vs extracted answer.
                 r_last = _normalize_number_string(_extract_last_number_like(rationale))
                 a_norm = _normalize_number_string(pred)
                 if r_last and a_norm:
                     consistency.append(1 if r_last == a_norm else 0)
 
+                if pred == gold and gold != "":
+                    correct += 1
+                total += 1
+
+        else:
+            # Single-pass generation.
+            if use_cot_prompt:
+                prompts = [f"Q: {q}\nA: Let's think step by step." for q in questions]
             else:
-                if use_cot_prompt:
-                    prompt = f"Q: {question}\nA: Let's think step by step."
-                else:
-                    prompt = f"Q: {question}\nA:"
+                prompts = [f"Q: {q}\nA:" for q in questions]
 
-                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
-                with torch.inference_mode():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=int(gen_cfg.max_new_tokens),
-                        temperature=float(gen_cfg.temperature),
-                        do_sample=bool(gen_cfg.do_sample),
-                        top_p=gen_cfg.top_p,
-                        top_k=gen_cfg.top_k,
-                        pad_token_id=tokenizer.eos_token_id,
-                        repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
-                    )
+            conts, cont_lens = _batched_generate_continuations(
+                model,
+                tokenizer,
+                prompts,
+                device=self.config.device,
+                max_length=int(self.config.max_length),
+                gen_cfg=gen_cfg,
+                max_new_tokens=int(gen_cfg.max_new_tokens),
+                pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                batch_size=batch_size,
+            )
 
-                cont_text = ""
-                try:
-                    input_len = int(inputs["input_ids"].shape[1])
-                    out_len = int(outputs.shape[1])
-                    cont_len = max(0, out_len - input_len)
-                    generated_token_lens.append(cont_len)
-                except Exception:
-                    cont_len = 0
+            for cont_text, cont_len, gold in tqdm(
+                list(zip(conts, cont_lens, golds)),
+                desc="Eval GSM8K",
+            ):
+                generated_token_lens.append(int(cont_len))
 
-                generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                cont_text = generated[len(prompt) :].strip() if len(generated) > len(prompt) else generated.strip()
                 if (not use_cot_prompt) and bool(answer_first_eval):
                     pred = extract_gsm8k_answer_first(cont_text)
                 else:
-                    pred = extract_gsm8k_answer(generated)
-            if pred == gold and gold != "":
-                correct += 1
-            total += 1
+                    pred = extract_gsm8k_answer(cont_text)
 
-            if not bool(cascod_two_stage):
-                # Answer-first: numeric-looking continuation.
+                if pred == gold and gold != "":
+                    correct += 1
+                total += 1
+
                 answer_first.append(1 if _starts_with_answer_like(cont_text, mode="numeric") else 0)
 
-                # CoT token proxy: generated tokens minus tokens for extracted final answer.
-                if use_cot_prompt and cont_len > 0:
+                if use_cot_prompt and int(cont_len) > 0:
                     try:
                         ans_ids = tokenizer(pred or "", add_special_tokens=False).get("input_ids") or []
                         ans_len = int(len(ans_ids))
@@ -634,18 +691,14 @@ class StandardizedEvaluator:
                         ans_len = 0
                     cot_token_lens.append(max(0, int(cont_len) - int(ans_len)))
 
-                # Simple rationale/answer consistency: compare last number in 'reasoning' vs final extracted answer.
                 if use_cot_prompt:
-                    # Prefer '####' split when present.
-                    if "####" in generated:
-                        reasoning_text = generated.split("####")[0]
+                    reasoning_text = cont_text
+                    if "####" in reasoning_text:
+                        reasoning_text = reasoning_text.split("####")[0]
                     else:
-                        # Fallback: look before the last occurrence of the extracted answer string.
                         if pred:
-                            pos = generated.rfind(str(pred))
-                            reasoning_text = generated[:pos] if pos > 0 else generated
-                        else:
-                            reasoning_text = generated
+                            pos = reasoning_text.rfind(str(pred))
+                            reasoning_text = reasoning_text[:pos] if pos > 0 else reasoning_text
                     r_last = _normalize_number_string(_extract_last_number_like(reasoning_text))
                     a_norm = _normalize_number_string(pred)
                     if r_last and a_norm:
@@ -681,91 +734,84 @@ class StandardizedEvaluator:
             task_correct = 0
             generated_token_lens: List[int] = []
             answer_first: List[int] = []
-            for idx in tqdm(indices, desc=f"Eval BBH {task}"):
+
+            inputs_texts: List[str] = []
+            targets: List[str] = []
+            for idx in indices:
                 ex = ds[int(idx)]
-                input_text = ex.get("input", "") or ex.get("prompt", "")
-                target = ex.get("target", "") or ex.get("output", "")
+                inputs_texts.append(str(ex.get("input", "") or ex.get("prompt", "")))
+                targets.append(str(ex.get("target", "") or ex.get("output", "")))
 
-                if bool(cascod_two_stage):
-                    prompt_r = build_cascod_rationale_prompt(input_text, granularity_level=0)
-                    inputs_r = tokenizer(prompt_r, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
-                    with torch.inference_mode():
-                        out_r = model.generate(
-                            **inputs_r,
-                            max_new_tokens=int(gen_cfg.max_new_tokens),
-                            temperature=float(gen_cfg.temperature),
-                            do_sample=bool(gen_cfg.do_sample),
-                            top_p=gen_cfg.top_p,
-                            top_k=gen_cfg.top_k,
-                            pad_token_id=getattr(tokenizer, "eos_token_id", None),
-                            repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
-                        )
+            batch_size = int(os.environ.get("SLM_EVAL_BATCH_SIZE", "4") or 4)
 
-                    rationale = ""
-                    r_cont_len = 0
-                    try:
-                        in_len = int(inputs_r["input_ids"].shape[1])
-                        out_len = int(out_r.shape[1])
-                        r_cont_len = max(0, out_len - in_len)
-                    except Exception:
-                        r_cont_len = 0
+            if bool(cascod_two_stage):
+                prompts_r = [build_cascod_rationale_prompt(x, granularity_level=0) for x in inputs_texts]
+                conts_r, lens_r = _batched_generate_continuations(
+                    model,
+                    tokenizer,
+                    prompts_r,
+                    device=self.config.device,
+                    max_length=int(self.config.max_length),
+                    gen_cfg=gen_cfg,
+                    max_new_tokens=int(gen_cfg.max_new_tokens),
+                    pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                    batch_size=batch_size,
+                )
 
-                    r_full = tokenizer.decode(out_r[0], skip_special_tokens=True)
-                    rationale = r_full[len(prompt_r) :].strip() if len(r_full) > len(prompt_r) else r_full.strip()
+                prompts_a = [build_cascod_answer_prompt(x, r) for x, r in zip(inputs_texts, conts_r)]
+                conts_a, lens_a = _batched_generate_continuations(
+                    model,
+                    tokenizer,
+                    prompts_a,
+                    device=self.config.device,
+                    max_length=int(self.config.max_length),
+                    gen_cfg=gen_cfg,
+                    max_new_tokens=min(64, int(gen_cfg.max_new_tokens)),
+                    pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                    batch_size=batch_size,
+                )
 
-                    prompt_a = build_cascod_answer_prompt(input_text, rationale)
-                    inputs_a = tokenizer(prompt_a, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
-                    with torch.inference_mode():
-                        out_a = model.generate(
-                            **inputs_a,
-                            max_new_tokens=min(64, int(gen_cfg.max_new_tokens)),
-                            temperature=float(gen_cfg.temperature),
-                            do_sample=bool(gen_cfg.do_sample),
-                            top_p=gen_cfg.top_p,
-                            top_k=gen_cfg.top_k,
-                            pad_token_id=getattr(tokenizer, "eos_token_id", None),
-                            repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
-                        )
+                for gen_answer, target, r_len, a_len in tqdm(
+                    list(zip(conts_a, targets, lens_r, lens_a)),
+                    desc=f"Eval BBH {task}",
+                ):
+                    generated_token_lens.append(int(r_len) + int(a_len))
+                    answer_first.append(
+                        1
+                        if _starts_with_answer_like(gen_answer, mode="bool")
+                        or _starts_with_answer_like(gen_answer, mode="letter")
+                        else 0
+                    )
+                    if bbh_answer_match(gen_answer, target or ""):
+                        task_correct += 1
 
-                    a_cont_len = 0
-                    try:
-                        in_len = int(inputs_a["input_ids"].shape[1])
-                        out_len = int(out_a.shape[1])
-                        a_cont_len = max(0, out_len - in_len)
-                    except Exception:
-                        a_cont_len = 0
+            else:
+                prompts = [f"{x}\nAnswer:" for x in inputs_texts]
+                conts, cont_lens = _batched_generate_continuations(
+                    model,
+                    tokenizer,
+                    prompts,
+                    device=self.config.device,
+                    max_length=int(self.config.max_length),
+                    gen_cfg=gen_cfg,
+                    max_new_tokens=min(64, int(gen_cfg.max_new_tokens)),
+                    pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                    batch_size=batch_size,
+                )
 
-                    generated_token_lens.append(int(r_cont_len) + int(a_cont_len))
-
-                    a_full = tokenizer.decode(out_a[0], skip_special_tokens=True)
-                    gen_answer = a_full[len(prompt_a):].strip() if len(a_full) > len(prompt_a) else a_full.strip()
-
-                else:
-                    prompt = f"{input_text}\nAnswer:"
-                    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
-                    with torch.inference_mode():
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=min(64, int(gen_cfg.max_new_tokens)),
-                            temperature=float(gen_cfg.temperature),
-                            do_sample=bool(gen_cfg.do_sample),
-                            top_p=gen_cfg.top_p,
-                            top_k=gen_cfg.top_k,
-                            pad_token_id=getattr(tokenizer, "eos_token_id", None),
-                            repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
-                        )
-                    try:
-                        input_len = int(inputs["input_ids"].shape[1])
-                        out_len = int(outputs.shape[1])
-                        generated_token_lens.append(max(0, out_len - input_len))
-                    except Exception:
-                        pass
-                    gen = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    gen_answer = gen[len(prompt):].strip() if len(gen) > len(prompt) else gen.strip()
-
-                answer_first.append(1 if _starts_with_answer_like(gen_answer, mode="bool") or _starts_with_answer_like(gen_answer, mode="letter") else 0)
-                if bbh_answer_match(gen_answer, target or ""):
-                    task_correct += 1
+                for gen_answer, target, clen in tqdm(
+                    list(zip(conts, targets, cont_lens)),
+                    desc=f"Eval BBH {task}",
+                ):
+                    generated_token_lens.append(int(clen))
+                    answer_first.append(
+                        1
+                        if _starts_with_answer_like(gen_answer, mode="bool")
+                        or _starts_with_answer_like(gen_answer, mode="letter")
+                        else 0
+                    )
+                    if bbh_answer_match(gen_answer, target or ""):
+                        task_correct += 1
 
             task_acc = task_correct / limit if limit else 0.0
             all_results[task] = {"accuracy": float(task_acc), "correct": int(task_correct), "total": int(limit), "source": src}
