@@ -75,6 +75,8 @@ class EvidenceBasedConfig:
     train_limit: Optional[int] = 3000
     eval_limit_gsm8k: int = 200
     eval_limit_bbh: int = 50
+    # OOD commonsense (eval-only; not part of primary hypothesis by default)
+    eval_limit_obqa: int = 200
 
     # Distillation hyperparams
     kd_params: Dict[str, Any] = field(
@@ -185,6 +187,7 @@ class EvidenceBasedConfig:
             "eval_limits": {
                 "gsm8k": self.eval_limit_gsm8k,
                 "bbh": self.eval_limit_bbh,
+                "obqa": self.eval_limit_obqa,
             },
             "kd_params": json.loads(json.dumps(self.kd_params, default=str)),
             "seeds": list(self.seeds),

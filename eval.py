@@ -85,6 +85,33 @@ def bbh_answer_match(generated: str, target: str) -> bool:
     return g in bool_map and bool_map[g] == t
 
 
+def _extract_choice_letter(text: str, *, choices: str) -> str:
+    """Extract a multiple-choice letter from model output.
+
+    `choices` should be a string like "ABCD".
+    """
+
+    if not text:
+        return ""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    first = t[0].upper()
+    if first in choices:
+        return first
+
+    m = re.search(r"\b([%s])\b" % re.escape(choices), t.upper())
+    if m:
+        return str(m.group(1)).upper()
+
+    # Common pattern: "Answer: B"
+    m = re.search(r"answer\s*[:\-]\s*([%s])" % re.escape(choices), t, flags=re.IGNORECASE)
+    if m:
+        return str(m.group(1)).upper()
+
+    return ""
+
+
 def load_bbeh_task_dataset(task_name: str) -> Tuple[HFDataset, str]:
     """Loads a BBEH task JSON from GitHub with a small local cache."""
 
@@ -157,6 +184,7 @@ class StandardizedEvaluator:
         seed: int,
         eval_gsm8k: bool = True,
         eval_bbh: bool = True,
+        eval_obqa: bool = False,
         eval_efficiency: bool = True,
         use_cot_prompt: bool = True,
         generation_cfg: Optional[GenerationConfig] = None,
@@ -176,6 +204,8 @@ class StandardizedEvaluator:
             results["gsm8k"] = self._eval_gsm8k(model, tokenizer, seed, use_cot_prompt, generation_cfg)
         if eval_bbh:
             results["bbh"] = self._eval_bbh(model, tokenizer, seed, generation_cfg)
+        if eval_obqa:
+            results["obqa"] = self._eval_obqa(model, tokenizer, seed, generation_cfg)
         if eval_efficiency:
             # Secondary metric: not part of hypothesis test by default.
             results["efficiency"] = self._eval_efficiency(model, tokenizer, seed, generation_cfg)
@@ -207,6 +237,76 @@ class StandardizedEvaluator:
         # Keep same spirit: performance + small efficiency weight.
         speed_score = max(0.0, 1.0 - (t / 5.0))
         return 0.45 * gsm + 0.45 * bbh + 0.10 * speed_score
+
+    def _eval_obqa(self, model, tokenizer, seed: int, gen_cfg: GenerationConfig) -> Dict[str, Any]:
+        """OpenBookQA (commonsense) eval-only OOD.
+
+        Scientific controls:
+        - Uses the official test split.
+        - Deterministic sampling per seed.
+        - Exact-match on the multiple-choice letter.
+        """
+
+        from datasets import load_dataset
+
+        ds = load_dataset("openbookqa", "main", split="test")
+        limit = min(int(self.config.eval_limit_obqa), len(ds))
+        rng = np.random.RandomState(seed)
+        indices = rng.choice(len(ds), limit, replace=False) if limit < len(ds) else np.arange(len(ds))
+
+        ensure_tokenizer_has_pad(tokenizer, model)
+        model.eval()
+
+        correct = 0
+        total = 0
+
+        for idx in tqdm(indices, desc="Eval OBQA"):
+            ex = ds[int(idx)]
+            stem = str(ex.get("question_stem", ""))
+            choices_obj = ex.get("choices") or {}
+            texts = list(choices_obj.get("text") or [])
+            labels = list(choices_obj.get("label") or [])
+            gold = str(ex.get("answerKey", "")).strip().upper()
+
+            # Build map label->text and keep stable order A,B,C,D when possible.
+            pairs = []
+            for lab, txt in zip(labels, texts):
+                lab_u = str(lab).strip().upper()
+                if lab_u and txt is not None:
+                    pairs.append((lab_u, str(txt)))
+            if not pairs:
+                continue
+
+            # Stable ordering by label.
+            pairs = sorted(pairs, key=lambda p: p[0])
+            valid_letters = "".join([p[0] for p in pairs])
+
+            lines = [f"Q: {stem}", "Choices:"]
+            for lab, txt in pairs:
+                lines.append(f"{lab}) {txt}")
+            prompt = "\n".join(lines) + "\nAnswer:"
+
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.config.max_length).to(self.config.device)
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=min(8, int(gen_cfg.max_new_tokens)),
+                    temperature=float(gen_cfg.temperature),
+                    do_sample=bool(gen_cfg.do_sample),
+                    top_p=gen_cfg.top_p,
+                    top_k=gen_cfg.top_k,
+                    pad_token_id=getattr(tokenizer, "eos_token_id", None),
+                    repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
+                )
+
+            generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            gen_answer = generated[len(prompt) :].strip() if len(generated) > len(prompt) else generated.strip()
+            pred = _extract_choice_letter(gen_answer, choices=valid_letters)
+            if pred and gold and pred == gold:
+                correct += 1
+            total += 1
+
+        return {"accuracy": correct / total if total else 0.0, "correct": int(correct), "total": int(total)}
 
     def _eval_gsm8k(self, model, tokenizer, seed: int, use_cot_prompt: bool, gen_cfg: GenerationConfig) -> Dict[str, Any]:
         from datasets import load_dataset

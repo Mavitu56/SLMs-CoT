@@ -13,10 +13,904 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from cache import cache_teacher_cot, cache_teacher_logits, read_cache_metadata
 from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_pad, get_safe_tokenizer_length, safe_model_to, set_seed
 from data import load_training_dataset
-from distill import ReasoningAwareDistiller, TraditionalKDDistiller
+from distill import ReasoningAwareDistiller, TraditionalKDDistiller, autocast_ctx, make_grad_scaler, preprocess_and_tokenize
 from eval import StandardizedEvaluator
 from report import ScientificLogger, write_plots, write_report_json, write_summary_txt
 from stats import StatisticalAnalyst
+
+
+def _train_sft_lora(
+    cfg: EvidenceBasedConfig,
+    model,
+    tokenizer,
+    raw_dataset,
+    *,
+    seed: int,
+) -> tuple[Any, Dict[str, Any]]:
+    """Supervised fine-tuning (SFT) helper.
+
+    Baseline 0.1 requirement: explicit teacher fine-tuning on TRAIN split only,
+    with clear checkpoint saving and reproducibility.
+
+    Implementation choice: LoRA/QLoRA-style adapters for Colab feasibility.
+    """
+
+    import math
+
+    import torch.nn.functional as F
+    from peft import LoraConfig, TaskType, get_peft_model
+    from torch.utils.data import DataLoader
+    from tqdm.auto import tqdm
+    from transformers import get_scheduler
+
+    set_seed(seed)
+    device = cfg.device
+
+    tokenized = preprocess_and_tokenize(raw_dataset, tokenizer, max_length=cfg.max_length)
+
+    # Stability + memory.
+    try:
+        model.config.use_cache = False
+    except Exception:
+        pass
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        pass
+
+    # QLoRA preparation when model is k-bit.
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+        try:
+            from peft import prepare_model_for_kbit_training
+
+            model = prepare_model_for_kbit_training(model)
+        except Exception:
+            # If unavailable, continue; training may still work but will be less stable.
+            pass
+
+    lora_cfg = LoraConfig(
+        r=int(cfg.kd_params.get("lora_rank", 16)),
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.1,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.train()
+    model = safe_model_to(model, device)
+
+    batch_size = int(cfg.kd_params.get("batch_size", 2))
+    grad_accum_steps = int(cfg.kd_params.get("grad_accum_steps", 1))
+    num_workers = int(cfg.kd_params.get("dataloader_num_workers", 0))
+    dataloader = DataLoader(
+        tokenized,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=num_workers,
+    )
+
+    num_epochs = int(cfg.kd_params.get("epochs", 1))
+    num_training_steps = max(1, num_epochs * len(dataloader))
+    warmup_steps = max(0, int(0.1 * num_training_steps))
+
+    lr = float(cfg.kd_params.get("learning_rates", {}).get("kd", 5e-5))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+
+    scaler = make_grad_scaler(device)
+    metrics: Dict[str, Any] = {
+        "epochs": num_epochs,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "learning_rate": lr,
+        "loss_mean": None,
+        "losses": [],
+    }
+
+    model.zero_grad(set_to_none=True)
+    step = 0
+    for epoch in range(num_epochs):
+        pbar = tqdm(dataloader, desc=f"FT Teacher (LoRA) Epoch {epoch}")
+        for batch in pbar:
+            step += 1
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            labels = batch["labels"].to(device)
+
+            with autocast_ctx(device):
+                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = out.loss
+                if loss is None:
+                    # Defensive fallback: compute CE manually.
+                    logits = out.logits
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1),
+                        ignore_index=-100,
+                    )
+                loss_to_backprop = loss / float(max(1, grad_accum_steps))
+
+            scaler.scale(loss_to_backprop).backward()
+
+            if (step % grad_accum_steps) == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                lr_scheduler.step()
+
+            metrics["losses"].append(float(loss.detach().cpu().item()))
+            if metrics["losses"]:
+                recent = metrics["losses"][-min(50, len(metrics["losses"])) :]
+                pbar.set_postfix({"loss": f"{sum(recent)/len(recent):.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+
+    if metrics["losses"]:
+        metrics["loss_mean"] = float(sum(metrics["losses"]) / len(metrics["losses"]))
+
+    return model, metrics
+
+
+def run_ft_teacher_baseline(
+    cfg: EvidenceBasedConfig,
+    *,
+    enable_gsm8k_train: bool,
+    enable_bbh_train: bool,
+    eval_gsm8k: bool,
+    eval_bbh: bool,
+    eval_efficiency: bool,
+    use_cot_prompt_eval: bool,
+    eval_obqa: bool = False,
+) -> Dict[str, Any]:
+    """Baseline 0.1: fine-tune the teacher explicitly and evaluate it.
+
+    Guarantees:
+    - Training uses TRAIN split only (via load_training_dataset).
+    - Saves a clear checkpoint (LoRA adapter + tokenizer).
+    - Records the run in exp_id/state.json for traceability.
+    """
+
+    logger = ScientificLogger()
+    evaluator = StandardizedEvaluator(cfg)
+
+    flags = {
+        "baseline": "ft_teacher",
+        "enable_gsm8k_train": enable_gsm8k_train,
+        "enable_bbh_train": enable_bbh_train,
+        "eval_gsm8k": eval_gsm8k,
+        "eval_bbh": eval_bbh,
+        "eval_efficiency": eval_efficiency,
+        "use_cot_prompt_eval": use_cot_prompt_eval,
+        "eval_obqa": bool(eval_obqa),
+    }
+
+    exp_id = _experiment_id(cfg, kd_modes=["ft_teacher"], flags=flags)
+    exp_dir = cfg.experiments_dir / exp_id
+    state_path = exp_dir / "state.json"
+    state = _load_state(state_path)
+
+    logger.log_phase("EXPERIMENT", {"id": exp_id, "dir": str(exp_dir), "flags": flags})
+    logger.log_hyperparameters(cfg.to_metadata())
+
+    results: Dict[str, Any] = {"metadata": cfg.to_metadata(), "conditions": {}}
+    cond_name = "ft_teacher"
+    cond_runs: List[Dict[str, Any]] = []
+
+    base_teacher_name = str(cfg.model_hierarchy.get("teacher_medium"))
+
+    for seed in cfg.seeds:
+        run_key = f"{cond_name}_seed{seed}"
+        if state.get("completed", {}).get(run_key):
+            print(f" Pulando run já completado: {run_key}")
+            cond_runs.append(state["completed"][run_key])
+            continue
+
+        print(f"\n Baseline FT Teacher | seed={seed}")
+        set_seed(seed)
+
+        # TRAIN split only.
+        train_ds = load_training_dataset(enable_gsm8k_train, enable_bbh_train, cfg.train_limit, seed=seed)
+
+        teacher_model, teacher_tok = setup_model_and_tokenizer(base_teacher_name, cfg.device, cfg.quantization)
+        teacher_model, train_metrics = _train_sft_lora(cfg, teacher_model, teacher_tok, train_ds, seed=seed)
+
+        # Save immediately.
+        save_dir = cfg.models_dir / exp_id / f"ft_teacher_seed{seed}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        teacher_model.save_pretrained(save_dir)
+        teacher_tok.save_pretrained(save_dir)
+
+        state.setdefault("artifacts", {})[f"ft_teacher_seed{seed}_dir"] = str(save_dir)
+        state.setdefault("artifacts", {})["ft_teacher_base_model"] = base_teacher_name
+        _save_state(state_path, state)
+        print(f" Teacher (adapter) salvo em: {save_dir}")
+
+        # Eval (kept consistent with the repo evaluator).
+        eval_results = evaluator.evaluate(
+            teacher_model,
+            teacher_tok,
+            seed=seed,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=bool(eval_obqa),
+            eval_efficiency=eval_efficiency,
+            use_cot_prompt=use_cot_prompt_eval,
+            generation_cfg=cfg.eval_generation,
+        )
+
+        run_payload = {
+            "seed": seed,
+            "condition": cond_name,
+            "description": "Fine-tuning do teacher (LoRA/Colab-friendly)",
+            "training": train_metrics,
+            "evaluation": eval_results,
+            "artifacts": {"teacher_dir": str(save_dir), "teacher_base": base_teacher_name},
+        }
+
+        state.setdefault("completed", {})[run_key] = run_payload
+        _save_state(state_path, state)
+        cond_runs.append(run_payload)
+
+        del teacher_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results["conditions"][cond_name] = {"description": "FT Teacher", "runs": cond_runs}
+
+    # Reports
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    report_json = cfg.reports_dir / f"comprehensive_report_{exp_id}_{timestamp}.json"
+    summary_txt = cfg.reports_dir / f"results_summary_{exp_id}_{timestamp}.txt"
+
+    results.setdefault("artifacts", {})
+    results["artifacts"].update(
+        {
+            "experiment_id": exp_id,
+            "experiment_dir": str(exp_dir),
+            "report_json": str(report_json),
+            "summary_txt": str(summary_txt),
+        }
+    )
+
+    write_report_json(report_json, results)
+    write_summary_txt(summary_txt, results)
+
+    plot_paths = write_plots(cfg.reports_dir, results, prefix=f"plots_{exp_id}_{timestamp}")
+    results["artifacts"]["plots"] = [str(p) for p in plot_paths]
+    write_report_json(report_json, results)
+
+    print(" Relatórios salvos:")
+    print(f"   - JSON: {report_json}")
+    print(f"   - TXT:  {summary_txt}")
+    if plot_paths:
+        print("   - PLOTS:")
+        for p in plot_paths:
+            print(f"     * {p}")
+
+    return results
+
+
+def run_ft_student_baseline(
+    cfg: EvidenceBasedConfig,
+    *,
+    student_key: str,
+    enable_gsm8k_train: bool,
+    enable_bbh_train: bool,
+    eval_gsm8k: bool,
+    eval_bbh: bool,
+    eval_efficiency: bool,
+    use_cot_prompt_eval: bool,
+    eval_obqa: bool = False,
+) -> Dict[str, Any]:
+    """Baseline 0.2: fine-tune the student explicitly (no KD) and evaluate.
+
+    Guarantees:
+    - Training uses TRAIN split only (via load_training_dataset).
+    - Does NOT reuse teacher CoT/logits caches (no KD components invoked).
+    - Saves a clear checkpoint (LoRA adapter + tokenizer).
+    - Records the run in exp_id/state.json for traceability.
+    """
+
+    logger = ScientificLogger()
+    evaluator = StandardizedEvaluator(cfg)
+
+    flags = {
+        "baseline": "ft_student",
+        "student_key": str(student_key),
+        "enable_gsm8k_train": enable_gsm8k_train,
+        "enable_bbh_train": enable_bbh_train,
+        "eval_gsm8k": eval_gsm8k,
+        "eval_bbh": eval_bbh,
+        "eval_efficiency": eval_efficiency,
+        "use_cot_prompt_eval": use_cot_prompt_eval,
+        "eval_obqa": bool(eval_obqa),
+    }
+
+    exp_id = _experiment_id(cfg, kd_modes=["ft_student"], flags=flags)
+    exp_dir = cfg.experiments_dir / exp_id
+    state_path = exp_dir / "state.json"
+    state = _load_state(state_path)
+
+    logger.log_phase("EXPERIMENT", {"id": exp_id, "dir": str(exp_dir), "flags": flags})
+    logger.log_hyperparameters(cfg.to_metadata())
+
+    results: Dict[str, Any] = {"metadata": cfg.to_metadata(), "conditions": {}}
+    cond_name = "ft_student"
+    cond_runs: List[Dict[str, Any]] = []
+
+    if student_key not in cfg.model_hierarchy:
+        raise ValueError(f"student_key inválido: {student_key}. Opções: {sorted(cfg.model_hierarchy.keys())}")
+    base_student_name = str(cfg.model_hierarchy.get(student_key))
+
+    for seed in cfg.seeds:
+        run_key = f"{cond_name}_seed{seed}"
+        if state.get("completed", {}).get(run_key):
+            print(f" Pulando run já completado: {run_key}")
+            cond_runs.append(state["completed"][run_key])
+            continue
+
+        print(f"\n Baseline FT Student | student={student_key} | seed={seed}")
+        set_seed(seed)
+
+        # TRAIN split only.
+        train_ds = load_training_dataset(enable_gsm8k_train, enable_bbh_train, cfg.train_limit, seed=seed)
+
+        student_model, student_tok = setup_model_and_tokenizer(base_student_name, cfg.device, cfg.quantization)
+        student_model, train_metrics = _train_sft_lora(cfg, student_model, student_tok, train_ds, seed=seed)
+
+        # Save immediately.
+        save_dir = cfg.models_dir / exp_id / f"ft_student_seed{seed}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        student_model.save_pretrained(save_dir)
+        student_tok.save_pretrained(save_dir)
+
+        state.setdefault("artifacts", {})[f"ft_student_seed{seed}_dir"] = str(save_dir)
+        state.setdefault("artifacts", {})["ft_student_base_model"] = base_student_name
+        state.setdefault("artifacts", {})["ft_student_key"] = str(student_key)
+        _save_state(state_path, state)
+        print(f" Student (adapter) salvo em: {save_dir}")
+
+        eval_results = evaluator.evaluate(
+            student_model,
+            student_tok,
+            seed=seed,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=bool(eval_obqa),
+            eval_efficiency=eval_efficiency,
+            use_cot_prompt=use_cot_prompt_eval,
+            generation_cfg=cfg.eval_generation,
+        )
+
+        run_payload = {
+            "seed": seed,
+            "condition": cond_name,
+            "description": f"Fine-tuning do student ({student_key}) sem KD (LoRA/Colab-friendly)",
+            "training": train_metrics,
+            "evaluation": eval_results,
+            "artifacts": {"student_dir": str(save_dir), "student_base": base_student_name, "student_key": str(student_key)},
+        }
+
+        state.setdefault("completed", {})[run_key] = run_payload
+        _save_state(state_path, state)
+        cond_runs.append(run_payload)
+
+        del student_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results["conditions"][cond_name] = {"description": "FT Student", "runs": cond_runs}
+
+    # Reports
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    report_json = cfg.reports_dir / f"comprehensive_report_{exp_id}_{timestamp}.json"
+    summary_txt = cfg.reports_dir / f"results_summary_{exp_id}_{timestamp}.txt"
+
+    results.setdefault("artifacts", {})
+    results["artifacts"].update(
+        {
+            "experiment_id": exp_id,
+            "experiment_dir": str(exp_dir),
+            "report_json": str(report_json),
+            "summary_txt": str(summary_txt),
+        }
+    )
+
+    write_report_json(report_json, results)
+    write_summary_txt(summary_txt, results)
+
+    plot_paths = write_plots(cfg.reports_dir, results, prefix=f"plots_{exp_id}_{timestamp}")
+    results["artifacts"]["plots"] = [str(p) for p in plot_paths]
+    write_report_json(report_json, results)
+
+    print(" Relatórios salvos:")
+    print(f"   - JSON: {report_json}")
+    print(f"   - TXT:  {summary_txt}")
+    if plot_paths:
+        print("   - PLOTS:")
+        for p in plot_paths:
+            print(f"     * {p}")
+
+    return results
+
+
+def _load_model_and_tokenizer_from_dir(model_dir: Path, device: torch.device, quant_cfg: Dict[str, Any]):
+    """Load either a full HF model dir (config.json) or a PEFT adapter dir (adapter_config.json).
+
+    This mirrors evaluate_saved_models.py but keeps run_experiment self-contained.
+    """
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer.model_max_length = get_safe_tokenizer_length(tokenizer, fallback=2048, upper_bound=4096)
+    tokenizer_len = len(tokenizer)
+
+    model_kwargs: Dict[str, Any] = {}
+    if bool(quant_cfg.get("load_in_4bit")):
+        compute_dtype = quant_cfg.get("bnb_4bit_compute_dtype", torch.bfloat16)
+        if isinstance(compute_dtype, str):
+            compute_dtype = getattr(torch, compute_dtype, torch.bfloat16)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=quant_cfg.get("bnb_4bit_use_double_quant", True),
+            bnb_4bit_quant_type=quant_cfg.get("bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+        model_kwargs["quantization_config"] = bnb_config
+        model_kwargs["device_map"] = quant_cfg.get("device_map", "auto")
+
+    if (model_dir / "config.json").exists():
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
+        if not bool(quant_cfg.get("load_in_4bit")):
+            model = safe_model_to(model, device)
+        ensure_tokenizer_has_pad(tokenizer, model)
+        model.eval()
+        # Unique identity for caches.
+        try:
+            setattr(model, "name_or_path", str(model_dir))
+        except Exception:
+            pass
+        return model, tokenizer
+
+    if (model_dir / "adapter_config.json").exists():
+        adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+        base_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
+        if not base_name:
+            raise ValueError(
+                f"adapter_config.json em {model_dir} não contém 'base_model_name_or_path'. "
+                "Não é possível carregar o modelo base."
+            )
+
+        base_model = AutoModelForCausalLM.from_pretrained(base_name, **model_kwargs)
+
+        # Ensure embedding size matches tokenizer before adapter load.
+        try:
+            emb = base_model.get_input_embeddings()
+            if emb is not None and emb.weight.shape[0] != tokenizer_len:
+                base_model.resize_token_embeddings(tokenizer_len)
+        except Exception:
+            pass
+
+        try:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(base_model, model_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                "Falha ao carregar adapter PEFT (instale 'peft' e verifique compatibilidade). "
+                f"Erro: {exc}"
+            )
+
+        if not bool(quant_cfg.get("load_in_4bit")):
+            model = safe_model_to(model, device)
+        ensure_tokenizer_has_pad(tokenizer, model)
+        model.eval()
+
+        # Make teacher identity unique so caches don't collide with base teacher.
+        unique_id = f"{base_name}::adapter::{str(model_dir)}"
+        try:
+            setattr(model, "name_or_path", unique_id)
+        except Exception:
+            pass
+
+        return model, tokenizer
+
+    raise ValueError(f"Diretório não parece ser um modelo HF nem um adapter PEFT: {model_dir}")
+
+
+def run_kd_logits_baseline(
+    cfg: EvidenceBasedConfig,
+    *,
+    teacher_ckpt_dir: str,
+    student_key: str,
+    enable_gsm8k_train: bool,
+    enable_bbh_train: bool,
+    eval_gsm8k: bool,
+    eval_bbh: bool,
+    eval_efficiency: bool,
+    use_cot_prompt_eval: bool,
+    eval_obqa: bool = False,
+) -> Dict[str, Any]:
+    """Baseline 0.3: logits-KD using an ADJUSTED teacher -> student.
+
+    Requirements:
+    - Enforce teacher/student tokenizer compatibility.
+    - Cache logits separated by teacher identity + tokenizer hash + split + params.
+    - Logits must be computed on TRAIN split only (no eval leakage).
+    """
+
+    logger = ScientificLogger()
+    evaluator = StandardizedEvaluator(cfg)
+
+    teacher_dir = Path(teacher_ckpt_dir)
+    if not teacher_dir.exists():
+        raise ValueError(f"teacher_ckpt_dir não existe: {teacher_dir}")
+
+    flags = {
+        "baseline": "kd_logits",
+        "teacher_ckpt_dir": str(teacher_dir),
+        "student_key": str(student_key),
+        "enable_gsm8k_train": enable_gsm8k_train,
+        "enable_bbh_train": enable_bbh_train,
+        "eval_gsm8k": eval_gsm8k,
+        "eval_bbh": eval_bbh,
+        "eval_efficiency": eval_efficiency,
+        "use_cot_prompt_eval": use_cot_prompt_eval,
+        "eval_obqa": bool(eval_obqa),
+    }
+
+    exp_id = _experiment_id(cfg, kd_modes=["kd_logits"], flags=flags)
+    exp_dir = cfg.experiments_dir / exp_id
+    state_path = exp_dir / "state.json"
+    state = _load_state(state_path)
+
+    logger.log_phase("EXPERIMENT", {"id": exp_id, "dir": str(exp_dir), "flags": flags})
+    logger.log_hyperparameters(cfg.to_metadata())
+
+    results: Dict[str, Any] = {"metadata": cfg.to_metadata(), "conditions": {}}
+    cond_name = "kd_logits"
+    cond_runs: List[Dict[str, Any]] = []
+
+    if student_key not in cfg.model_hierarchy:
+        raise ValueError(f"student_key inválido: {student_key}. Opções: {sorted(cfg.model_hierarchy.keys())}")
+    student_name = str(cfg.model_hierarchy[student_key])
+
+    for seed in cfg.seeds:
+        run_key = f"{cond_name}_seed{seed}"
+        if state.get("completed", {}).get(run_key):
+            print(f" Pulando run já completado: {run_key}")
+            cond_runs.append(state["completed"][run_key])
+            continue
+
+        print(f"\n Baseline KD Logits | teacher_ckpt={teacher_dir} | student={student_key} | seed={seed}")
+        set_seed(seed)
+
+        # TRAIN split only.
+        train_ds = load_training_dataset(enable_gsm8k_train, enable_bbh_train, cfg.train_limit, seed=seed)
+
+        # Load adjusted teacher from checkpoint directory (adapter/full model).
+        teacher_model, teacher_tok = _load_model_and_tokenizer_from_dir(teacher_dir, cfg.device, cfg.quantization)
+
+        # Load student (fresh).
+        student_model, student_tok = setup_model_and_tokenizer(student_name, cfg.device, cfg.quantization)
+
+        # Block if tokenizers incompatible (scientific validity requirement).
+        assert_tokenizer_compatible_for_logits_kd(
+            teacher_tok,
+            student_tok,
+            context=f"baseline=kd_logits, teacher_ckpt={teacher_dir}, student={student_key}",
+        )
+
+        # Cache teacher logits (versioned by teacher identity + tokenizer hash + dataset fp + split + params).
+        logits_dir = cache_teacher_logits(
+            teacher_model,
+            teacher_tok,
+            train_ds,
+            cache_root=cfg.cache_dir,
+            batch_size=cfg.kd_params["batch_size"],
+            device=str(cfg.device),
+            generation_cfg=GenerationConfig(max_new_tokens=0, temperature=0.0, do_sample=False),
+            split="train",
+            seed=seed,
+            kd_mode="traditional",
+            input_kind="prompt_completion",
+            train_limit=cfg.train_limit,
+            max_length=cfg.max_length,
+        )
+
+        # Free teacher memory before training.
+        del teacher_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Distill student using cache only.
+        distiller = TraditionalKDDistiller(cfg, cache_dir=str(logits_dir))
+        trained_model, train_metrics = distiller.distill(
+            student_model,
+            teacher_model=None,
+            student_tokenizer=student_tok,
+            raw_dataset=train_ds,
+            seed=seed,
+            use_cache=True,
+        )
+
+        # Save.
+        save_dir = cfg.models_dir / exp_id / f"kd_logits_seed{seed}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        trained_model.save_pretrained(save_dir)
+        student_tok.save_pretrained(save_dir)
+        print(f" Student KD-logits salvo em: {save_dir}")
+
+        # Eval.
+        eval_results = evaluator.evaluate(
+            trained_model,
+            student_tok,
+            seed=seed,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=bool(eval_obqa),
+            eval_efficiency=eval_efficiency,
+            use_cot_prompt=use_cot_prompt_eval,
+            generation_cfg=cfg.eval_generation,
+        )
+
+        run_payload = {
+            "seed": seed,
+            "condition": cond_name,
+            "description": "KD por logits (teacher ajustado → student)",
+            "training": train_metrics,
+            "evaluation": eval_results,
+            "artifacts": {
+                "teacher_ckpt_dir": str(teacher_dir),
+                "logits_cache_dir": str(logits_dir),
+                "student_dir": str(save_dir),
+                "student_key": str(student_key),
+            },
+        }
+
+        state.setdefault("completed", {})[run_key] = run_payload
+        state.setdefault("artifacts", {})[f"kd_logits_seed{seed}_dir"] = str(save_dir)
+        state.setdefault("artifacts", {})[f"kd_logits_seed{seed}_logits_cache"] = str(logits_dir)
+        state.setdefault("artifacts", {})["kd_logits_teacher_ckpt_dir"] = str(teacher_dir)
+        _save_state(state_path, state)
+        cond_runs.append(run_payload)
+
+        del trained_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results["conditions"][cond_name] = {"description": "KD logits baseline", "runs": cond_runs}
+
+    # Reports
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    report_json = cfg.reports_dir / f"comprehensive_report_{exp_id}_{timestamp}.json"
+    summary_txt = cfg.reports_dir / f"results_summary_{exp_id}_{timestamp}.txt"
+
+    results.setdefault("artifacts", {})
+    results["artifacts"].update(
+        {
+            "experiment_id": exp_id,
+            "experiment_dir": str(exp_dir),
+            "report_json": str(report_json),
+            "summary_txt": str(summary_txt),
+        }
+    )
+
+    write_report_json(report_json, results)
+    write_summary_txt(summary_txt, results)
+
+    plot_paths = write_plots(cfg.reports_dir, results, prefix=f"plots_{exp_id}_{timestamp}")
+    results["artifacts"]["plots"] = [str(p) for p in plot_paths]
+    write_report_json(report_json, results)
+
+    print(" Relatórios salvos:")
+    print(f"   - JSON: {report_json}")
+    print(f"   - TXT:  {summary_txt}")
+    if plot_paths:
+        print("   - PLOTS:")
+        for p in plot_paths:
+            print(f"     * {p}")
+
+    return results
+
+
+def run_kd_cot_standard_baseline(
+    cfg: EvidenceBasedConfig,
+    *,
+    teacher_ckpt_dir: Optional[str],
+    student_key: str,
+    enable_gsm8k_train: bool,
+    enable_bbh_train: bool,
+    eval_gsm8k: bool,
+    eval_bbh: bool,
+    eval_efficiency: bool,
+    use_cot_prompt_eval: bool,
+    eval_obqa: bool = False,
+) -> Dict[str, Any]:
+    """Baseline 0.4: KD CoT padrão (text-only), sem otimizações.
+
+    Definition enforced:
+    - Teacher generates CoT BEFORE the answer.
+    - Student trains with CE on teacher-generated sequences (no logits-KD).
+    - Prompt tokens (question/instruction) are masked out; loss applies only to CoT+answer.
+    - CoT is generated from TRAIN split only (no eval leakage).
+    """
+
+    logger = ScientificLogger()
+    evaluator = StandardizedEvaluator(cfg)
+
+    if student_key not in cfg.model_hierarchy:
+        raise ValueError(f"student_key inválido: {student_key}. Opções: {sorted(cfg.model_hierarchy.keys())}")
+    student_name = str(cfg.model_hierarchy[student_key])
+
+    teacher_dir = Path(teacher_ckpt_dir) if teacher_ckpt_dir else None
+    if teacher_dir is not None and not teacher_dir.exists():
+        raise ValueError(f"teacher_ckpt_dir não existe: {teacher_dir}")
+
+    flags = {
+        "baseline": "kd_cot_standard",
+        "teacher_ckpt_dir": str(teacher_dir) if teacher_dir else None,
+        "student_key": str(student_key),
+        "enable_gsm8k_train": enable_gsm8k_train,
+        "enable_bbh_train": enable_bbh_train,
+        "eval_gsm8k": eval_gsm8k,
+        "eval_bbh": eval_bbh,
+        "eval_efficiency": eval_efficiency,
+        "use_cot_prompt_eval": use_cot_prompt_eval,
+        "eval_obqa": bool(eval_obqa),
+        "teacher_cot_generation": cfg.teacher_cot_generation.to_jsonable(),
+    }
+
+    exp_id = _experiment_id(cfg, kd_modes=["kd_cot_standard"], flags=flags)
+    exp_dir = cfg.experiments_dir / exp_id
+    state_path = exp_dir / "state.json"
+    state = _load_state(state_path)
+
+    logger.log_phase("EXPERIMENT", {"id": exp_id, "dir": str(exp_dir), "flags": flags})
+    logger.log_hyperparameters(cfg.to_metadata())
+
+    results: Dict[str, Any] = {"metadata": cfg.to_metadata(), "conditions": {}}
+    cond_name = "kd_cot_standard"
+    cond_runs: List[Dict[str, Any]] = []
+
+    for seed in cfg.seeds:
+        run_key = f"{cond_name}_seed{seed}"
+        if state.get("completed", {}).get(run_key):
+            print(f" Pulando run já completado: {run_key}")
+            cond_runs.append(state["completed"][run_key])
+            continue
+
+        print(f"\n Baseline KD CoT padrão | student={student_key} | seed={seed}")
+        set_seed(seed)
+
+        # TRAIN split only.
+        train_ds = load_training_dataset(enable_gsm8k_train, enable_bbh_train, cfg.train_limit, seed=seed)
+
+        # Load teacher for CoT generation (adjusted checkpoint if provided; else base teacher).
+        if teacher_dir is not None:
+            teacher_model, teacher_tok = _load_model_and_tokenizer_from_dir(teacher_dir, cfg.device, cfg.quantization)
+            teacher_identity = str(teacher_dir)
+        else:
+            teacher_model, teacher_tok = setup_model_and_tokenizer(cfg.model_hierarchy["teacher_medium"], cfg.device, cfg.quantization)
+            teacher_identity = str(cfg.model_hierarchy["teacher_medium"])
+
+        # Generate (or reuse) CoT cache from TRAIN only.
+        cot_file = cache_teacher_cot(
+            teacher_model,
+            teacher_tok,
+            train_ds,
+            cache_root=cfg.cache_dir,
+            batch_size=max(1, cfg.kd_params["batch_size"] // 2),
+            device=str(cfg.device),
+            generation_cfg=cfg.teacher_cot_generation,
+            split="train",
+            seed=seed,
+            prompt_max_length=cfg.max_length,
+            train_limit=cfg.train_limit,
+        )
+
+        # Free teacher memory; baseline is text-only distillation.
+        del teacher_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        student_model, student_tok = setup_model_and_tokenizer(student_name, cfg.device, cfg.quantization)
+
+        # Distill (CE-only): teacher logits are NOT used.
+        distiller = ReasoningAwareDistiller(cfg, cot_cache_path=str(cot_file), logits_cache_dir=None)
+        trained_model, train_metrics = distiller.distill_with_reasoning(
+            student_model,
+            teacher_model=None,
+            student_tokenizer=student_tok,
+            raw_dataset=train_ds,
+            seed=seed,
+            use_cot_cache=True,
+            use_logits_cache=False,
+            use_teacher_logits=False,
+        )
+
+        save_dir = cfg.models_dir / exp_id / f"kd_cot_standard_seed{seed}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        trained_model.save_pretrained(save_dir)
+        student_tok.save_pretrained(save_dir)
+        print(f" Student KD-CoT (padrão) salvo em: {save_dir}")
+
+        eval_results = evaluator.evaluate(
+            trained_model,
+            student_tok,
+            seed=seed,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=bool(eval_obqa),
+            eval_efficiency=eval_efficiency,
+            use_cot_prompt=use_cot_prompt_eval,
+            generation_cfg=cfg.eval_generation,
+        )
+
+        run_payload = {
+            "seed": seed,
+            "condition": cond_name,
+            "description": "KD CoT padrão (texto; CoT→resposta; CE-only)",
+            "training": train_metrics,
+            "evaluation": eval_results,
+            "artifacts": {
+                "teacher": teacher_identity,
+                "teacher_ckpt_dir": str(teacher_dir) if teacher_dir else None,
+                "cot_cache_file": str(cot_file),
+                "student_dir": str(save_dir),
+                "student_key": str(student_key),
+            },
+        }
+
+        state.setdefault("completed", {})[run_key] = run_payload
+        state.setdefault("artifacts", {})[f"kd_cot_standard_seed{seed}_dir"] = str(save_dir)
+        state.setdefault("artifacts", {})[f"kd_cot_standard_seed{seed}_cot_cache"] = str(cot_file)
+        _save_state(state_path, state)
+        cond_runs.append(run_payload)
+
+        del trained_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results["conditions"][cond_name] = {"description": "KD CoT padrão", "runs": cond_runs}
+
+    # Reports
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    report_json = cfg.reports_dir / f"comprehensive_report_{exp_id}_{timestamp}.json"
+    summary_txt = cfg.reports_dir / f"results_summary_{exp_id}_{timestamp}.txt"
+
+    results.setdefault("artifacts", {})
+    results["artifacts"].update(
+        {
+            "experiment_id": exp_id,
+            "experiment_dir": str(exp_dir),
+            "report_json": str(report_json),
+            "summary_txt": str(summary_txt),
+        }
+    )
+
+    write_report_json(report_json, results)
+    write_summary_txt(summary_txt, results)
+
+    plot_paths = write_plots(cfg.reports_dir, results, prefix=f"plots_{exp_id}_{timestamp}")
+    results["artifacts"]["plots"] = [str(p) for p in plot_paths]
+    write_report_json(report_json, results)
+
+    print(" Relatórios salvos:")
+    print(f"   - JSON: {report_json}")
+    print(f"   - TXT:  {summary_txt}")
+    if plot_paths:
+        print("   - PLOTS:")
+        for p in plot_paths:
+            print(f"     * {p}")
+
+    return results
 
 
 def _tokenizer_compat_key(tokenizer) -> str:
@@ -140,6 +1034,7 @@ def run_experiment(
     enable_bbh_train: bool,
     eval_gsm8k: bool,
     eval_bbh: bool,
+    eval_obqa: bool,
     eval_efficiency: bool,
     use_cot_prompt_eval: bool,
     prepare_caches: bool,
@@ -159,6 +1054,7 @@ def run_experiment(
         "enable_bbh_train": enable_bbh_train,
         "eval_gsm8k": eval_gsm8k,
         "eval_bbh": eval_bbh,
+        "eval_obqa": bool(eval_obqa),
         "eval_efficiency": eval_efficiency,
         "use_cot_prompt_eval": use_cot_prompt_eval,
         "prepare_caches": prepare_caches,
@@ -403,6 +1299,7 @@ def run_experiment(
                 seed=seed,
                 eval_gsm8k=eval_gsm8k,
                 eval_bbh=eval_bbh,
+                eval_obqa=bool(eval_obqa),
                 eval_efficiency=eval_efficiency,
                 use_cot_prompt=use_cot_prompt_eval,
                 generation_cfg=cfg.eval_generation,
@@ -530,6 +1427,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_eval_gsm8k", action="store_true", help="Disable GSM8K evaluation")
     p.add_argument("--eval_bbh", action="store_true", help="Evaluate on BBEH/BBH held-out split")
     p.add_argument("--no_eval_bbh", action="store_true", help="Disable BBH evaluation")
+
+    # Commonsense OOD (eval-only)
+    p.add_argument("--eval_obqa", action="store_true", help="Evaluate on OpenBookQA test (commonsense; OOD; eval-only)")
+    p.add_argument("--no_eval_obqa", action="store_true", help="Disable OBQA evaluation")
+    p.add_argument("--eval_limit_obqa", type=int, default=200, help="Max OBQA examples to evaluate")
     p.add_argument("--eval_efficiency", action="store_true", help="Compute secondary efficiency metrics")
     p.add_argument("--no_eval_efficiency", action="store_true", help="Disable efficiency metrics")
 
@@ -561,6 +1463,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--teacher_cot_max_new_tokens", type=int, default=150)
     p.add_argument("--teacher_cot_temperature", type=float, default=0.0)
+
+    # Baseline 0.1
+    p.add_argument(
+        "--ft_teacher",
+        action="store_true",
+        help="Run baseline 0.1: supervised fine-tuning (SFT) of the teacher on TRAIN split only (LoRA), then evaluate and save checkpoint.",
+    )
+    p.add_argument(
+        "--ft_student",
+        action="store_true",
+        help="Run baseline 0.2: supervised fine-tuning (SFT) of the student (no KD) on TRAIN split only (LoRA), then evaluate and save checkpoint.",
+    )
+
+    # Baseline 0.3
+    p.add_argument(
+        "--kd_logits_baseline",
+        action="store_true",
+        help="Run baseline 0.3: KD by logits using an adjusted teacher checkpoint dir (teacher_ckpt_dir) -> student.",
+    )
+    p.add_argument(
+        "--teacher_ckpt_dir",
+        type=str,
+        default=None,
+        help="Path to a saved teacher directory (either full HF model dir with config.json or PEFT adapter dir with adapter_config.json). Used by --kd_logits_baseline and --kd_cot_baseline.",
+    )
+
+    # Baseline 0.4
+    p.add_argument(
+        "--kd_cot_baseline",
+        action="store_true",
+        help="Run baseline 0.4: KD CoT padrão (text-only; CoT before answer; CE-only; no granularidade/CasCoD/Post-CoT).",
+    )
 
     return p
 
@@ -615,6 +1549,13 @@ def main(argv: Optional[Sequence[str]] = None):
     if args.no_eval_bbh:
         eval_bbh = False
 
+    eval_obqa = False
+    if args.eval_obqa:
+        eval_obqa = True
+    if args.no_eval_obqa:
+        eval_obqa = False
+    cfg.eval_limit_obqa = int(args.eval_limit_obqa)
+
     eval_eff = True
     if args.eval_efficiency:
         eval_eff = True
@@ -637,6 +1578,65 @@ def main(argv: Optional[Sequence[str]] = None):
     if args.no_logits_kd:
         use_logits_kd = False
 
+    # Baseline 0.1: FT Teacher
+    if bool(args.ft_teacher):
+        return run_ft_teacher_baseline(
+            cfg,
+            enable_gsm8k_train=enable_gsm8k_train,
+            enable_bbh_train=enable_bbh_train,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=eval_obqa,
+            eval_efficiency=eval_eff,
+            use_cot_prompt_eval=use_cot_eval,
+        )
+
+    # Baseline 0.2: FT Student
+    if bool(args.ft_student):
+        return run_ft_student_baseline(
+            cfg,
+            student_key=str(args.student),
+            enable_gsm8k_train=enable_gsm8k_train,
+            enable_bbh_train=enable_bbh_train,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=eval_obqa,
+            eval_efficiency=eval_eff,
+            use_cot_prompt_eval=use_cot_eval,
+        )
+
+    # Baseline 0.3: KD logits (teacher adjusted -> student)
+    if bool(args.kd_logits_baseline):
+        if not args.teacher_ckpt_dir:
+            raise ValueError("--kd_logits_baseline requer --teacher_ckpt_dir")
+        return run_kd_logits_baseline(
+            cfg,
+            teacher_ckpt_dir=str(args.teacher_ckpt_dir),
+            student_key=str(args.student),
+            enable_gsm8k_train=enable_gsm8k_train,
+            enable_bbh_train=enable_bbh_train,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=eval_obqa,
+            eval_efficiency=eval_eff,
+            use_cot_prompt_eval=use_cot_eval,
+        )
+
+    # Baseline 0.4: KD CoT padrão (text-only)
+    if bool(args.kd_cot_baseline):
+        return run_kd_cot_standard_baseline(
+            cfg,
+            teacher_ckpt_dir=(str(args.teacher_ckpt_dir) if args.teacher_ckpt_dir else None),
+            student_key=str(args.student),
+            enable_gsm8k_train=enable_gsm8k_train,
+            enable_bbh_train=enable_bbh_train,
+            eval_gsm8k=eval_gsm8k,
+            eval_bbh=eval_bbh,
+            eval_obqa=eval_obqa,
+            eval_efficiency=eval_eff,
+            use_cot_prompt_eval=use_cot_eval,
+        )
+
     return run_experiment(
         cfg,
         kd_modes=args.kd_modes,
@@ -644,6 +1644,7 @@ def main(argv: Optional[Sequence[str]] = None):
         enable_bbh_train=enable_bbh_train,
         eval_gsm8k=eval_gsm8k,
         eval_bbh=eval_bbh,
+        eval_obqa=eval_obqa,
         eval_efficiency=eval_eff,
         use_cot_prompt_eval=use_cot_eval,
         prepare_caches=prepare_caches,

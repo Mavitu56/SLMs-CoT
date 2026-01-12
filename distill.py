@@ -358,16 +358,17 @@ class ReasoningAwareDistiller:
         seed: int = 42,
         use_cot_cache: bool = True,
         use_logits_cache: bool = True,
+        use_teacher_logits: bool = True,
     ):
         set_seed(seed)
         device = self.config.device
 
-        logits_ready = bool(use_logits_cache and self.logits_cache_dir and os.path.isdir(self.logits_cache_dir))
+        logits_ready = bool(use_teacher_logits and use_logits_cache and self.logits_cache_dir and os.path.isdir(self.logits_cache_dir))
         cot_ready = bool(use_cot_cache and self.cot_cache_path and os.path.exists(self.cot_cache_path))
         if use_cot_cache and not cot_ready:
             raise ValueError("cot_cache_path no encontrado. Gere o cache primeiro.")
-        if not logits_ready and teacher_model is None:
-            raise ValueError("Precisa de teacher_model quando no h cache de logits.")
+        if use_teacher_logits and not logits_ready and teacher_model is None:
+            raise ValueError("Precisa de teacher_model quando não há cache de logits e use_teacher_logits=True.")
 
         teacher_logits_cache = self._load_logits_cache(self.logits_cache_dir) if logits_ready else None
         cot_records = self._load_cot_cache(self.cot_cache_path) if cot_ready else None
@@ -496,7 +497,7 @@ class ReasoningAwareDistiller:
         temperature_schedule = self.config.kd_params.get("temperature_schedule") or [1.0]
         alpha_schedule = self.config.kd_params.get("alpha_schedule") or [0.5]
 
-        metrics = {"losses": [], "kd_losses": [], "ce_losses": []}
+        metrics = {"losses": [], "kd_losses": [], "ce_losses": [], "use_teacher_logits": bool(use_teacher_logits)}
 
         for epoch in range(num_epochs):
             temperature = get_schedule_value(temperature_schedule, epoch, default=1.0)
@@ -519,21 +520,26 @@ class ReasoningAwareDistiller:
                     labels_ce = labels.long().clamp(min=-100, max=vocab_size - 1)
                     labels_ce, _san = sanitize_labels_for_ce(labels_ce, vocab_size)
 
-                    if "teacher_logits" in batch:
-                        teacher_logits = batch["teacher_logits"].to(device)
-                    else:
-                        with torch.inference_mode():
-                            teacher_logits = teacher_model(**inputs).logits
-                    teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
-
                     ce_loss = F.cross_entropy(s_logits.reshape(-1, vocab_size), labels_ce.reshape(-1), ignore_index=-100)
-                    t_probs = F.softmax(teacher_logits / temperature, dim=-1)
-                    s_logp = F.log_softmax(s_logits / temperature, dim=-1)
-                    token_kl = F.kl_div(s_logp, t_probs, reduction="none")
-                    mask = reasoning_mask.unsqueeze(-1).float()
-                    kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
-                    kd_loss *= temperature**2
-                    loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
+
+                    if use_teacher_logits:
+                        if "teacher_logits" in batch:
+                            teacher_logits = batch["teacher_logits"].to(device)
+                        else:
+                            with torch.inference_mode():
+                                teacher_logits = teacher_model(**inputs).logits
+                        teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
+
+                        t_probs = F.softmax(teacher_logits / temperature, dim=-1)
+                        s_logp = F.log_softmax(s_logits / temperature, dim=-1)
+                        token_kl = F.kl_div(s_logp, t_probs, reduction="none")
+                        mask = reasoning_mask.unsqueeze(-1).float()
+                        kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
+                        kd_loss *= temperature**2
+                        loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
+                    else:
+                        kd_loss = torch.tensor(0.0, device=device)
+                        loss = ce_loss
 
                     if grad_accum_steps > 1:
                         loss = loss / float(grad_accum_steps)
