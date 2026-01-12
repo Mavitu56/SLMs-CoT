@@ -118,6 +118,7 @@ def build_reasoning_full_sequences_from_cot(
     *,
     granularity_level: int = 0,
     post_cot: bool = False,
+    post_cot_use_ig: bool = False,
 ) -> List[str]:
     """Build prompt+completion sequences from a teacher CoT cache.
 
@@ -131,13 +132,59 @@ def build_reasoning_full_sequences_from_cot(
     with open(cot_path, "r", encoding="utf-8") as handle:
         for line in handle:
             rec = json.loads(line)
-            prompt, _ = build_cot_prompt(
-                str(rec.get("question", rec.get("text", ""))),
-                granularity_level=int(granularity_level or 0),
-                post_cot=bool(post_cot),
-            )
+
+            # Multi-level cache: expand across cached granularity levels.
+            prompt_levels = rec.get("prompt_levels")
+            reasoning_levels = rec.get("teacher_reasoning_levels")
+            answer_levels = rec.get("teacher_answer_levels")
+
+            if isinstance(prompt_levels, dict) and isinstance(reasoning_levels, dict):
+                levels = rec.get("granularity_levels")
+                if not isinstance(levels, list) or not levels:
+                    try:
+                        levels = sorted({int(k) for k in prompt_levels.keys()})
+                    except Exception:
+                        levels = []
+                for lvl in levels:
+                    k = str(int(lvl))
+                    prompt = str(prompt_levels.get(k) or "").strip()
+                    if not prompt:
+                        continue
+                    reasoning = str(reasoning_levels.get(k) or "").strip()
+                    if not reasoning:
+                        continue
+                    answer = str((answer_levels or {}).get(k) or rec.get("teacher_answer", "") or "").strip()
+
+                    if bool(post_cot):
+                        if bool(post_cot_use_ig) and isinstance(rec.get("teacher_reasoning_ig"), str) and rec.get("teacher_reasoning_ig").strip():
+                            reasoning_use = str(rec.get("teacher_reasoning_ig") or "").strip()
+                        else:
+                            reasoning_use = reasoning
+                        teacher_full = (answer + "\n### REASONING:\n" + reasoning_use)
+                    else:
+                        teacher_full = (reasoning + "\n### FINAL_ANSWER: " + answer)
+
+                    seqs.append(prompt + teacher_full)
+                    if max_records is not None and len(seqs) >= int(max_records):
+                        break
+                if max_records is not None and len(seqs) >= int(max_records):
+                    break
+                continue
+
+            # Single-level legacy.
+            prompt = rec.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                prompt, _ = build_cot_prompt(
+                    str(rec.get("question", rec.get("text", ""))),
+                    granularity_level=int(granularity_level or 0),
+                    post_cot=bool(post_cot),
+                )
+
             if bool(post_cot):
-                teacher_full = (rec.get("teacher_answer", "").strip() + "\n### REASONING:\n" + rec.get("teacher_reasoning", "").strip())
+                reasoning = rec.get("teacher_reasoning", "").strip()
+                if bool(post_cot_use_ig) and isinstance(rec.get("teacher_reasoning_ig"), str) and rec.get("teacher_reasoning_ig").strip():
+                    reasoning = str(rec.get("teacher_reasoning_ig") or "").strip()
+                teacher_full = (rec.get("teacher_answer", "").strip() + "\n### REASONING:\n" + reasoning)
             else:
                 teacher_full = (rec.get("teacher_reasoning", "").strip() + "\n### FINAL_ANSWER: " + rec.get("teacher_answer", ""))
             seqs.append(prompt + teacher_full)
@@ -378,6 +425,8 @@ class ReasoningAwareDistiller:
         use_teacher_logits: bool = True,
         granularity_level: int = 0,
         post_cot: bool = False,
+        granularity_multi_level: bool = False,
+        post_cot_use_ig: bool = False,
     ):
         set_seed(seed)
         device = self.config.device
@@ -396,13 +445,50 @@ class ReasoningAwareDistiller:
         examples: List[Dict[str, str]] = []
         if cot_records is not None:
             for rec in cot_records:
-                prompt, _ = build_cot_prompt(
-                    str(rec.get("question", rec.get("text", ""))),
-                    granularity_level=int(granularity_level or 0),
-                    post_cot=bool(post_cot),
-                )
+                prompt_levels = rec.get("prompt_levels")
+                reasoning_levels = rec.get("teacher_reasoning_levels")
+                answer_levels = rec.get("teacher_answer_levels")
+
+                if bool(granularity_multi_level) and isinstance(prompt_levels, dict) and isinstance(reasoning_levels, dict):
+                    levels = rec.get("granularity_levels")
+                    if not isinstance(levels, list) or not levels:
+                        try:
+                            levels = sorted({int(k) for k in prompt_levels.keys()})
+                        except Exception:
+                            levels = []
+
+                    for lvl in levels:
+                        k = str(int(lvl))
+                        prompt = str(prompt_levels.get(k) or "").strip()
+                        if not prompt:
+                            continue
+                        reasoning = str(reasoning_levels.get(k) or "").strip()
+                        if not reasoning:
+                            continue
+                        answer = str((answer_levels or {}).get(k) or rec.get("teacher_answer", "") or "").strip()
+
+                        if bool(post_cot):
+                            reasoning_use = reasoning
+                            if bool(post_cot_use_ig) and isinstance(rec.get("teacher_reasoning_ig"), str) and rec.get("teacher_reasoning_ig").strip():
+                                reasoning_use = str(rec.get("teacher_reasoning_ig") or "").strip()
+                            teacher_full = (answer + "\n### REASONING:\n" + reasoning_use)
+                        else:
+                            teacher_full = (reasoning + "\n### FINAL_ANSWER: " + answer)
+                        examples.append({"prompt": prompt, "teacher_full": teacher_full})
+                    continue
+
+                prompt = rec.get("prompt")
+                if not isinstance(prompt, str) or not prompt.strip():
+                    prompt, _ = build_cot_prompt(
+                        str(rec.get("question", rec.get("text", ""))),
+                        granularity_level=int(granularity_level or 0),
+                        post_cot=bool(post_cot),
+                    )
                 if bool(post_cot):
-                    teacher_full = (rec.get("teacher_answer", "").strip() + "\n### REASONING:\n" + rec.get("teacher_reasoning", "").strip())
+                    reasoning = rec.get("teacher_reasoning", "").strip()
+                    if bool(post_cot_use_ig) and isinstance(rec.get("teacher_reasoning_ig"), str) and rec.get("teacher_reasoning_ig").strip():
+                        reasoning = str(rec.get("teacher_reasoning_ig") or "").strip()
+                    teacher_full = (rec.get("teacher_answer", "").strip() + "\n### REASONING:\n" + reasoning)
                 else:
                     teacher_full = (rec.get("teacher_reasoning", "").strip() + "\n### FINAL_ANSWER: " + rec.get("teacher_answer", ""))
                 examples.append({"prompt": prompt, "teacher_full": teacher_full})

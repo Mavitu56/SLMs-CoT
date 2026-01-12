@@ -14,6 +14,7 @@ from cache import cache_teacher_cot, cache_teacher_logits, read_cache_metadata, 
 from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_pad, get_safe_tokenizer_length, safe_model_to, set_seed
 from data import load_training_dataset
 from distill import ReasoningAwareDistiller, TraditionalKDDistiller, autocast_ctx, make_grad_scaler, preprocess_and_tokenize
+from prompts import build_cascod_answer_prompt, build_cascod_rationale_prompt
 from eval import StandardizedEvaluator
 from report import ScientificLogger, write_plots, write_report_json, write_summary_txt
 from stats import StatisticalAnalyst
@@ -68,15 +69,16 @@ def _train_sft_lora(
             # If unavailable, continue; training may still work but will be less stable.
             pass
 
-    lora_cfg = LoraConfig(
-        r=int(cfg.kd_params.get("lora_rank", 16)),
-        lora_alpha=32,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.1,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, lora_cfg)
+    if not hasattr(model, "peft_config"):
+        lora_cfg = LoraConfig(
+            r=int(cfg.kd_params.get("lora_rank", 16)),
+            lora_alpha=32,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        model = get_peft_model(model, lora_cfg)
     model.train()
     model = safe_model_to(model, device)
 
@@ -151,6 +153,138 @@ def _train_sft_lora(
             if metrics["losses"]:
                 recent = metrics["losses"][-min(50, len(metrics["losses"])) :]
                 pbar.set_postfix({"loss": f"{sum(recent)/len(recent):.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+
+    if metrics["losses"]:
+        metrics["loss_mean"] = float(sum(metrics["losses"]) / len(metrics["losses"]))
+
+    return model, metrics
+
+
+def _train_cascod_lora(
+    cfg: EvidenceBasedConfig,
+    model,
+    tokenizer,
+    ds_rationale,
+    ds_answer,
+    *,
+    seed: int,
+    alpha: float,
+) -> tuple[Any, Dict[str, Any]]:
+    """CasCoD training with teacher rationales.
+
+    Implements:
+      L = (1-α) L_rationale(q->r) + α L_answer(q,r->a)
+
+    This is done via two forward passes per step (one for each objective).
+    """
+
+    import math
+
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+    from tqdm.auto import tqdm
+    from transformers import get_scheduler
+
+    set_seed(seed)
+    device = cfg.device
+
+    alpha = float(alpha)
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError("cascod_alpha must be in [0,1]")
+
+    tok_r = preprocess_and_tokenize(ds_rationale, tokenizer, max_length=cfg.max_length)
+    tok_a = preprocess_and_tokenize(ds_answer, tokenizer, max_length=cfg.max_length)
+
+    # Stability + memory.
+    try:
+        model.config.use_cache = False
+    except Exception:
+        pass
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        pass
+
+    # Model should already have LoRA from stage1; if not, allow training anyway.
+    model.train()
+    model = safe_model_to(model, device)
+
+    batch_size = int(cfg.kd_params.get("batch_size", 2))
+    grad_accum_steps = int(cfg.kd_params.get("grad_accum_steps", 1))
+    num_workers = int(cfg.kd_params.get("dataloader_num_workers", 0))
+
+    dl_r = DataLoader(tok_r, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=num_workers)
+    dl_a = DataLoader(tok_a, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=num_workers)
+
+    num_epochs = int(cfg.kd_params.get("epochs", 1))
+    num_training_steps = max(1, num_epochs * min(len(dl_r), len(dl_a)))
+    warmup_steps = max(0, int(0.1 * num_training_steps))
+
+    lr = float(cfg.kd_params.get("learning_rates", {}).get("kd", 5e-5))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+
+    scaler = make_grad_scaler(device)
+    metrics: Dict[str, Any] = {
+        "epochs": num_epochs,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "learning_rate": lr,
+        "alpha": alpha,
+        "loss_mean": None,
+        "losses": [],
+        "losses_rationale": [],
+        "losses_answer": [],
+    }
+
+    model.zero_grad(set_to_none=True)
+    step = 0
+    for epoch in range(num_epochs):
+        pbar = tqdm(zip(dl_r, dl_a), desc=f"CasCoD Epoch {epoch}", total=min(len(dl_r), len(dl_a)))
+        for batch_r, batch_a in pbar:
+            step += 1
+
+            def _forward_loss(batch):
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
+                labels = batch["labels"].to(device)
+                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = out.loss
+                if loss is None:
+                    logits = out.logits
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1),
+                        ignore_index=-100,
+                    )
+                return loss
+
+            with autocast_ctx(device):
+                loss_r = _forward_loss(batch_r)
+                loss_a = _forward_loss(batch_a)
+                loss = (1.0 - alpha) * loss_r + alpha * loss_a
+                loss_to_backprop = loss / float(max(1, grad_accum_steps))
+
+            scaler.scale(loss_to_backprop).backward()
+
+            if (step % grad_accum_steps) == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                lr_scheduler.step()
+
+            metrics["losses"].append(float(loss.detach().cpu().item()))
+            metrics["losses_rationale"].append(float(loss_r.detach().cpu().item()))
+            metrics["losses_answer"].append(float(loss_a.detach().cpu().item()))
+            recent = metrics["losses"][-min(50, len(metrics["losses"])) :]
+            pbar.set_postfix({"loss": f"{sum(recent)/len(recent):.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
 
     if metrics["losses"]:
         metrics["loss_mean"] = float(sum(metrics["losses"]) / len(metrics["losses"]))
@@ -1018,9 +1152,17 @@ def run_experiment(
     hypothesis_metric: str,
     student_key: str,
     granularity_level: int = 0,
+    granularity_one_shot: bool = False,
+    granularity_multi_level: bool = False,
     cascod_stage1_epochs: int = 1,
     cascod_stage2_epochs: int = -1,
+    cascod_alpha: float = 0.3,
     post_cot: bool = False,
+    post_cot_gold_rationale: bool = False,
+    post_cot_use_ig: bool = False,
+    post_cot_ig_steps: int = 8,
+    post_cot_ig_top_frac: float = 0.3,
+    cascod_filter_by_gold: bool = True,
 ) -> Dict[str, Any]:
     logger = ScientificLogger()
     analyst = StatisticalAnalyst(alpha=cfg.alpha_level)
@@ -1028,8 +1170,25 @@ def run_experiment(
 
     combo_d_enabled = "combo_d" in set(kd_modes or [])
 
-    def _cot_variant_key(*, post: bool, gran: int) -> str:
-        return f"post_cot={int(bool(post))}|granularity={int(gran or 0)}"
+    def _cot_variant_key(
+        *,
+        post: bool,
+        gran: int,
+        one_shot: bool,
+        multi_level: bool,
+        gold_rationale: bool,
+        ig: bool,
+        filter_gold: bool,
+    ) -> str:
+        return (
+            f"post_cot={int(bool(post))}|"
+            f"granularity={int(gran or 0)}|"
+            f"one_shot={int(bool(one_shot))}|"
+            f"multi_level={int(bool(multi_level))}|"
+            f"gold_rationale={int(bool(gold_rationale))}|"
+            f"ig={int(bool(ig))}|"
+            f"filter_gold={int(bool(filter_gold))}"
+        )
 
     flags = {
         "enable_gsm8k_train": enable_gsm8k_train,
@@ -1047,9 +1206,17 @@ def run_experiment(
         "hypothesis_metric": hypothesis_metric,
         "student_key": student_key,
         "granularity_level": int(granularity_level or 0),
+        "granularity_one_shot": bool(granularity_one_shot),
+        "granularity_multi_level": bool(granularity_multi_level),
         "cascod_stage1_epochs": int(cascod_stage1_epochs or 0),
         "cascod_stage2_epochs": int(cascod_stage2_epochs or -1),
+        "cascod_alpha": float(cascod_alpha),
         "post_cot": bool(post_cot),
+        "post_cot_gold_rationale": bool(post_cot_gold_rationale),
+        "post_cot_use_ig": bool(post_cot_use_ig),
+        "post_cot_ig_steps": int(post_cot_ig_steps or 0),
+        "post_cot_ig_top_frac": float(post_cot_ig_top_frac or 0.0),
+        "cascod_filter_by_gold": bool(cascod_filter_by_gold),
         "combo_d_enabled": bool(combo_d_enabled),
     }
 
@@ -1067,7 +1234,10 @@ def run_experiment(
     if "reasoning" in kd_modes:
         conditions["kd_with_reasoning"] = {"mode": "reasoning", "description": "KD com raciocínio (CoT-aware)"}
     if "cascod" in kd_modes:
-        conditions["kd_cascod"] = {"mode": "cascod", "description": "CasCoD (2B): 2 estágios (CoT CE-only → logits-KD)"}
+        conditions["kd_cascod"] = {
+            "mode": "cascod",
+            "description": "CasCoD (2B): q→r e q,r→a com L=(1-α)Lr+αLa (teacher rationales)",
+        }
     if "combo_d" in kd_modes:
         conditions["kd_combo_d"] = {
             "mode": "cascod",
@@ -1089,31 +1259,68 @@ def run_experiment(
         teacher_model, teacher_tok = setup_model_and_tokenizer(cfg.model_hierarchy["teacher_medium"], cfg.device, cfg.quantization)
 
         if cache_cot:
-            cot_file = cache_teacher_cot(
-                teacher_model,
-                teacher_tok,
-                train_ds_for_cache,
-                cache_root=cfg.cache_dir,
-                batch_size=max(1, cfg.kd_params["batch_size"] // 2),
-                device=str(cfg.device),
-                generation_cfg=cfg.teacher_cot_generation,
-                split="train",
-                seed=cfg.seeds[0],
-                prompt_max_length=cfg.max_length,
-                train_limit=cfg.train_limit,
-                granularity_level=int(granularity_level or 0),
-                post_cot=bool(post_cot),
-            )
-            # Legacy key (kept for backward-compat)
-            state["teacher_cot_file"] = str(cot_file)
+            use_one_shot = bool(granularity_one_shot) and int(granularity_level or 0) > 0
 
-            # New variant-keyed mapping (prevents collisions across post_cot/granularity)
-            cot_key = _cot_variant_key(post=bool(post_cot), gran=int(granularity_level or 0))
+            # Prepare the CoT variants actually needed by selected modes.
+            variants = []
+            if "reasoning" in kd_modes:
+                variants.append({"post": bool(post_cot), "filter_gold": False})
+            if "cascod" in kd_modes:
+                variants.append({"post": bool(post_cot), "filter_gold": bool(cascod_filter_by_gold)})
+            if combo_d_enabled:
+                variants.append({"post": True, "filter_gold": bool(cascod_filter_by_gold)})
+            if not variants:
+                variants.append({"post": bool(post_cot), "filter_gold": False})
+
             tcf = state.get("teacher_cot_files")
             if not isinstance(tcf, dict):
                 tcf = {}
-            tcf[cot_key] = str(cot_file)
+
+            cot_file_for_legacy = None
+            for v in variants:
+                v_post = bool(v["post"])
+                v_filter = bool(v["filter_gold"])
+                v_gold_rationale = bool(post_cot_gold_rationale) and v_post
+                cot_file = cache_teacher_cot(
+                    teacher_model,
+                    teacher_tok,
+                    train_ds_for_cache,
+                    cache_root=cfg.cache_dir,
+                    batch_size=max(1, cfg.kd_params["batch_size"] // 2),
+                    device=str(cfg.device),
+                    generation_cfg=cfg.teacher_cot_generation,
+                    split="train",
+                    seed=cfg.seeds[0],
+                    prompt_max_length=cfg.max_length,
+                    train_limit=cfg.train_limit,
+                    granularity_level=int(granularity_level or 0),
+                    granularity_multi_level=bool(granularity_multi_level),
+                    post_cot=bool(v_post),
+                    one_shot=bool(use_one_shot),
+                    post_cot_gold_rationale=bool(v_gold_rationale),
+                    post_cot_use_ig=bool(post_cot_use_ig),
+                    post_cot_ig_steps=int(post_cot_ig_steps or 8),
+                    post_cot_ig_top_frac=float(post_cot_ig_top_frac or 0.3),
+                    filter_by_gold_answer=bool(v_filter),
+                )
+
+                cot_key = _cot_variant_key(
+                    post=bool(v_post),
+                    gran=int(granularity_level or 0),
+                    one_shot=bool(use_one_shot),
+                    multi_level=bool(granularity_multi_level),
+                    gold_rationale=bool(v_gold_rationale),
+                    ig=bool(post_cot_use_ig),
+                    filter_gold=bool(v_filter),
+                )
+                tcf[cot_key] = str(cot_file)
+                if cot_file_for_legacy is None:
+                    cot_file_for_legacy = str(cot_file)
+
             state["teacher_cot_files"] = dict(tcf)
+            # Legacy key (kept for backward-compat)
+            if cot_file_for_legacy is not None:
+                state["teacher_cot_file"] = str(cot_file_for_legacy)
 
         # Scientific validity fix: logits-cache is per KD mode/input. We only
         # build caches when logits-KD is enabled and tokenizers are compatible.
@@ -1143,11 +1350,27 @@ def run_experiment(
                 else:
                     from distill import build_reasoning_full_sequences_from_cot
 
+                    use_one_shot = bool(granularity_one_shot) and int(granularity_level or 0) > 0
+                    reason_key = _cot_variant_key(
+                        post=bool(post_cot),
+                        gran=int(granularity_level or 0),
+                        one_shot=bool(use_one_shot),
+                        multi_level=bool(granularity_multi_level),
+                        gold_rationale=(bool(post_cot) and bool(post_cot_gold_rationale)),
+                        ig=bool(post_cot_use_ig),
+                        filter_gold=False,
+                    )
+                    cot_for_reasoning = None
+                    tcf = state.get("teacher_cot_files")
+                    if isinstance(tcf, dict):
+                        cot_for_reasoning = tcf.get(reason_key)
+                    cot_for_reasoning = cot_for_reasoning or state.get("teacher_cot_file")
+
                     full_sequences = build_reasoning_full_sequences_from_cot(
-                        cot_path=str(state["teacher_cot_file"]),
+                        cot_path=str(cot_for_reasoning),
                         max_records=cfg.train_limit,
-                        granularity_level=int(granularity_level or 0),
                         post_cot=bool(post_cot),
+                        post_cot_use_ig=bool(post_cot_use_ig),
                     )
                     logits_dir_reason = cache_teacher_logits(
                         teacher_model,
@@ -1180,8 +1403,18 @@ def run_experiment(
         teacher_cot_files = {}
         legacy = state.get("teacher_cot_file")
         if legacy:
-            # Assume legacy corresponds to current global settings.
-            teacher_cot_files[_cot_variant_key(post=bool(post_cot), gran=int(granularity_level or 0))] = str(legacy)
+            # Assume legacy corresponds to current global settings (no filtering, no 1-shot).
+            teacher_cot_files[
+                _cot_variant_key(
+                    post=bool(post_cot),
+                    gran=int(granularity_level or 0),
+                    one_shot=False,
+                    multi_level=bool(granularity_multi_level),
+                    gold_rationale=False,
+                    ig=False,
+                    filter_gold=False,
+                )
+            ] = str(legacy)
             state["teacher_cot_files"] = dict(teacher_cot_files)
             _save_state(state_path, state)
 
@@ -1198,7 +1431,18 @@ def run_experiment(
             set_seed(seed)
 
             cond_post_cot = bool(post_cot) or bool(cond_cfg.get("force_post_cot", False))
-            cot_key = _cot_variant_key(post=cond_post_cot, gran=int(granularity_level or 0))
+            cond_one_shot = bool(granularity_one_shot) and int(granularity_level or 0) > 0
+            cond_gold_rationale = bool(post_cot_gold_rationale) and bool(cond_post_cot)
+            cond_filter_gold = bool(cascod_filter_by_gold) if cond_cfg["mode"] == "cascod" else False
+            cot_key = _cot_variant_key(
+                post=bool(cond_post_cot),
+                gran=int(granularity_level or 0),
+                one_shot=bool(cond_one_shot),
+                multi_level=bool(granularity_multi_level),
+                gold_rationale=bool(cond_gold_rationale),
+                ig=bool(post_cot_use_ig),
+                filter_gold=bool(cond_filter_gold),
+            )
             teacher_cot_file = teacher_cot_files.get(cot_key)
 
             # Load models
@@ -1216,7 +1460,8 @@ def run_experiment(
             student_model, student_tok = setup_model_and_tokenizer(student_name, cfg.device, cfg.quantization)
 
             # Scientific validity fix: logits-KD requires tokenizer compatibility.
-            if use_logits_kd:
+            # CasCoD fiel (q->r + q,r->a) não depende de logits-KD por padrão.
+            if use_logits_kd and cond_cfg["mode"] != "cascod":
                 cache_dir = None
                 if cond_cfg["mode"] in ("traditional", "cascod"):
                     cache_dir = teacher_logits_traditional_dir
@@ -1272,35 +1517,21 @@ def run_experiment(
                         prompt_max_length=cfg.max_length,
                         train_limit=cfg.train_limit,
                         granularity_level=int(granularity_level or 0),
+                        granularity_multi_level=bool(granularity_multi_level),
                         post_cot=bool(cond_post_cot),
+                        one_shot=bool(cond_one_shot),
+                        post_cot_gold_rationale=bool(cond_gold_rationale),
+                        post_cot_use_ig=bool(post_cot_use_ig),
+                        post_cot_ig_steps=int(post_cot_ig_steps or 8),
+                        post_cot_ig_top_frac=float(post_cot_ig_top_frac or 0.3),
+                        filter_by_gold_answer=bool(cond_filter_gold),
                     )
                 )
                 teacher_cot_files[cot_key] = str(teacher_cot_file)
                 state["teacher_cot_files"] = dict(teacher_cot_files)
                 _save_state(state_path, state)
 
-            # CasCoD stage2 requires traditional logits cache when logits-KD is enabled.
-            if cond_cfg["mode"] == "cascod" and use_logits_kd and not teacher_logits_traditional_dir:
-                if teacher_model is None or teacher_tok is None:
-                    teacher_model, teacher_tok = setup_model_and_tokenizer(cfg.model_hierarchy["teacher_medium"], cfg.device, cfg.quantization)
-                logits_dir_trad = cache_teacher_logits(
-                    teacher_model,
-                    teacher_tok,
-                    train_ds,
-                    cache_root=cfg.cache_dir,
-                    batch_size=cfg.kd_params["batch_size"],
-                    device=str(cfg.device),
-                    generation_cfg=GenerationConfig(max_new_tokens=0, temperature=0.0, do_sample=False),
-                    split="train",
-                    seed=seed,
-                    kd_mode="traditional",
-                    input_kind="prompt_completion",
-                    train_limit=cfg.train_limit,
-                    max_length=cfg.max_length,
-                )
-                teacher_logits_traditional_dir = str(logits_dir_trad)
-                state["teacher_logits_traditional_dir"] = str(teacher_logits_traditional_dir)
-                _save_state(state_path, state)
+            # Note: CasCoD fiel (q->r + q,r->a) não precisa de logits cache.
 
             # Distill
             if cond_cfg["mode"] == "traditional":
@@ -1337,15 +1568,75 @@ def run_experiment(
                     use_logits_cache=bool(use_logits_kd and teacher_logits_reasoning_dir),
                     granularity_level=int(granularity_level or 0),
                     post_cot=bool(cond_post_cot),
+                    granularity_multi_level=bool(granularity_multi_level),
+                    post_cot_use_ig=bool(post_cot_use_ig),
                 )
             elif cond_cfg["mode"] == "cascod":
-                if not use_logits_kd:
-                    raise ValueError(
-                        "CasCoD (2B) requer logits-KD habilitado para o estágio 2 (answer-only). "
-                        "Use --use_logits_kd ou remova 'cascod' dos kd_modes."
-                    )
                 if not teacher_cot_file:
                     raise ValueError("CasCoD exige teacher_cot_file.")
+
+                # Faithful CasCoD uses Pre-CoT internally (q->r), and q,r->a for the answer.
+                if bool(cond_post_cot):
+                    print(" (info) CasCoD fiel usa Pre-CoT internamente; ignorando post_cot para o treino CasCoD.")
+
+                import json as _json
+
+                try:
+                    from datasets import Dataset as _Dataset
+                except Exception:
+                    _Dataset = None
+
+                records_r = []
+                records_a = []
+                total_lines = 0
+                skipped_no_q = 0
+                skipped_no_r = 0
+                skipped_no_a = 0
+                skipped_bad_json = 0
+                with open(str(teacher_cot_file), "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        total_lines += 1
+                        try:
+                            rec = _json.loads(line)
+                        except Exception:
+                            skipped_bad_json += 1
+                            continue
+
+                        q = (rec.get("question") or rec.get("text") or "").strip()
+                        r = (rec.get("teacher_reasoning") or "").strip()
+                        gold = (rec.get("gold_answer") or "").strip()
+                        a = (gold or (rec.get("teacher_answer") or "")).strip()
+
+                        if not q:
+                            skipped_no_q += 1
+                            continue
+                        if not r:
+                            skipped_no_r += 1
+                            continue
+                        if not a:
+                            skipped_no_a += 1
+                            continue
+
+                        prompt_r = build_cascod_rationale_prompt(str(q), granularity_level=int(granularity_level or 0))
+                        prompt_a = build_cascod_answer_prompt(str(q), str(r))
+
+                        records_r.append({"text": prompt_r + r, "prompt": prompt_r, "completion": r})
+                        records_a.append({"text": prompt_a + a, "prompt": prompt_a, "completion": a})
+
+                if not records_r or not records_a:
+                    raise ValueError(
+                        "CasCoD: datasets vazios após processar o teacher_cot_file. "
+                        f"total_lines={total_lines} bad_json={skipped_bad_json} "
+                        f"skipped_no_q={skipped_no_q} skipped_no_r={skipped_no_r} skipped_no_a={skipped_no_a}. "
+                        "Dica: verifique se o cache de CoT do teacher contém 'teacher_reasoning' e 'teacher_answer' (ou 'gold_answer'), "
+                        "e se filtros como --cascod_filter_by_gold não estão eliminando quase tudo."
+                    )
+
+                if _Dataset is None:
+                    raise RuntimeError("CasCoD requer o pacote 'datasets' instalado para construir datasets derivados.")
+
+                ds_r = _Dataset.from_list(records_r)
+                ds_a = _Dataset.from_list(records_a)
 
                 old_epochs = int(cfg.kd_params.get("epochs", 1))
                 stage1_epochs = max(1, int(cascod_stage1_epochs or 1))
@@ -1353,37 +1644,25 @@ def run_experiment(
                 if stage2_epochs <= 0:
                     stage2_epochs = old_epochs
 
-                # Stage 1: reasoning CE-only on teacher CoT.
+                # Stage 1 warmup: q -> r
                 cfg.kd_params["epochs"] = stage1_epochs
-                distiller1 = ReasoningAwareDistiller(cfg, cot_cache_path=teacher_cot_file, logits_cache_dir=None)
-                model_s1, metrics_s1 = distiller1.distill_with_reasoning(
-                    student_model,
-                    teacher_model=None,
-                    student_tokenizer=student_tok,
-                    raw_dataset=train_ds,
-                    seed=seed,
-                    use_cot_cache=True,
-                    use_logits_cache=False,
-                    use_teacher_logits=False,
-                    granularity_level=int(granularity_level or 0),
-                    post_cot=bool(cond_post_cot),
-                )
+                model_s1, metrics_s1 = _train_sft_lora(cfg, student_model, student_tok, ds_r, seed=seed)
 
                 stage1_dir = cfg.models_dir / exp_id / f"{cond_name}_stage1_seed{seed}"
                 stage1_dir.mkdir(parents=True, exist_ok=True)
                 model_s1.save_pretrained(stage1_dir)
                 student_tok.save_pretrained(stage1_dir)
 
-                # Stage 2: traditional logits-KD answer-only, continuing from stage1.
+                # Stage 2: mixed loss L=(1-α)Lr + αLa
                 cfg.kd_params["epochs"] = max(1, stage2_epochs)
-                distiller2 = TraditionalKDDistiller(cfg, cache_dir=teacher_logits_traditional_dir)
-                model_s2, metrics_s2 = distiller2.distill(
+                model_s2, metrics_s2 = _train_cascod_lora(
+                    cfg,
                     model_s1,
-                    teacher_model,
                     student_tok,
-                    train_ds,
+                    ds_r,
+                    ds_a,
                     seed=seed,
-                    use_cache=bool(teacher_logits_traditional_dir),
+                    alpha=float(cascod_alpha),
                 )
 
                 cfg.kd_params["epochs"] = old_epochs
@@ -1391,19 +1670,17 @@ def run_experiment(
                 trained_model = model_s2
                 train_metrics = {
                     "cascod": {
+                        "alpha": float(cascod_alpha),
                         "stage1": {
-                            "kind": "reasoning_ce_only",
+                            "kind": "q_to_r_sft",
                             "epochs": int(stage1_epochs),
                             "metrics": metrics_s1,
                             "ckpt_dir": str(stage1_dir),
-                            "granularity_level": int(granularity_level or 0),
-                            "post_cot": bool(cond_post_cot),
                         },
                         "stage2": {
-                            "kind": "traditional_logits_kd",
+                            "kind": "mixed_loss_q_to_r_and_qr_to_a",
                             "epochs": int(stage2_epochs),
                             "metrics": metrics_s2,
-                            "logits_cache_dir": str(teacher_logits_traditional_dir),
                         },
                     }
                 }
@@ -1428,6 +1705,7 @@ def run_experiment(
                 eval_efficiency=eval_efficiency,
                 use_cot_prompt=(False if bool(cond_post_cot) else use_cot_prompt_eval),
                 answer_first_eval=bool(cond_post_cot),
+                cascod_two_stage=(True if cond_cfg["mode"] == "cascod" else False),
                 generation_cfg=cfg.eval_generation,
             )
 
@@ -1444,7 +1722,7 @@ def run_experiment(
                 run_payload["artifacts"].update(
                     {
                         "teacher_cot_file": str(teacher_cot_file),
-                        "teacher_logits_traditional_dir": str(teacher_logits_traditional_dir),
+                        "cascod_alpha": float(cascod_alpha),
                     }
                 )
 
@@ -1607,6 +1885,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="CasCoD stage2 epochs (traditional logits-KD). -1 means use --epochs",
     )
 
+    p.add_argument(
+        "--cascod_alpha",
+        type=float,
+        default=0.3,
+        help="CasCoD alpha in L=(1-alpha)L_rationale + alpha L_answer (default: 0.3)",
+    )
+
     p.add_argument("--eval_max_new_tokens", type=int, default=256)
     p.add_argument("--eval_temperature", type=float, default=0.0)
 
@@ -1621,10 +1906,83 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="0=disabled (backward-compatible), 1..6 increasing reasoning detail for teacher CoT prompts",
     )
 
+    p.add_argument("--granularity_one_shot", dest="granularity_one_shot", action="store_true", help="Enable 1-shot exemplar for granularity prompts")
+    p.add_argument("--no_granularity_one_shot", dest="granularity_one_shot", action="store_false", help="Disable 1-shot exemplar for granularity prompts")
+    p.set_defaults(granularity_one_shot=None)
+
+    p.add_argument(
+        "--granularity_multi_level",
+        dest="granularity_multi_level",
+        action="store_true",
+        help="When granularity is enabled, cache all levels 1..level and expand training across levels",
+    )
+    p.add_argument(
+        "--no_granularity_multi_level",
+        dest="granularity_multi_level",
+        action="store_false",
+        help="Disable multi-level granularity caching/expansion (legacy: only cache the max level)",
+    )
+    p.set_defaults(granularity_multi_level=None)
+
     # Technique 2C: Post-CoT (answer-first training + eval without rationale).
     p.add_argument("--post_cot", dest="post_cot", action="store_true", help="Enable Post-CoT (answer-first) formatting")
     p.add_argument("--no_post_cot", dest="post_cot", action="store_false", help="Disable Post-CoT")
     p.set_defaults(post_cot=False)
+
+    p.add_argument(
+        "--post_cot_gold_rationale",
+        dest="post_cot_gold_rationale",
+        action="store_true",
+        help="Post-CoT teacher prompt: provide gold answer and elicit justification only (more faithful to paper)",
+    )
+    p.add_argument(
+        "--no_post_cot_gold_rationale",
+        dest="post_cot_gold_rationale",
+        action="store_false",
+        help="Disable gold-conditioned rationale elicitation for Post-CoT (legacy behavior)",
+    )
+    p.set_defaults(post_cot_gold_rationale=None)
+
+    p.add_argument(
+        "--post_cot_use_ig",
+        dest="post_cot_use_ig",
+        action="store_true",
+        help="Post-CoT: apply Integrated Gradients to filter/keep important rationale tokens (requires captum)",
+    )
+    p.add_argument(
+        "--no_post_cot_use_ig",
+        dest="post_cot_use_ig",
+        action="store_false",
+        help="Disable Integrated Gradients filtering for Post-CoT",
+    )
+    p.set_defaults(post_cot_use_ig=None)
+
+    p.add_argument(
+        "--post_cot_ig_steps",
+        type=int,
+        default=8,
+        help="Integrated Gradients steps (only used when --post_cot_use_ig; default: 8)",
+    )
+    p.add_argument(
+        "--post_cot_ig_top_frac",
+        type=float,
+        default=0.3,
+        help="Fraction of rationale tokens to keep by IG importance (0,1]; default: 0.3)",
+    )
+
+    p.add_argument(
+        "--cascod_filter_by_gold",
+        dest="cascod_filter_by_gold",
+        action="store_true",
+        help="CasCoD stage1: filter teacher CoTs to keep only examples where teacher answer matches gold",
+    )
+    p.add_argument(
+        "--no_cascod_filter_by_gold",
+        dest="cascod_filter_by_gold",
+        action="store_false",
+        help="Disable CasCoD gold-match filtering (keeps all teacher CoTs)",
+    )
+    p.set_defaults(cascod_filter_by_gold=True)
 
     # Baseline 0.1
     p.add_argument(
@@ -1691,8 +2049,34 @@ def main(argv: Optional[Sequence[str]] = None):
 
     granularity_level = int(getattr(args, "granularity_level", 0) or 0)
     post_cot = bool(getattr(args, "post_cot", False))
+
+    # Defaults that track the paper more closely:
+    # - Granularity adaptation: include a 1-shot exemplar when granularity is enabled.
+    # - Post-CoT: teacher justifications are elicited conditioned on the gold answer.
+    go_raw = getattr(args, "granularity_one_shot", None)
+    granularity_one_shot = bool(go_raw) if go_raw is not None else bool(granularity_level > 0)
+
+    gm_raw = getattr(args, "granularity_multi_level", None)
+    granularity_multi_level = bool(gm_raw) if gm_raw is not None else bool(granularity_level > 0)
+
+    pr_raw = getattr(args, "post_cot_gold_rationale", None)
+    post_cot_gold_rationale = bool(pr_raw) if pr_raw is not None else bool(post_cot)
+
+    ig_raw = getattr(args, "post_cot_use_ig", None)
+    # Default: keep IG off unless explicitly enabled (requires captum).
+    post_cot_use_ig = bool(ig_raw) if ig_raw is not None else False
+    post_cot_ig_steps = int(getattr(args, "post_cot_ig_steps", 8) or 8)
+    post_cot_ig_top_frac = float(getattr(args, "post_cot_ig_top_frac", 0.3) or 0.3)
+
+    if post_cot_ig_steps < 1:
+        raise ValueError("--post_cot_ig_steps deve ser >= 1")
+    if not (0.0 < post_cot_ig_top_frac <= 1.0):
+        raise ValueError("--post_cot_ig_top_frac deve estar em (0, 1]")
+
+    cascod_filter_by_gold = bool(getattr(args, "cascod_filter_by_gold", True))
     cascod_stage1_epochs = int(getattr(args, "cascod_stage1_epochs", 1) or 1)
     cascod_stage2_epochs = int(getattr(args, "cascod_stage2_epochs", -1) or -1)
+    cascod_alpha = float(getattr(args, "cascod_alpha", 0.3) or 0.3)
 
     enable_gsm8k_train = True
     if args.enable_gsm8k_train:
@@ -1802,7 +2186,8 @@ def main(argv: Optional[Sequence[str]] = None):
             eval_obqa=eval_obqa,
             eval_efficiency=eval_eff,
             use_cot_prompt_eval=use_cot_eval,
-            granularity_level=granularity_level,
+            # Baseline 0.4 is intentionally "standard" (no granularity/Post-CoT/CasCoD knobs).
+            granularity_level=0,
         )
 
     return run_experiment(
@@ -1823,9 +2208,17 @@ def main(argv: Optional[Sequence[str]] = None):
         hypothesis_metric=str(args.hypothesis_metric),
         student_key=str(args.student),
         granularity_level=granularity_level,
+        granularity_one_shot=granularity_one_shot,
+        granularity_multi_level=granularity_multi_level,
         cascod_stage1_epochs=cascod_stage1_epochs,
         cascod_stage2_epochs=cascod_stage2_epochs,
+        cascod_alpha=cascod_alpha,
         post_cot=post_cot,
+        post_cot_gold_rationale=post_cot_gold_rationale,
+        post_cot_use_ig=post_cot_use_ig,
+        post_cot_ig_steps=post_cot_ig_steps,
+        post_cot_ig_top_frac=post_cot_ig_top_frac,
+        cascod_filter_by_gold=cascod_filter_by_gold,
     )
 
 

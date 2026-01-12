@@ -5,14 +5,40 @@ import json
 import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from config import GenerationConfig, ensure_tokenizer_has_pad, get_safe_tokenizer_length, resolve_device, safe_model_to
-from prompts import PROMPT_VERSION, build_cot_prompt
+from prompts import (
+    PROMPT_VERSION,
+    build_cot_prompt,
+    build_one_shot_demo,
+    build_one_shot_teacher_demo_for_post_cot_gold_rationale,
+    build_teacher_cot_prompt,
+)
+
+
+def _normalize_answer(ans: str) -> str:
+    a = (ans or "").strip()
+    # Conservative normalization: avoid over-normalizing (BBH tasks can be free-form).
+    a = a.replace("\n", " ").strip()
+    return a.lower()
+
+
+def _extract_gold_answer(example: Dict[str, Any]) -> str:
+    # Prefer already-extracted final answers (GSM8K pipeline provides this).
+    for key in ("final_answer", "answer", "target", "label", "output"):
+        v = example.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # Some datasets store numeric answers.
+    v = example.get("final_answer")
+    if v is not None:
+        return str(v).strip()
+    return ""
 
 
 def tokenizer_fingerprint(tokenizer) -> str:
@@ -257,7 +283,15 @@ def cache_teacher_cot(
     train_limit: Optional[int] = None,
     text_key: str = "text",
     granularity_level: int = 0,
+    granularity_multi_level: bool = False,
+    granularity_levels: Optional[List[int]] = None,
     post_cot: bool = False,
+    one_shot: bool = False,
+    post_cot_gold_rationale: bool = False,
+    post_cot_use_ig: bool = False,
+    post_cot_ig_steps: int = 8,
+    post_cot_ig_top_frac: float = 0.3,
+    filter_by_gold_answer: bool = False,
 ) -> Path:
     """Generate and persist Chain-of-Thought traces as JSONL."""
 
@@ -277,7 +311,15 @@ def cache_teacher_cot(
         "prompt_max_length": prompt_max_length,
         "prompt_version": PROMPT_VERSION,
         "granularity_level": int(granularity_level or 0),
+        "granularity_multi_level": bool(granularity_multi_level),
+        "granularity_levels": list(granularity_levels) if isinstance(granularity_levels, list) else None,
         "post_cot": bool(post_cot),
+        "one_shot": bool(one_shot),
+        "post_cot_gold_rationale": bool(post_cot_gold_rationale),
+        "post_cot_use_ig": bool(post_cot_use_ig),
+        "post_cot_ig_steps": int(post_cot_ig_steps or 0),
+        "post_cot_ig_top_frac": float(post_cot_ig_top_frac or 0.0),
+        "filter_by_gold_answer": bool(filter_by_gold_answer),
         "train_limit": train_limit,
         "dataset_fingerprint": ds_fp,
         "dataset_domains": _dataset_domains(dataset),
@@ -303,30 +345,192 @@ def cache_teacher_cot(
 
     ensure_tokenizer_has_pad(tokenizer, teacher_model)
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: x)
-    with open(out_file, "w", encoding="utf-8") as fout:
-        for batch in tqdm(loader, desc="Caching teacher CoT"):
-            prompts = []
-            for ex in batch:
-                q = ex.get("question", ex.get(text_key, ""))
-                p, _ = build_cot_prompt(
-                    str(q),
-                    granularity_level=int(granularity_level or 0),
-                    post_cot=bool(post_cot),
-                )
-                prompts.append(p)
-            inputs = tokenizer(
-                prompts,
+    # Resolve granularity levels to cache (multi-level pipeline).
+    resolved_levels: List[int] = []
+    if bool(granularity_multi_level) and int(granularity_level or 0) > 0:
+        if isinstance(granularity_levels, list) and granularity_levels:
+            for x in granularity_levels:
+                try:
+                    v = int(x)
+                except Exception:
+                    continue
+                if 1 <= v <= 6:
+                    resolved_levels.append(v)
+        if not resolved_levels:
+            resolved_levels = list(range(1, max(1, min(6, int(granularity_level or 0))) + 1))
+        resolved_levels = sorted(set(resolved_levels))
+
+    use_ig = bool(post_cot_use_ig) and bool(post_cot) and bool(post_cot_gold_rationale)
+    if use_ig:
+        try:
+            import captum  # noqa: F401
+        except Exception:
+            raise RuntimeError(
+                "post_cot_use_ig=True requer o pacote 'captum'. Instale com: pip install captum"
+            )
+
+    def _ig_filter_reasoning(*, question: str, reasoning: str, answer: str) -> Tuple[Optional[str], Dict[str, Any]]:
+        meta: Dict[str, Any] = {"enabled": True, "steps": int(post_cot_ig_steps or 0), "top_frac": float(post_cot_ig_top_frac or 0.0)}
+        q = (question or "").strip()
+        r = (reasoning or "").strip()
+        a = (answer or "").strip()
+        if not q or not r or not a:
+            meta["skipped"] = True
+            meta["reason"] = "missing_q_r_a"
+            return None, meta
+
+        try:
+            # Attribution prompt: rationale -> answer (importance of rationale tokens for the answer).
+            prompt = f"Q: {q}\n### REASONING:\n{r}\n### FINAL_ANSWER:\n"
+            ans_ids = tokenizer(" " + a, add_special_tokens=False).get("input_ids") or []
+            if not ans_ids:
+                ans_ids = tokenizer(a, add_special_tokens=False).get("input_ids") or []
+            if not ans_ids:
+                meta["skipped"] = True
+                meta["reason"] = "no_answer_tokens"
+                return None, meta
+            target_id = int(ans_ids[0])
+
+            enc = tokenizer(
+                prompt,
                 return_tensors="pt",
-                # Keep stable sequence layout for reproducible truncation.
+                padding="max_length",
+                truncation=True,
+                max_length=max_len,
+                return_offsets_mapping=True,
+            )
+            input_ids = enc["input_ids"].to(target_device)
+            attention_mask = enc["attention_mask"].to(target_device)
+            offsets = enc.get("offset_mapping")
+            if offsets is None:
+                meta["skipped"] = True
+                meta["reason"] = "no_offset_mapping"
+                return None, meta
+
+            # Baseline: pad token IDs.
+            baseline_id = int(tokenizer.pad_token_id or tokenizer.eos_token_id or 0)
+            baselines = torch.full_like(input_ids, baseline_id)
+
+            def forward_func(ids, mask):
+                out = teacher_model(input_ids=ids, attention_mask=mask, use_cache=False)
+                logits = out.logits
+                return logits[:, -1, target_id]
+
+            from captum.attr import LayerIntegratedGradients
+
+            lig = LayerIntegratedGradients(forward_func, teacher_model.get_input_embeddings())
+
+            with torch.enable_grad():
+                attributions = lig.attribute(
+                    inputs=input_ids,
+                    baselines=baselines,
+                    additional_forward_args=(attention_mask,),
+                    n_steps=int(post_cot_ig_steps or 8),
+                )
+
+            # Token-level importance score.
+            scores = attributions.detach().abs().sum(dim=-1)[0].to("cpu")  # (L,)
+            offsets = offsets[0].to("cpu").tolist()
+
+            span_start = prompt.find(r)
+            if span_start < 0:
+                meta["skipped"] = True
+                meta["reason"] = "reasoning_span_not_found"
+                return None, meta
+            span_end = span_start + len(r)
+
+            reasoning_token_idxs: List[int] = []
+            reasoning_spans: List[Tuple[int, int]] = []
+            for i, (s, e) in enumerate(offsets):
+                if e <= s:
+                    continue
+                if s >= span_start and e <= span_end:
+                    reasoning_token_idxs.append(i)
+                    reasoning_spans.append((int(s), int(e)))
+
+            if not reasoning_token_idxs:
+                meta["skipped"] = True
+                meta["reason"] = "no_reasoning_tokens"
+                return None, meta
+
+            k = max(1, int(round(len(reasoning_token_idxs) * float(post_cot_ig_top_frac or 0.0))))
+            if k <= 0:
+                meta["skipped"] = True
+                meta["reason"] = "top_frac_zero"
+                return None, meta
+
+            # Pick top-k tokens in the reasoning span.
+            scored = []
+            for idx, (s, e) in zip(reasoning_token_idxs, reasoning_spans):
+                scored.append((float(scores[int(idx)].item()), int(s), int(e)))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            keep = scored[:k]
+            keep_spans = sorted([(s, e) for _, s, e in keep], key=lambda x: (x[0], x[1]))
+
+            # Merge overlapping/adjacent spans.
+            merged: List[List[int]] = []
+            for s, e in keep_spans:
+                if not merged or s > merged[-1][1] + 1:
+                    merged.append([s, e])
+                else:
+                    merged[-1][1] = max(int(merged[-1][1]), int(e))
+
+            pieces = []
+            for s, e in merged:
+                chunk = prompt[int(s) : int(e)].strip()
+                if chunk:
+                    pieces.append(chunk)
+            filtered = " ".join(pieces).strip()
+
+            meta.update({"k": int(k), "n_reasoning_tokens": int(len(reasoning_token_idxs)), "n_kept_spans": int(len(merged))})
+            return filtered if filtered else None, meta
+        except Exception as exc:
+            meta["error"] = str(exc)
+            return None, meta
+
+    # Optional 1-shot exemplar (deterministic).
+    one_shot_teacher_prefix: Optional[str] = None
+    one_shot_student_prefix: Optional[str] = None
+    if bool(one_shot):
+        try:
+            n = int(len(dataset))
+        except Exception:
+            n = 0
+
+        exemplar = None
+        if n > 0 and hasattr(dataset, "__getitem__"):
+            try:
+                exemplar = dataset[int(seed) % max(1, n)]
+            except Exception:
+                exemplar = None
+        if exemplar is None:
+            try:
+                exemplar = next(iter(dataset))
+            except Exception:
+                exemplar = None
+
+        if isinstance(exemplar, dict):
+            ex_q = exemplar.get("question", exemplar.get(text_key, ""))
+            ex_gold = _extract_gold_answer(exemplar)
+            ex_teacher_prompt, _ = build_teacher_cot_prompt(
+                str(ex_q),
+                granularity_level=int(granularity_level or 0),
+                post_cot=bool(post_cot),
+                one_shot_prefix=None,
+                gold_answer=ex_gold,
+                post_cot_gold_rationale=bool(post_cot_gold_rationale),
+            )
+            ex_inputs = tokenizer(
+                [ex_teacher_prompt],
+                return_tensors="pt",
                 padding="max_length",
                 truncation=True,
                 max_length=max_len,
             )
-            inputs = {k: v.to(target_device) for k, v in inputs.items()}
+            ex_inputs = {k: v.to(target_device) for k, v in ex_inputs.items()}
             with torch.no_grad():
-                generations = teacher_model.generate(
-                    **inputs,
+                ex_gen = teacher_model.generate(
+                    **ex_inputs,
                     max_new_tokens=int(generation_cfg.max_new_tokens),
                     do_sample=bool(generation_cfg.do_sample),
                     temperature=float(generation_cfg.temperature),
@@ -336,16 +540,285 @@ def cache_teacher_cot(
                     repetition_penalty=(generation_cfg.repetition_penalty or 1.0),
                 )
 
-            for example, output in zip(batch, generations):
-                text = tokenizer.decode(output, skip_special_tokens=True)
-                reasoning, answer = parse_cot_output(text)
-                rec = {
-                    "text": example.get("text", ""),
-                    "question": example.get("question", example.get("text", "")),
-                    "teacher_reasoning": reasoning,
-                    "teacher_answer": answer,
-                }
-                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            ex_in_len = int(ex_inputs["attention_mask"].sum(dim=1)[0].item())
+            ex_cont = ex_gen[0][ex_in_len:]
+            ex_cont_text = tokenizer.decode(ex_cont, skip_special_tokens=True).strip()
+
+            if bool(post_cot) and bool(post_cot_gold_rationale):
+                ex_reasoning = ex_cont_text
+                ex_answer = ex_gold
+            else:
+                ex_full_text = ex_teacher_prompt + ex_cont_text
+                ex_reasoning, ex_answer = parse_cot_output(ex_full_text)
+
+            ex_reasoning = (ex_reasoning or "").strip()
+            ex_answer = (ex_answer or ex_gold or "").strip()
+
+            # Save a compact exemplar identity in metadata for traceability.
+            metadata["one_shot_exemplar"] = {
+                "question": str(ex_q)[:200],
+                "gold_answer": str(ex_gold)[:80],
+            }
+            # Prefix shown to student.
+            one_shot_student_prefix = build_one_shot_demo(
+                question=str(ex_q),
+                answer=str(ex_answer),
+                reasoning=str(ex_reasoning),
+                post_cot=bool(post_cot),
+            )
+            # Prefix shown to teacher.
+            if bool(post_cot) and bool(post_cot_gold_rationale):
+                one_shot_teacher_prefix = build_one_shot_teacher_demo_for_post_cot_gold_rationale(
+                    question=str(ex_q),
+                    answer=str(ex_answer),
+                    reasoning=str(ex_reasoning),
+                )
+            else:
+                one_shot_teacher_prefix = one_shot_student_prefix
+
+    # Re-write metadata if exemplar was added.
+    write_cache_metadata(out_dir, metadata)
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: x)
+    with open(out_file, "w", encoding="utf-8") as fout:
+        n_total = 0
+        n_kept = 0
+        n_filtered = 0
+        for batch in tqdm(loader, desc="Caching teacher CoT"):
+            # Multi-level: cache multiple granularity levels per example.
+            if resolved_levels:
+                per_ex = []
+                for ex in batch:
+                    q = ex.get("question", ex.get(text_key, ""))
+                    gold = _extract_gold_answer(ex)
+                    per_ex.append(
+                        {
+                            "example": ex,
+                            "question": str(q),
+                            "gold": str(gold),
+                            "prompt_levels": {},
+                            "teacher_prompt_levels": {},
+                            "teacher_reasoning_levels": {},
+                            "teacher_answer_levels": {},
+                            "teacher_reasoning_token_lens": {},
+                        }
+                    )
+
+                for lvl in resolved_levels:
+                    lvl_prompts = []
+                    lvl_student_prompts = []
+                    for exd in per_ex:
+                        teacher_prompt, _ = build_teacher_cot_prompt(
+                            exd["question"],
+                            granularity_level=int(lvl),
+                            post_cot=bool(post_cot),
+                            one_shot_prefix=one_shot_teacher_prefix,
+                            gold_answer=exd["gold"],
+                            post_cot_gold_rationale=bool(post_cot_gold_rationale),
+                        )
+                        student_prompt, _ = build_cot_prompt(
+                            exd["question"],
+                            granularity_level=int(lvl),
+                            post_cot=bool(post_cot),
+                            one_shot_prefix=one_shot_student_prefix,
+                        )
+                        lvl_prompts.append(teacher_prompt)
+                        lvl_student_prompts.append(student_prompt)
+
+                    inputs = tokenizer(
+                        lvl_prompts,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_len,
+                    )
+                    inputs = {k: v.to(target_device) for k, v in inputs.items()}
+                    input_lens = inputs["attention_mask"].sum(dim=1).tolist()
+                    with torch.no_grad():
+                        generations = teacher_model.generate(
+                            **inputs,
+                            max_new_tokens=int(generation_cfg.max_new_tokens),
+                            do_sample=bool(generation_cfg.do_sample),
+                            temperature=float(generation_cfg.temperature),
+                            top_p=generation_cfg.top_p,
+                            top_k=generation_cfg.top_k,
+                            pad_token_id=int(tokenizer.pad_token_id or tokenizer.eos_token_id or 0),
+                            repetition_penalty=(generation_cfg.repetition_penalty or 1.0),
+                        )
+
+                    for exd, teacher_prompt, student_prompt, out_ids, in_len in zip(
+                        per_ex,
+                        lvl_prompts,
+                        lvl_student_prompts,
+                        generations,
+                        input_lens,
+                    ):
+                        cont_ids = out_ids[int(in_len) :]
+                        cont_text = tokenizer.decode(cont_ids, skip_special_tokens=True).strip()
+
+                        if bool(post_cot) and bool(post_cot_gold_rationale):
+                            answer = (exd["gold"] or "").strip()
+                            reasoning = cont_text
+                            if reasoning.lower().startswith("### reasoning:"):
+                                reasoning = reasoning[len("### reasoning:") :].strip()
+                        else:
+                            generated_text = str(teacher_prompt) + ("\n" + cont_text if cont_text else "")
+                            reasoning, answer = parse_cot_output(generated_text)
+
+                        exd["prompt_levels"][str(int(lvl))] = student_prompt
+                        exd["teacher_prompt_levels"][str(int(lvl))] = teacher_prompt
+                        exd["teacher_reasoning_levels"][str(int(lvl))] = (reasoning or "").strip()
+                        exd["teacher_answer_levels"][str(int(lvl))] = (answer or "").strip()
+                        try:
+                            rid = tokenizer((reasoning or ""), add_special_tokens=False).get("input_ids") or []
+                            exd["teacher_reasoning_token_lens"][str(int(lvl))] = int(len(rid))
+                        except Exception:
+                            exd["teacher_reasoning_token_lens"][str(int(lvl))] = 0
+
+                base_lvl = str(int(max(resolved_levels) if resolved_levels else int(granularity_level or 0)))
+                for exd in per_ex:
+                    n_total += 1
+                    gold = exd["gold"]
+                    reasoning = (exd["teacher_reasoning_levels"].get(base_lvl) or "").strip()
+                    answer = (exd["teacher_answer_levels"].get(base_lvl) or "").strip()
+
+                    gold_norm = _normalize_answer(str(gold))
+                    ans_norm = _normalize_answer(str(answer))
+                    if bool(filter_by_gold_answer) and gold_norm and ans_norm and (gold_norm != ans_norm):
+                        n_filtered += 1
+                        continue
+
+                    n_kept += 1
+
+                    rec = {
+                        "text": exd["example"].get("text", ""),
+                        "question": exd["example"].get("question", exd["example"].get("text", "")),
+                        "gold_answer": gold,
+                        # Backward-compatible single prompt (default to base level)
+                        "prompt": exd["prompt_levels"].get(base_lvl, ""),
+                        "teacher_prompt": exd["teacher_prompt_levels"].get(base_lvl, ""),
+                        "teacher_reasoning": reasoning,
+                        "teacher_answer": answer,
+                        # Multi-level fields
+                        "granularity_levels": list(resolved_levels),
+                        "prompt_levels": exd["prompt_levels"],
+                        "teacher_prompt_levels": exd["teacher_prompt_levels"],
+                        "teacher_reasoning_levels": exd["teacher_reasoning_levels"],
+                        "teacher_answer_levels": exd["teacher_answer_levels"],
+                        "teacher_reasoning_token_lens": exd["teacher_reasoning_token_lens"],
+                    }
+                    # Alignment diagnostic: are token lengths monotonic with level?
+                    try:
+                        lens = [int(exd["teacher_reasoning_token_lens"].get(str(l), 0)) for l in resolved_levels]
+                        rec["granularity_monotonic_by_len"] = bool(all(lens[i] <= lens[i + 1] for i in range(len(lens) - 1)))
+                    except Exception:
+                        rec["granularity_monotonic_by_len"] = None
+
+                    # Optional Post-CoT IG filtering (store filtered rationale but keep original).
+                    if use_ig:
+                        filtered, ig_meta = _ig_filter_reasoning(question=exd["question"], reasoning=reasoning, answer=(gold or answer))
+                        rec["teacher_reasoning_ig"] = (filtered or "")
+                        rec["teacher_reasoning_ig_meta"] = ig_meta
+
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            else:
+                # Single-level (legacy)
+                prompts = []
+                student_prompts = []
+                gold_answers = []
+                for ex in batch:
+                    q = ex.get("question", ex.get(text_key, ""))
+                    gold = _extract_gold_answer(ex)
+                    gold_answers.append(gold)
+
+                    teacher_prompt, _ = build_teacher_cot_prompt(
+                        str(q),
+                        granularity_level=int(granularity_level or 0),
+                        post_cot=bool(post_cot),
+                        one_shot_prefix=one_shot_teacher_prefix,
+                        gold_answer=gold,
+                        post_cot_gold_rationale=bool(post_cot_gold_rationale),
+                    )
+                    student_prompt, _ = build_cot_prompt(
+                        str(q),
+                        granularity_level=int(granularity_level or 0),
+                        post_cot=bool(post_cot),
+                        one_shot_prefix=one_shot_student_prefix,
+                    )
+                    prompts.append(teacher_prompt)
+                    student_prompts.append(student_prompt)
+                inputs = tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    # Keep stable sequence layout for reproducible truncation.
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_len,
+                )
+                inputs = {k: v.to(target_device) for k, v in inputs.items()}
+                input_lens = inputs["attention_mask"].sum(dim=1).tolist()
+                with torch.no_grad():
+                    generations = teacher_model.generate(
+                        **inputs,
+                        max_new_tokens=int(generation_cfg.max_new_tokens),
+                        do_sample=bool(generation_cfg.do_sample),
+                        temperature=float(generation_cfg.temperature),
+                        top_p=generation_cfg.top_p,
+                        top_k=generation_cfg.top_k,
+                        pad_token_id=int(tokenizer.pad_token_id or tokenizer.eos_token_id or 0),
+                        repetition_penalty=(generation_cfg.repetition_penalty or 1.0),
+                    )
+
+                for example, teacher_prompt, student_prompt, gold, out_ids, in_len in zip(
+                    batch,
+                    prompts,
+                    student_prompts,
+                    gold_answers,
+                    generations,
+                    input_lens,
+                ):
+                    n_total += 1
+                    cont_ids = out_ids[int(in_len) :]
+                    cont_text = tokenizer.decode(cont_ids, skip_special_tokens=True).strip()
+
+                    if bool(post_cot) and bool(post_cot_gold_rationale):
+                        answer = (gold or "").strip()
+                        reasoning = cont_text
+                        # If the model repeats the marker, drop it.
+                        if reasoning.lower().startswith("### reasoning:"):
+                            reasoning = reasoning[len("### reasoning:") :].strip()
+                    else:
+                        generated_text = str(teacher_prompt) + ("\n" + cont_text if cont_text else "")
+                        reasoning, answer = parse_cot_output(generated_text)
+
+                    gold_norm = _normalize_answer(str(gold))
+                    ans_norm = _normalize_answer(str(answer))
+                    if bool(filter_by_gold_answer) and gold_norm and ans_norm and (gold_norm != ans_norm):
+                        n_filtered += 1
+                        continue
+
+                    n_kept += 1
+                    rec = {
+                        "text": example.get("text", ""),
+                        "question": example.get("question", example.get("text", "")),
+                        "gold_answer": gold,
+                        # Student-side prompt (used in distillation/logits caches).
+                        "prompt": student_prompt,
+                        # Teacher-side prompt (for traceability).
+                        "teacher_prompt": teacher_prompt,
+                        "teacher_reasoning": (reasoning or "").strip(),
+                        "teacher_answer": (answer or "").strip(),
+                    }
+                    if use_ig:
+                        ex_q = str(example.get("question", example.get(text_key, "")) or "")
+                        filtered, ig_meta = _ig_filter_reasoning(question=ex_q, reasoning=(reasoning or ""), answer=str(gold or answer))
+                        rec["teacher_reasoning_ig"] = (filtered or "")
+                        rec["teacher_reasoning_ig_meta"] = ig_meta
+                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        if bool(filter_by_gold_answer):
+            print(f" CasCoD filter_by_gold_answer: kept={n_kept}/{n_total}, filtered={n_filtered}")
 
     return out_file
 

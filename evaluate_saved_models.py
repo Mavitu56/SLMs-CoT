@@ -160,6 +160,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--use_cot_prompt_eval", action="store_true")
     p.add_argument("--no_cot_prompt_eval", action="store_true")
 
+    p.add_argument(
+        "--cascod_two_stage_eval",
+        action="store_true",
+        help="If set, run CasCoD-style two-stage inference (q→r then q,r→a) during eval.",
+    )
+    p.add_argument(
+        "--no_cascod_two_stage_eval",
+        action="store_true",
+        help="Disable CasCoD two-stage inference during eval.",
+    )
+
     p.add_argument("--eval_max_new_tokens", type=int, default=256)
     p.add_argument("--eval_temperature", type=float, default=0.0)
     p.add_argument(
@@ -242,6 +253,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.no_cot_prompt_eval:
         use_cot = False
 
+    cascod_two_stage = False
+    if args.cascod_two_stage_eval:
+        cascod_two_stage = True
+    if args.no_cascod_two_stage_eval:
+        cascod_two_stage = False
+
     device = resolve_device(args.device)
 
     # Build evaluator config consistent with the repo.
@@ -271,7 +288,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model, tokenizer = _load_model_and_tokenizer(model_dir, device=device, load_dtype=str(args.load_dtype))
 
         print(
-            f"[eval] Running evaluator flags: gsm8k={eval_gsm8k}, bbh={eval_bbh}, efficiency={eval_eff}, cot_prompt={use_cot}"
+            f"[eval] Running evaluator flags: gsm8k={eval_gsm8k}, bbh={eval_bbh}, efficiency={eval_eff}, cot_prompt={use_cot}, cascod_two_stage={cascod_two_stage}"
         )
         results = evaluator.evaluate(
             model,
@@ -281,6 +298,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             eval_bbh=eval_bbh,
             eval_efficiency=eval_eff,
             use_cot_prompt=use_cot,
+            cascod_two_stage=bool(cascod_two_stage),
             generation_cfg=cfg.eval_generation,
         )
 
@@ -294,6 +312,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "eval_bbh": eval_bbh,
                 "eval_efficiency": eval_eff,
                 "use_cot_prompt_eval": use_cot,
+                "cascod_two_stage_eval": bool(cascod_two_stage),
             },
             "generation": cfg.eval_generation.to_jsonable(),
             "limits": {
