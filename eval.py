@@ -74,6 +74,35 @@ def extract_gsm8k_answer(text: str) -> str:
     return numbers[-1] if numbers else ""
 
 
+def extract_gsm8k_answer_first(text: str) -> str:
+    """Extract the *first* plausible numeric answer from a completion.
+
+    Used for Post-CoT eval (answer-first). This is intentionally simple and
+    only activated when explicitly requested to avoid changing older results.
+    """
+
+    if not text:
+        return ""
+
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # Prefer explicit patterns if present.
+    patterns = [
+        r"answer[\s:\-]*([\$\d\.,]+)",
+        r"final[\s:\-]*([\$\d\.,]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, t, flags=re.IGNORECASE)
+        if m:
+            return str(m.group(1)).strip()
+
+    # Otherwise, take the first number-like span.
+    nums = re.findall(r"\d+\.?\d*", t)
+    return nums[0] if nums else ""
+
+
 def bbh_answer_match(generated: str, target: str) -> bool:
     g = (generated or "").lower().strip()
     t = (target or "").lower().strip()
@@ -229,6 +258,7 @@ class StandardizedEvaluator:
         eval_obqa: bool = False,
         eval_efficiency: bool = True,
         use_cot_prompt: bool = True,
+        answer_first_eval: bool = False,
         generation_cfg: Optional[GenerationConfig] = None,
     ) -> Dict[str, Any]:
         generation_cfg = generation_cfg or self.config.eval_generation
@@ -238,12 +268,13 @@ class StandardizedEvaluator:
             "metadata": {
                 "seed": seed,
                 "use_cot_prompt": bool(use_cot_prompt),
+                "answer_first_eval": bool(answer_first_eval),
                 "generation": generation_cfg.to_jsonable(),
             }
         }
 
         if eval_gsm8k:
-            results["gsm8k"] = self._eval_gsm8k(model, tokenizer, seed, use_cot_prompt, generation_cfg)
+            results["gsm8k"] = self._eval_gsm8k(model, tokenizer, seed, use_cot_prompt, generation_cfg, answer_first_eval=bool(answer_first_eval))
         if eval_bbh:
             results["bbh"] = self._eval_bbh(model, tokenizer, seed, generation_cfg)
         if eval_obqa:
@@ -406,7 +437,16 @@ class StandardizedEvaluator:
         }
         return {"accuracy": correct / total if total else 0.0, "correct": int(correct), "total": int(total), "secondary": sec}
 
-    def _eval_gsm8k(self, model, tokenizer, seed: int, use_cot_prompt: bool, gen_cfg: GenerationConfig) -> Dict[str, Any]:
+    def _eval_gsm8k(
+        self,
+        model,
+        tokenizer,
+        seed: int,
+        use_cot_prompt: bool,
+        gen_cfg: GenerationConfig,
+        *,
+        answer_first_eval: bool = False,
+    ) -> Dict[str, Any]:
         from datasets import load_dataset
 
         ds = load_dataset("gsm8k", "main", split="test")
@@ -457,7 +497,10 @@ class StandardizedEvaluator:
 
             generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
             cont_text = generated[len(prompt) :].strip() if len(generated) > len(prompt) else generated.strip()
-            pred = extract_gsm8k_answer(generated)
+            if (not use_cot_prompt) and bool(answer_first_eval):
+                pred = extract_gsm8k_answer_first(cont_text)
+            else:
+                pred = extract_gsm8k_answer(generated)
             if pred == gold and gold != "":
                 correct += 1
             total += 1

@@ -492,7 +492,7 @@ def _load_model_and_tokenizer_from_dir(model_dir: Path, device: torch.device, qu
         # Ensure embedding size matches tokenizer before adapter load.
         try:
             emb = base_model.get_input_embeddings()
-            if emb is not None and emb.weight.shape[0] != tokenizer_len:
+            if emb is not None and tokenizer_len > int(emb.weight.shape[0]):
                 base_model.resize_token_embeddings(tokenizer_len)
         except Exception:
             pass
@@ -732,6 +732,7 @@ def run_kd_cot_standard_baseline(
     eval_efficiency: bool,
     use_cot_prompt_eval: bool,
     eval_obqa: bool = False,
+    granularity_level: int = 0,
 ) -> Dict[str, Any]:
     """Baseline 0.4: KD CoT padrão (text-only), sem otimizações.
 
@@ -764,6 +765,7 @@ def run_kd_cot_standard_baseline(
         "eval_efficiency": eval_efficiency,
         "use_cot_prompt_eval": use_cot_prompt_eval,
         "eval_obqa": bool(eval_obqa),
+        "granularity_level": int(granularity_level or 0),
         "teacher_cot_generation": cfg.teacher_cot_generation.to_jsonable(),
     }
 
@@ -813,6 +815,7 @@ def run_kd_cot_standard_baseline(
             seed=seed,
             prompt_max_length=cfg.max_length,
             train_limit=cfg.train_limit,
+            granularity_level=int(granularity_level or 0),
         )
 
         # Free teacher memory; baseline is text-only distillation.
@@ -833,6 +836,7 @@ def run_kd_cot_standard_baseline(
             use_cot_cache=True,
             use_logits_cache=False,
             use_teacher_logits=False,
+            granularity_level=int(granularity_level or 0),
         )
 
         save_dir = cfg.models_dir / exp_id / f"kd_cot_standard_seed{seed}"
@@ -1044,10 +1048,19 @@ def run_experiment(
     allow_insufficient_runs: bool,
     hypothesis_metric: str,
     student_key: str,
+    granularity_level: int = 0,
+    cascod_stage1_epochs: int = 1,
+    cascod_stage2_epochs: int = -1,
+    post_cot: bool = False,
 ) -> Dict[str, Any]:
     logger = ScientificLogger()
     analyst = StatisticalAnalyst(alpha=cfg.alpha_level)
     evaluator = StandardizedEvaluator(cfg)
+
+    combo_d_enabled = "combo_d" in set(kd_modes or [])
+
+    def _cot_variant_key(*, post: bool, gran: int) -> str:
+        return f"post_cot={int(bool(post))}|granularity={int(gran or 0)}"
 
     flags = {
         "enable_gsm8k_train": enable_gsm8k_train,
@@ -1064,6 +1077,11 @@ def run_experiment(
         "allow_insufficient_runs": allow_insufficient_runs,
         "hypothesis_metric": hypothesis_metric,
         "student_key": student_key,
+        "granularity_level": int(granularity_level or 0),
+        "cascod_stage1_epochs": int(cascod_stage1_epochs or 0),
+        "cascod_stage2_epochs": int(cascod_stage2_epochs or -1),
+        "post_cot": bool(post_cot),
+        "combo_d_enabled": bool(combo_d_enabled),
     }
 
     exp_id = _experiment_id(cfg, kd_modes, flags)
@@ -1079,6 +1097,14 @@ def run_experiment(
         conditions["kd_traditional"] = {"mode": "traditional", "description": "KD tradicional (answer-only)"}
     if "reasoning" in kd_modes:
         conditions["kd_with_reasoning"] = {"mode": "reasoning", "description": "KD com raciocínio (CoT-aware)"}
+    if "cascod" in kd_modes:
+        conditions["kd_cascod"] = {"mode": "cascod", "description": "CasCoD (2B): 2 estágios (CoT CE-only → logits-KD)"}
+    if "combo_d" in kd_modes:
+        conditions["kd_combo_d"] = {
+            "mode": "cascod",
+            "description": "Condição D (A+B+C): granularity + CasCoD + Post-CoT",
+            "force_post_cot": True,
+        }
     if not conditions:
         raise ValueError("Nenhum modo de KD selecionado.")
 
@@ -1106,6 +1132,8 @@ def run_experiment(
                 seed=cfg.seeds[0],
                 prompt_max_length=cfg.max_length,
                 train_limit=cfg.train_limit,
+                granularity_level=int(granularity_level or 0),
+                post_cot=bool(post_cot),
             )
             state["teacher_cot_file"] = str(cot_file)
 
@@ -1140,6 +1168,8 @@ def run_experiment(
                     full_sequences = build_reasoning_full_sequences_from_cot(
                         cot_path=str(state["teacher_cot_file"]),
                         max_records=cfg.train_limit,
+                        granularity_level=int(granularity_level or 0),
+                        post_cot=bool(post_cot),
                     )
                     logits_dir_reason = cache_teacher_logits(
                         teacher_model,
@@ -1165,7 +1195,17 @@ def run_experiment(
 
     teacher_logits_traditional_dir = state.get("teacher_logits_traditional_dir")
     teacher_logits_reasoning_dir = state.get("teacher_logits_reasoning_dir")
-    teacher_cot_file = state.get("teacher_cot_file")
+
+    # Backward-compat: older runs stored a single teacher_cot_file.
+    teacher_cot_files = state.get("teacher_cot_files")
+    if not isinstance(teacher_cot_files, dict):
+        teacher_cot_files = {}
+        legacy = state.get("teacher_cot_file")
+        if legacy:
+            # Assume legacy corresponds to current global settings.
+            teacher_cot_files[_cot_variant_key(post=bool(post_cot), gran=int(granularity_level or 0))] = str(legacy)
+            state["teacher_cot_files"] = dict(teacher_cot_files)
+            _save_state(state_path, state)
 
     for cond_name, cond_cfg in conditions.items():
         cond_runs = []
@@ -1179,12 +1219,16 @@ def run_experiment(
             print(f"\n Condição {cond_name} | seed={seed}")
             set_seed(seed)
 
+            cond_post_cot = bool(post_cot) or bool(cond_cfg.get("force_post_cot", False))
+            cot_key = _cot_variant_key(post=cond_post_cot, gran=int(granularity_level or 0))
+            teacher_cot_file = teacher_cot_files.get(cot_key)
+
             # Load models
             teacher_model = None
             teacher_tok = None
-            if cond_cfg["mode"] == "traditional" and not teacher_logits_traditional_dir and use_logits_kd:
+            if cond_cfg["mode"] in ("traditional", "cascod") and not teacher_logits_traditional_dir and use_logits_kd:
                 teacher_model, teacher_tok = setup_model_and_tokenizer(cfg.model_hierarchy["teacher_medium"], cfg.device, cfg.quantization)
-            if cond_cfg["mode"] == "reasoning" and not teacher_cot_file:
+            if cond_cfg["mode"] in ("reasoning", "cascod") and not teacher_cot_file:
                 teacher_model, teacher_tok = setup_model_and_tokenizer(cfg.model_hierarchy["teacher_medium"], cfg.device, cfg.quantization)
             if cond_cfg["mode"] == "reasoning" and use_logits_kd and not teacher_logits_reasoning_dir:
                 # Only needed if logits-KD is requested for reasoning mode.
@@ -1195,7 +1239,11 @@ def run_experiment(
 
             # Scientific validity fix: logits-KD requires tokenizer compatibility.
             if use_logits_kd:
-                cache_dir = teacher_logits_traditional_dir if cond_cfg["mode"] == "traditional" else teacher_logits_reasoning_dir
+                cache_dir = None
+                if cond_cfg["mode"] in ("traditional", "cascod"):
+                    cache_dir = teacher_logits_traditional_dir
+                elif cond_cfg["mode"] == "reasoning":
+                    cache_dir = teacher_logits_reasoning_dir
                 if cache_dir:
                     meta = read_cache_metadata(Path(cache_dir)) or {}
                     cache_hash = str(meta.get("tokenizer_hash") or "")
@@ -1215,7 +1263,7 @@ def run_experiment(
                                 f"cache_tokenizer='{cache_tok}', student_tokenizer='{stud_name}'."
                             )
                 else:
-                    if teacher_tok is None:
+                    if teacher_tok is None and cond_cfg["mode"] in ("traditional", "cascod"):
                         # Load teacher tokenizer just for compatibility check.
                         teacher_tok = AutoTokenizer.from_pretrained(cfg.model_hierarchy["teacher_medium"])
                     assert_tokenizer_compatible_for_logits_kd(
@@ -1227,9 +1275,9 @@ def run_experiment(
             # Data
             train_ds = load_training_dataset(enable_gsm8k_train, enable_bbh_train, cfg.train_limit, seed=seed)
 
-            # Scientific validity fix: reasoning condition requires teacher-generated CoT
+            # Scientific validity fix: reasoning/cascod conditions require teacher-generated CoT
             # (cached or generated on demand). No silent fallback to gold answers.
-            if cond_cfg["mode"] == "reasoning" and not teacher_cot_file:
+            if cond_cfg["mode"] in ("reasoning", "cascod") and not teacher_cot_file:
                 if teacher_model is None or teacher_tok is None:
                     teacher_model, teacher_tok = setup_model_and_tokenizer(cfg.model_hierarchy["teacher_medium"], cfg.device, cfg.quantization)
                 teacher_cot_file = str(
@@ -1245,9 +1293,35 @@ def run_experiment(
                         seed=seed,
                         prompt_max_length=cfg.max_length,
                         train_limit=cfg.train_limit,
+                        granularity_level=int(granularity_level or 0),
+                        post_cot=bool(cond_post_cot),
                     )
                 )
-                state["teacher_cot_file"] = str(teacher_cot_file)
+                teacher_cot_files[cot_key] = str(teacher_cot_file)
+                state["teacher_cot_files"] = dict(teacher_cot_files)
+                _save_state(state_path, state)
+
+            # CasCoD stage2 requires traditional logits cache when logits-KD is enabled.
+            if cond_cfg["mode"] == "cascod" and use_logits_kd and not teacher_logits_traditional_dir:
+                if teacher_model is None or teacher_tok is None:
+                    teacher_model, teacher_tok = setup_model_and_tokenizer(cfg.model_hierarchy["teacher_medium"], cfg.device, cfg.quantization)
+                logits_dir_trad = cache_teacher_logits(
+                    teacher_model,
+                    teacher_tok,
+                    train_ds,
+                    cache_root=cfg.cache_dir,
+                    batch_size=cfg.kd_params["batch_size"],
+                    device=str(cfg.device),
+                    generation_cfg=GenerationConfig(max_new_tokens=0, temperature=0.0, do_sample=False),
+                    split="train",
+                    seed=seed,
+                    kd_mode="traditional",
+                    input_kind="prompt_completion",
+                    train_limit=cfg.train_limit,
+                    max_length=cfg.max_length,
+                )
+                teacher_logits_traditional_dir = str(logits_dir_trad)
+                state["teacher_logits_traditional_dir"] = str(teacher_logits_traditional_dir)
                 _save_state(state_path, state)
 
             # Distill
@@ -1267,7 +1341,7 @@ def run_experiment(
                     seed=seed,
                     use_cache=bool(teacher_logits_traditional_dir),
                 )
-            else:
+            elif cond_cfg["mode"] == "reasoning":
                 # For incompatible teacher/student, logits-KD is disabled and we fall back
                 # to CE-only on distilled sequences (sequence-level distillation).
                 distiller = ReasoningAwareDistiller(
@@ -1283,7 +1357,80 @@ def run_experiment(
                     seed=seed,
                     use_cot_cache=bool(teacher_cot_file),
                     use_logits_cache=bool(use_logits_kd and teacher_logits_reasoning_dir),
+                    granularity_level=int(granularity_level or 0),
+                    post_cot=bool(cond_post_cot),
                 )
+            elif cond_cfg["mode"] == "cascod":
+                if not use_logits_kd:
+                    raise ValueError(
+                        "CasCoD (2B) requer logits-KD habilitado para o estágio 2 (answer-only). "
+                        "Use --use_logits_kd ou remova 'cascod' dos kd_modes."
+                    )
+                if not teacher_cot_file:
+                    raise ValueError("CasCoD exige teacher_cot_file.")
+
+                old_epochs = int(cfg.kd_params.get("epochs", 1))
+                stage1_epochs = max(1, int(cascod_stage1_epochs or 1))
+                stage2_epochs = int(cascod_stage2_epochs or -1)
+                if stage2_epochs <= 0:
+                    stage2_epochs = old_epochs
+
+                # Stage 1: reasoning CE-only on teacher CoT.
+                cfg.kd_params["epochs"] = stage1_epochs
+                distiller1 = ReasoningAwareDistiller(cfg, cot_cache_path=teacher_cot_file, logits_cache_dir=None)
+                model_s1, metrics_s1 = distiller1.distill_with_reasoning(
+                    student_model,
+                    teacher_model=None,
+                    student_tokenizer=student_tok,
+                    raw_dataset=train_ds,
+                    seed=seed,
+                    use_cot_cache=True,
+                    use_logits_cache=False,
+                    use_teacher_logits=False,
+                    granularity_level=int(granularity_level or 0),
+                    post_cot=bool(cond_post_cot),
+                )
+
+                stage1_dir = cfg.models_dir / exp_id / f"{cond_name}_stage1_seed{seed}"
+                stage1_dir.mkdir(parents=True, exist_ok=True)
+                model_s1.save_pretrained(stage1_dir)
+                student_tok.save_pretrained(stage1_dir)
+
+                # Stage 2: traditional logits-KD answer-only, continuing from stage1.
+                cfg.kd_params["epochs"] = max(1, stage2_epochs)
+                distiller2 = TraditionalKDDistiller(cfg, cache_dir=teacher_logits_traditional_dir)
+                model_s2, metrics_s2 = distiller2.distill(
+                    model_s1,
+                    teacher_model,
+                    student_tok,
+                    train_ds,
+                    seed=seed,
+                    use_cache=bool(teacher_logits_traditional_dir),
+                )
+
+                cfg.kd_params["epochs"] = old_epochs
+
+                trained_model = model_s2
+                train_metrics = {
+                    "cascod": {
+                        "stage1": {
+                            "kind": "reasoning_ce_only",
+                            "epochs": int(stage1_epochs),
+                            "metrics": metrics_s1,
+                            "ckpt_dir": str(stage1_dir),
+                            "granularity_level": int(granularity_level or 0),
+                            "post_cot": bool(cond_post_cot),
+                        },
+                        "stage2": {
+                            "kind": "traditional_logits_kd",
+                            "epochs": int(stage2_epochs),
+                            "metrics": metrics_s2,
+                            "logits_cache_dir": str(teacher_logits_traditional_dir),
+                        },
+                    }
+                }
+            else:
+                raise ValueError(f"Modo desconhecido: {cond_cfg['mode']}")
 
             # Save model immediately after training (before potentially long eval).
             save_dir = cfg.models_dir / exp_id / f"{cond_name}_seed{seed}"
@@ -1301,7 +1448,8 @@ def run_experiment(
                 eval_bbh=eval_bbh,
                 eval_obqa=bool(eval_obqa),
                 eval_efficiency=eval_efficiency,
-                use_cot_prompt=use_cot_prompt_eval,
+                use_cot_prompt=(False if bool(cond_post_cot) else use_cot_prompt_eval),
+                answer_first_eval=bool(cond_post_cot),
                 generation_cfg=cfg.eval_generation,
             )
 
@@ -1312,6 +1460,15 @@ def run_experiment(
                 "training": train_metrics,
                 "evaluation": eval_results,
             }
+
+            if cond_cfg["mode"] == "cascod":
+                run_payload.setdefault("artifacts", {})
+                run_payload["artifacts"].update(
+                    {
+                        "teacher_cot_file": str(teacher_cot_file),
+                        "teacher_logits_traditional_dir": str(teacher_logits_traditional_dir),
+                    }
+                )
 
             state.setdefault("completed", {})[run_key] = run_payload
             _save_state(state_path, state)
@@ -1403,7 +1560,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output root directory. In Colab, use /content/drive/MyDrive/SLM_results (requires drive.mount).",
     )
-    p.add_argument("--kd_modes", nargs="+", default=["traditional", "reasoning"], choices=["traditional", "reasoning"])
+    p.add_argument(
+        "--kd_modes",
+        nargs="+",
+        default=["traditional", "reasoning"],
+        choices=["traditional", "reasoning", "cascod", "combo_d"],
+    )
     p.add_argument("--student", default="student_primary", choices=["student_primary", "student_small"])
 
     p.add_argument("--seed", type=int, action="append", dest="seeds", help="Repeatable. Example: --seed 42 --seed 43")
@@ -1458,11 +1620,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Metric used for H1 statistical test (default: primary_score).",
     )
 
+    # Technique 2B: CasCoD (two-stage cascade distillation).
+    p.add_argument("--cascod_stage1_epochs", type=int, default=1, help="CasCoD stage1 epochs (reasoning CE-only)")
+    p.add_argument(
+        "--cascod_stage2_epochs",
+        type=int,
+        default=-1,
+        help="CasCoD stage2 epochs (traditional logits-KD). -1 means use --epochs",
+    )
+
     p.add_argument("--eval_max_new_tokens", type=int, default=256)
     p.add_argument("--eval_temperature", type=float, default=0.0)
 
     p.add_argument("--teacher_cot_max_new_tokens", type=int, default=150)
     p.add_argument("--teacher_cot_temperature", type=float, default=0.0)
+
+    # Technique 2A: reasoning granularity adaptation.
+    p.add_argument(
+        "--granularity_level",
+        type=int,
+        default=0,
+        help="0=disabled (backward-compatible), 1..6 increasing reasoning detail for teacher CoT prompts",
+    )
+
+    # Technique 2C: Post-CoT (answer-first training + eval without rationale).
+    p.add_argument("--post_cot", dest="post_cot", action="store_true", help="Enable Post-CoT (answer-first) formatting")
+    p.add_argument("--no_post_cot", dest="post_cot", action="store_false", help="Disable Post-CoT")
+    p.set_defaults(post_cot=False)
 
     # Baseline 0.1
     p.add_argument(
@@ -1526,6 +1710,11 @@ def main(argv: Optional[Sequence[str]] = None):
     cfg.teacher_cot_generation = GenerationConfig(
         max_new_tokens=args.teacher_cot_max_new_tokens, temperature=args.teacher_cot_temperature, do_sample=False
     )
+
+    granularity_level = int(getattr(args, "granularity_level", 0) or 0)
+    post_cot = bool(getattr(args, "post_cot", False))
+    cascod_stage1_epochs = int(getattr(args, "cascod_stage1_epochs", 1) or 1)
+    cascod_stage2_epochs = int(getattr(args, "cascod_stage2_epochs", -1) or -1)
 
     enable_gsm8k_train = True
     if args.enable_gsm8k_train:
@@ -1635,6 +1824,7 @@ def main(argv: Optional[Sequence[str]] = None):
             eval_obqa=eval_obqa,
             eval_efficiency=eval_eff,
             use_cot_prompt_eval=use_cot_eval,
+            granularity_level=granularity_level,
         )
 
     return run_experiment(
@@ -1654,6 +1844,10 @@ def main(argv: Optional[Sequence[str]] = None):
         allow_insufficient_runs=bool(args.allow_insufficient_runs),
         hypothesis_metric=str(args.hypothesis_metric),
         student_key=str(args.student),
+        granularity_level=granularity_level,
+        cascod_stage1_epochs=cascod_stage1_epochs,
+        cascod_stage2_epochs=cascod_stage2_epochs,
+        post_cot=post_cot,
     )
 
 

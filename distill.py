@@ -18,6 +18,7 @@ from config import (
     safe_model_to,
     set_seed,
 )
+from prompts import build_cot_prompt
 
 
 def _resolve_amp_device_type(device: torch.device) -> str:
@@ -111,7 +112,13 @@ def preprocess_and_tokenize(raw_dataset, tokenizer, max_length: int):
     return tokenized
 
 
-def build_reasoning_full_sequences_from_cot(cot_path: str, max_records: Optional[int] = None) -> List[str]:
+def build_reasoning_full_sequences_from_cot(
+    cot_path: str,
+    max_records: Optional[int] = None,
+    *,
+    granularity_level: int = 0,
+    post_cot: bool = False,
+) -> List[str]:
     """Build prompt+completion sequences from a teacher CoT cache.
 
     Scientific validity fix: reasoning-mode logits cache (if enabled) must be
@@ -124,11 +131,15 @@ def build_reasoning_full_sequences_from_cot(cot_path: str, max_records: Optional
     with open(cot_path, "r", encoding="utf-8") as handle:
         for line in handle:
             rec = json.loads(line)
-            prompt = (
-                f"Q: {rec.get('question', rec.get('text', ''))}\n"
-                "A: Let's think step by step.\n### REASONING:\n"
+            prompt, _ = build_cot_prompt(
+                str(rec.get("question", rec.get("text", ""))),
+                granularity_level=int(granularity_level or 0),
+                post_cot=bool(post_cot),
             )
-            teacher_full = (rec.get("teacher_reasoning", "").strip() + "\n### FINAL_ANSWER: " + rec.get("teacher_answer", ""))
+            if bool(post_cot):
+                teacher_full = (rec.get("teacher_answer", "").strip() + "\n### REASONING:\n" + rec.get("teacher_reasoning", "").strip())
+            else:
+                teacher_full = (rec.get("teacher_reasoning", "").strip() + "\n### FINAL_ANSWER: " + rec.get("teacher_answer", ""))
             seqs.append(prompt + teacher_full)
             if max_records is not None and len(seqs) >= int(max_records):
                 break
@@ -156,8 +167,10 @@ class TraditionalKDDistiller:
     def _ensure_vocab_alignment(self, model, tokenizer):
         tok_vocab = len(tokenizer)
         model_vocab = model.get_input_embeddings().weight.size(0)
-        if tok_vocab != model_vocab:
-            print(f" Resizing student embeddings: tokenizer={tok_vocab}, model={model_vocab}")
+        # Safety: only expand embeddings. Shrinking can break HF models that
+        # intentionally reserve extra rows and can desync output heads.
+        if tok_vocab > model_vocab:
+            print(f" Resizing student embeddings (expand): tokenizer={tok_vocab}, model={model_vocab}")
             model.resize_token_embeddings(tok_vocab)
             model = safe_model_to(model, self.config.device)
         return model
@@ -271,19 +284,23 @@ class TraditionalKDDistiller:
                         shard_iter = iter(teacher_logits_cache)
                         shard_path = next(shard_iter)
                     data = torch.load(shard_path, map_location="cpu")
-                    teacher_logits = data["logits"].to(device)
+                    # Stability: fp16 logits + softmax can be numerically fragile.
+                    teacher_logits = data["logits"].to(device=device, dtype=torch.float32)
                     teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
                 else:
                     with torch.no_grad():
                         t_out = teacher_model(**inputs)
                         teacher_logits = self._align_teacher_logits(t_out.logits, vocab_size)
+                        teacher_logits = teacher_logits.to(dtype=torch.float32)
 
                 with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
                     vocab_size = s_logits.size(-1)
                     ce_loss = F.cross_entropy(s_logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=-100)
-                    t_probs = F.softmax(teacher_logits / temperature, dim=-1)
-                    s_logp = F.log_softmax(s_logits / temperature, dim=-1)
+                    # KD math in fp32 for stability (especially with large vocabs).
+                    s_logits_kd = s_logits.to(dtype=torch.float32)
+                    t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
+                    s_logp = F.log_softmax(s_logits_kd / float(temperature), dim=-1)
                     token_kl = F.kl_div(s_logp, t_probs, reduction="none")
                     mask = (labels != -100).unsqueeze(-1).float()
                     kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
@@ -359,6 +376,8 @@ class ReasoningAwareDistiller:
         use_cot_cache: bool = True,
         use_logits_cache: bool = True,
         use_teacher_logits: bool = True,
+        granularity_level: int = 0,
+        post_cot: bool = False,
     ):
         set_seed(seed)
         device = self.config.device
@@ -377,17 +396,22 @@ class ReasoningAwareDistiller:
         examples: List[Dict[str, str]] = []
         if cot_records is not None:
             for rec in cot_records:
-                prompt = (
-                    f"Q: {rec.get('question', rec.get('text', ''))}\n"
-                    "A: Let's think step by step.\n### REASONING:\n"
+                prompt, _ = build_cot_prompt(
+                    str(rec.get("question", rec.get("text", ""))),
+                    granularity_level=int(granularity_level or 0),
+                    post_cot=bool(post_cot),
                 )
-                teacher_full = (rec.get("teacher_reasoning", "").strip() + "\n### FINAL_ANSWER: " + rec.get("teacher_answer", ""))
+                if bool(post_cot):
+                    teacher_full = (rec.get("teacher_answer", "").strip() + "\n### REASONING:\n" + rec.get("teacher_reasoning", "").strip())
+                else:
+                    teacher_full = (rec.get("teacher_reasoning", "").strip() + "\n### FINAL_ANSWER: " + rec.get("teacher_answer", ""))
                 examples.append({"prompt": prompt, "teacher_full": teacher_full})
         else:
             for ex in raw_dataset:
-                prompt = (
-                    f"Q: {ex.get('question', ex.get('text', ''))}\n"
-                    "A: Let's think step by step.\n### REASONING:\n"
+                prompt, _ = build_cot_prompt(
+                    str(ex.get("question", ex.get("text", ""))),
+                    granularity_level=int(granularity_level or 0),
+                    post_cot=bool(post_cot),
                 )
                 examples.append({"prompt": prompt, "teacher_full": str(ex.get("answer", ""))})
 
@@ -524,14 +548,17 @@ class ReasoningAwareDistiller:
 
                     if use_teacher_logits:
                         if "teacher_logits" in batch:
-                            teacher_logits = batch["teacher_logits"].to(device)
+                            teacher_logits = batch["teacher_logits"].to(device=device, dtype=torch.float32)
                         else:
                             with torch.inference_mode():
                                 teacher_logits = teacher_model(**inputs).logits
+                                teacher_logits = teacher_logits.to(dtype=torch.float32)
                         teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
 
-                        t_probs = F.softmax(teacher_logits / temperature, dim=-1)
-                        s_logp = F.log_softmax(s_logits / temperature, dim=-1)
+                        # KD math in fp32 for stability.
+                        s_logits_kd = s_logits.to(dtype=torch.float32)
+                        t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
+                        s_logp = F.log_softmax(s_logits_kd / float(temperature), dim=-1)
                         token_kl = F.kl_div(s_logp, t_probs, reduction="none")
                         mask = reasoning_mask.unsqueeze(-1).float()
                         kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)

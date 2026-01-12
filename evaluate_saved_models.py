@@ -93,7 +93,7 @@ def _load_model_and_tokenizer(model_dir: Path, device: torch.device, load_dtype:
         # tokenizer *before* loading adapter weights.
         try:
             emb = base_model.get_input_embeddings()
-            if emb is not None and emb.weight.shape[0] != tokenizer_len:
+            if emb is not None and tokenizer_len > int(emb.weight.shape[0]):
                 base_model.resize_token_embeddings(tokenizer_len)
         except Exception:
             # Best-effort; if resize isn't supported, loading may still fail.

@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from config import GenerationConfig, ensure_tokenizer_has_pad, get_safe_tokenizer_length, resolve_device, safe_model_to
+from prompts import PROMPT_VERSION, build_cot_prompt
 
 
 def _tokenizer_fingerprint(tokenizer) -> str:
@@ -194,6 +195,9 @@ def cache_teacher_logits(
     teacher_model = safe_model_to(teacher_model, target_device)
     teacher_model.eval()
 
+    # Some LMs ship without a pad token; caching uses padding='max_length'.
+    ensure_tokenizer_has_pad(tokenizer, teacher_model)
+
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: x)
     safe_max_len = effective_max_len
 
@@ -242,6 +246,8 @@ def cache_teacher_cot(
     prompt_max_length: Optional[int] = None,
     train_limit: Optional[int] = None,
     text_key: str = "text",
+    granularity_level: int = 0,
+    post_cot: bool = False,
 ) -> Path:
     """Generate and persist Chain-of-Thought traces as JSONL."""
 
@@ -259,6 +265,9 @@ def cache_teacher_cot(
         "split": split,
         "seed": seed,
         "prompt_max_length": prompt_max_length,
+        "prompt_version": PROMPT_VERSION,
+        "granularity_level": int(granularity_level or 0),
+        "post_cot": bool(post_cot),
         "train_limit": train_limit,
         "dataset_fingerprint": ds_fp,
         "dataset_domains": _dataset_domains(dataset),
@@ -287,11 +296,15 @@ def cache_teacher_cot(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: x)
     with open(out_file, "w", encoding="utf-8") as fout:
         for batch in tqdm(loader, desc="Caching teacher CoT"):
-            prompts = [
-                f"Q: {ex.get('question', ex.get('text', ''))}\n"
-                "A: Let's think step by step.\n### REASONING:\n"
-                for ex in batch
-            ]
+            prompts = []
+            for ex in batch:
+                q = ex.get("question", ex.get(text_key, ""))
+                p, _ = build_cot_prompt(
+                    str(q),
+                    granularity_level=int(granularity_level or 0),
+                    post_cot=bool(post_cot),
+                )
+                prompts.append(p)
             inputs = tokenizer(
                 prompts,
                 return_tensors="pt",
@@ -309,7 +322,7 @@ def cache_teacher_cot(
                     temperature=float(generation_cfg.temperature),
                     top_p=generation_cfg.top_p,
                     top_k=generation_cfg.top_k,
-                    pad_token_id=tokenizer.eos_token_id,
+                    pad_token_id=int(tokenizer.pad_token_id or tokenizer.eos_token_id or 0),
                     repetition_penalty=(generation_cfg.repetition_penalty or 1.0),
                 )
 
@@ -330,8 +343,15 @@ def cache_teacher_cot(
 def parse_cot_output(generated_text: str):
     import re
 
+    # Post-CoT (answer first):
+    #   ### FINAL_ANSWER: <answer>\n### REASONING: <reasoning>
+    pattern_post = re.compile(
+        r"###\s*FINAL_ANSWER\s*:\s*(.*?)\s*###\s*REASONING\s*:\s*(.*)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
     pattern_explicit = re.compile(
-        r"(?:### REASONING:|\n\s*A:\s*Let's think step by step\.\s*### REASONING:)\s*(.*?)\s*(?:### FINAL_ANSWER:|\n\s*FINAL_ANSWER:)\s*(.*)",
+        r"(?:### REASONING:|\n\s*A:\s*Let's think step by step\.(?:.*\n)*?\s*### REASONING:)\s*(.*?)\s*(?:### FINAL_ANSWER:|\n\s*FINAL_ANSWER:)\s*(.*)",
         re.DOTALL | re.IGNORECASE,
     )
     pattern_implicit = re.compile(
@@ -342,6 +362,10 @@ def parse_cot_output(generated_text: str):
     match_explicit = pattern_explicit.search(generated_text)
     if match_explicit:
         return match_explicit.group(1).strip(), match_explicit.group(2).strip()
+
+    match_post = pattern_post.search(generated_text)
+    if match_post:
+        return match_post.group(2).strip(), match_post.group(1).strip()
 
     match_implicit = pattern_implicit.search(generated_text)
     if match_implicit:
