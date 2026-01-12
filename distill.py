@@ -428,7 +428,84 @@ class ReasoningAwareDistiller:
         positions = torch.arange(labels.size(1)).unsqueeze(0)
         prompt_lengths = torch.clamp(prompt_lengths, max=labels.size(1)).unsqueeze(1)
         labels[positions < prompt_lengths] = -100
-        reasoning_mask = (labels != -100).long()
+
+        # KD mask should apply only to the reasoning portion (not the answer).
+        # CE still trains the entire completion; this keeps backward-compat while
+        # making KD interpretation cleaner.
+        reasoning_mask = torch.zeros_like(labels, dtype=torch.long)
+
+        # Audit stats (helps detect truncation/format drift silently breaking the mask).
+        mask_audit = {
+            "n_examples": int(len(full_sequences)),
+            "n_fallback": 0,
+            "n_reasoning_marker_found": 0,
+            "n_final_marker_found": 0,
+            "reasoning_tokens_sum": 0,
+            "completion_tokens_sum": 0,
+        }
+
+        def _safe_find(hay: str, needle: str) -> int:
+            try:
+                return (hay or "").lower().find((needle or "").lower())
+            except Exception:
+                return -1
+
+        for i, seq in enumerate(full_sequences):
+            # Default fallback: if we can't locate markers, KD over completion.
+            fallback_mask = (labels[i] != -100).long()
+            mask_audit["completion_tokens_sum"] += int(fallback_mask.sum().item())
+
+            if bool(post_cot):
+                # Format: prompt + "### FINAL_ANSWER:\n" + answer + "\n### REASONING:\n" + reasoning
+                m = "### REASONING:"
+                start = _safe_find(seq, m)
+                if start < 0:
+                    reasoning_mask[i] = fallback_mask
+                    mask_audit["n_fallback"] += 1
+                    mask_audit["reasoning_tokens_sum"] += int(fallback_mask.sum().item())
+                    continue
+
+                mask_audit["n_reasoning_marker_found"] += 1
+
+                prefix = seq[: start + len(m)]
+                tok_prefix = student_tokenizer(prefix, truncation=True, padding="max_length", max_length=self.config.max_length, return_tensors="pt")
+                start_len = int(tok_prefix["attention_mask"].sum().item())
+
+                positions_i = torch.arange(labels.size(1))
+                mask_i = (positions_i >= start_len) & (labels[i] != -100)
+                reasoning_mask[i][mask_i] = 1
+                mask_audit["reasoning_tokens_sum"] += int(reasoning_mask[i].sum().item())
+                continue
+
+            # Non-post: prompt + "### REASONING:\n" + reasoning + "\n### FINAL_ANSWER: " + answer
+            m_start = "### REASONING:"
+            m_end = "### FINAL_ANSWER:"
+            start = _safe_find(seq, m_start)
+            end = _safe_find(seq, m_end)
+            if start < 0:
+                reasoning_mask[i] = fallback_mask
+                mask_audit["n_fallback"] += 1
+                mask_audit["reasoning_tokens_sum"] += int(fallback_mask.sum().item())
+                continue
+
+            mask_audit["n_reasoning_marker_found"] += 1
+
+            prefix = seq[: start + len(m_start)]
+            tok_prefix = student_tokenizer(prefix, truncation=True, padding="max_length", max_length=self.config.max_length, return_tensors="pt")
+            start_len = int(tok_prefix["attention_mask"].sum().item())
+
+            end_len = labels.size(1)
+            if end > start:
+                mask_audit["n_final_marker_found"] += 1
+                prefix_end = seq[:end]
+                tok_end = student_tokenizer(prefix_end, truncation=True, padding="max_length", max_length=self.config.max_length, return_tensors="pt")
+                end_len = int(tok_end["attention_mask"].sum().item())
+                end_len = max(start_len, min(end_len, labels.size(1)))
+
+            positions_i = torch.arange(labels.size(1))
+            mask_i = (positions_i >= start_len) & (positions_i < end_len) & (labels[i] != -100)
+            reasoning_mask[i][mask_i] = 1
+            mask_audit["reasoning_tokens_sum"] += int(reasoning_mask[i].sum().item())
 
         class COTDataset(TorchDataset):
             def __init__(self, inputs, labels, reasoning_mask, teacher_logits: Optional[torch.Tensor]):
@@ -521,7 +598,25 @@ class ReasoningAwareDistiller:
         temperature_schedule = self.config.kd_params.get("temperature_schedule") or [1.0]
         alpha_schedule = self.config.kd_params.get("alpha_schedule") or [0.5]
 
-        metrics = {"losses": [], "kd_losses": [], "ce_losses": [], "use_teacher_logits": bool(use_teacher_logits)}
+        # Attach audit stats early so they get returned even if training aborts.
+        def _safe_div(num: float, den: float) -> float:
+            return float(num) / float(den) if float(den) != 0.0 else 0.0
+
+        mask_audit["reasoning_tokens_mean"] = _safe_div(mask_audit["reasoning_tokens_sum"], mask_audit["n_examples"])
+        mask_audit["completion_tokens_mean"] = _safe_div(mask_audit["completion_tokens_sum"], mask_audit["n_examples"])
+        mask_audit["reasoning_token_fraction_mean"] = _safe_div(mask_audit["reasoning_tokens_sum"], mask_audit["completion_tokens_sum"])
+        mask_audit["fallback_rate"] = _safe_div(mask_audit["n_fallback"], mask_audit["n_examples"])
+        mask_audit["reasoning_marker_found_rate"] = _safe_div(mask_audit["n_reasoning_marker_found"], mask_audit["n_examples"])
+        # For non-post mode, this checks whether FINAL marker was present; for post mode it may stay 0.
+        mask_audit["final_marker_found_rate"] = _safe_div(mask_audit["n_final_marker_found"], mask_audit["n_examples"])
+
+        metrics = {
+            "losses": [],
+            "kd_losses": [],
+            "ce_losses": [],
+            "use_teacher_logits": bool(use_teacher_logits),
+            "reasoning_mask_audit": mask_audit,
+        }
 
         for epoch in range(num_epochs):
             temperature = get_schedule_value(temperature_schedule, epoch, default=1.0)

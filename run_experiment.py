@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from cache import cache_teacher_cot, cache_teacher_logits, read_cache_metadata
+from cache import cache_teacher_cot, cache_teacher_logits, read_cache_metadata, tokenizer_fingerprint
 from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_pad, get_safe_tokenizer_length, safe_model_to, set_seed
 from data import load_training_dataset
 from distill import ReasoningAwareDistiller, TraditionalKDDistiller, autocast_ctx, make_grad_scaler, preprocess_and_tokenize
@@ -918,39 +918,8 @@ def run_kd_cot_standard_baseline(
 
 
 def _tokenizer_compat_key(tokenizer) -> str:
-    """Tokenizer compatibility fingerprint.
-
-    Scientific validity fix: logits-based KD assumes teacher forward-pass uses the
-    exact same token IDs as the student.
-
-    `name_or_path` differs across model sizes even when the tokenizer is
-    identical (e.g., Qwen2.5 7B vs 3B), so we compare a stable hash of the full
-    vocabulary mapping.
-    """
-
-    cached = getattr(tokenizer, "_slm_tokenizer_hash", None)
-    if isinstance(cached, str) and cached:
-        return cached
-
-    import hashlib
-
-    vocab = tokenizer.get_vocab()  # token -> id
-    h = hashlib.sha256()
-    h.update(tokenizer.__class__.__name__.encode("utf-8"))
-    h.update(str(len(vocab)).encode("utf-8"))
-    for k in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"):
-        h.update(f"|{k}={getattr(tokenizer, k, None)}".encode("utf-8"))
-    for token, idx in sorted(vocab.items(), key=lambda kv: kv[0]):
-        h.update(token.encode("utf-8", errors="ignore"))
-        h.update(b"\0")
-        h.update(str(int(idx)).encode("utf-8"))
-        h.update(b"\n")
-    digest = h.hexdigest()[:16]
-    try:
-        setattr(tokenizer, "_slm_tokenizer_hash", digest)
-    except Exception:
-        pass
-    return digest
+    # Single source of truth (shared with cache versioning).
+    return tokenizer_fingerprint(tokenizer)
 
 
 def assert_tokenizer_compatible_for_logits_kd(teacher_tokenizer, student_tokenizer, *, context: str) -> None:
@@ -1135,7 +1104,16 @@ def run_experiment(
                 granularity_level=int(granularity_level or 0),
                 post_cot=bool(post_cot),
             )
+            # Legacy key (kept for backward-compat)
             state["teacher_cot_file"] = str(cot_file)
+
+            # New variant-keyed mapping (prevents collisions across post_cot/granularity)
+            cot_key = _cot_variant_key(post=bool(post_cot), gran=int(granularity_level or 0))
+            tcf = state.get("teacher_cot_files")
+            if not isinstance(tcf, dict):
+                tcf = {}
+            tcf[cot_key] = str(cot_file)
+            state["teacher_cot_files"] = dict(tcf)
 
         # Scientific validity fix: logits-cache is per KD mode/input. We only
         # build caches when logits-KD is enabled and tokenizers are compatible.

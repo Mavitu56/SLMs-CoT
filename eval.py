@@ -183,10 +183,40 @@ def _extract_last_number_like(text: str) -> str:
     return nums[-1].strip() if nums else ""
 
 
+def _resolve_bbeh_cache_dir() -> Path:
+    """Resolve a persistent cache dir for BBEH downloads.
+
+    Priority:
+    1) SLM_BBEH_CACHE_DIR (explicit override)
+    2) SLM_DRIVE_ROOT/scientific_results/cache/bbeh_cache
+    3) Colab Drive default (when mounted)
+    4) /content/bbeh_cache (Colab ephemeral)
+    5) ./bbeh_cache (local fallback)
+    """
+
+    env = os.environ.get("SLM_BBEH_CACHE_DIR")
+    if env:
+        return Path(env)
+
+    drive_root = os.environ.get("SLM_DRIVE_ROOT")
+    if drive_root:
+        return Path(drive_root) / "scientific_results" / "cache" / "bbeh_cache"
+
+    try:
+        if os.path.ismount("/content/drive") and Path("/content/drive/MyDrive").is_dir():
+            return Path("/content/drive/MyDrive/SLM_results") / "scientific_results" / "cache" / "bbeh_cache"
+    except Exception:
+        pass
+
+    if Path("/content").exists():
+        return Path("/content") / "bbeh_cache"
+    return Path.cwd() / "bbeh_cache"
+
+
 def load_bbeh_task_dataset(task_name: str) -> Tuple[HFDataset, str]:
     """Loads a BBEH task JSON from GitHub with a small local cache."""
 
-    base_cache = Path("/content") / "bbeh_cache"
+    base_cache = _resolve_bbeh_cache_dir()
     base_cache.mkdir(parents=True, exist_ok=True)
 
     repo_alias_map = {

@@ -15,6 +15,16 @@ from config import GenerationConfig, ensure_tokenizer_has_pad, get_safe_tokenize
 from prompts import PROMPT_VERSION, build_cot_prompt
 
 
+def tokenizer_fingerprint(tokenizer) -> str:
+    """Public tokenizer fingerprint helper.
+
+    Used across the repo to ensure logits-KD comparisons are valid and caches
+    don't silently collide across tokenizer variants.
+    """
+
+    return _tokenizer_fingerprint(tokenizer)
+
+
 def _tokenizer_fingerprint(tokenizer) -> str:
     """Stable tokenizer identity hash.
 
@@ -359,24 +369,32 @@ def parse_cot_output(generated_text: str):
         re.DOTALL | re.IGNORECASE,
     )
 
-    match_explicit = pattern_explicit.search(generated_text)
-    if match_explicit:
-        return match_explicit.group(1).strip(), match_explicit.group(2).strip()
-
     match_post = pattern_post.search(generated_text)
     if match_post:
         return match_post.group(2).strip(), match_post.group(1).strip()
+
+    match_explicit = pattern_explicit.search(generated_text)
+    if match_explicit:
+        return match_explicit.group(1).strip(), match_explicit.group(2).strip()
 
     match_implicit = pattern_implicit.search(generated_text)
     if match_implicit:
         return match_implicit.group(1).strip(), match_implicit.group(2).strip()
 
-    lines = generated_text.splitlines()
+    # Fallback: drop common prompt prefix if present.
+    txt = (generated_text or "").strip()
+    # If the model echoed the prompt, keep only the tail after the last marker.
+    if "### REASONING:" in txt.upper() and txt.upper().rfind("### REASONING:") > 0:
+        txt = txt[txt.upper().rfind("### REASONING:") :]
+    if "### FINAL_ANSWER:" in txt.upper() and txt.upper().rfind("### FINAL_ANSWER:") > 0:
+        txt = txt[txt.upper().rfind("### FINAL_ANSWER:") :]
+
+    lines = txt.splitlines()
     if lines:
         answer = lines[-1].strip()
         reasoning = "\n".join(lines[:-1]).strip()
         if not reasoning:
-            return generated_text.strip(), ""
+            return txt.strip(), ""
         return reasoning, answer
 
     return "", ""
