@@ -56,6 +56,10 @@ def write_summary_txt(path: Path, results: Dict[str, Any]) -> None:
         gsm8k_scores = []
         bbh_scores = []
         inf_times = []
+        answer_first_rates = []
+        gen_token_means = []
+        gsm_cot_token_means = []
+        gsm_consistency_rates = []
 
         for run in runs:
             ev = run.get("evaluation", {})
@@ -64,6 +68,14 @@ def write_summary_txt(path: Path, results: Dict[str, Any]) -> None:
             gsm8k_scores.append(ev.get("gsm8k", {}).get("accuracy", 0.0))
             bbh_scores.append(ev.get("bbh", {}).get("average_accuracy", 0.0))
             inf_times.append(ev.get("efficiency", {}).get("inference_speed_seconds", 0.0))
+
+            sec = ev.get("secondary_metrics", {}) or {}
+            answer_first_rates.append(float(sec.get("answer_first_rate", 0.0) or 0.0))
+            gen_token_means.append(float(sec.get("generated_tokens_mean", 0.0) or 0.0))
+
+            gsm_sec = (ev.get("gsm8k", {}) or {}).get("secondary", {}) or {}
+            gsm_cot_token_means.append(float(gsm_sec.get("cot_tokens_mean", 0.0) or 0.0))
+            gsm_consistency_rates.append(float(gsm_sec.get("consistency_rate", 0.0) or 0.0))
 
         def _fmt_mean(arr: Sequence[float]) -> str:
             return f"{float(np.mean(arr)):.4f}" if arr else "N/D"
@@ -74,6 +86,13 @@ def write_summary_txt(path: Path, results: Dict[str, Any]) -> None:
         lines.append(f"BBH acc (média): {_fmt_mean(bbh_scores)}")
         lines.append(f"Overall (média): {_fmt_mean(overall_scores)}")
         lines.append(f"Inference time s (média): {_fmt_mean(inf_times)}")
+
+        # Optional secondary metrics (cheap).
+        if runs:
+            lines.append(f"Answer-first rate (média): {_fmt_mean(answer_first_rates)}")
+            lines.append(f"Generated tokens mean (média): {_fmt_mean(gen_token_means)}")
+            lines.append(f"GSM8K CoT tokens mean (média): {_fmt_mean(gsm_cot_token_means)}")
+            lines.append(f"GSM8K consistency rate (média): {_fmt_mean(gsm_consistency_rates)}")
 
         # Per-run view (more informative than only means).
         if runs:
@@ -87,6 +106,18 @@ def write_summary_txt(path: Path, results: Dict[str, Any]) -> None:
                 b = float(ev.get("bbh", {}).get("average_accuracy", 0.0) or 0.0)
                 t = float(ev.get("efficiency", {}).get("inference_speed_seconds", 0.0) or 0.0)
                 lines.append(f"  {seed} | {p:.4f} | {g:.4f} | {b:.4f} | {t:.4f}")
+
+            lines.append("  (sec) seed | answer_first | gen_tok_mean | gsm_cot_tok | gsm_consistency")
+            for r in runs:
+                ev = r.get("evaluation", {}) or {}
+                seed = r.get("seed")
+                sec = ev.get("secondary_metrics", {}) or {}
+                af = float(sec.get("answer_first_rate", 0.0) or 0.0)
+                gt = float(sec.get("generated_tokens_mean", 0.0) or 0.0)
+                gsm_sec = (ev.get("gsm8k", {}) or {}).get("secondary", {}) or {}
+                ct = float(gsm_sec.get("cot_tokens_mean", 0.0) or 0.0)
+                cr = float(gsm_sec.get("consistency_rate", 0.0) or 0.0)
+                lines.append(f"  (sec) {seed} | {af:.4f} | {gt:.2f} | {ct:.2f} | {cr:.4f}")
         lines.append("")
 
     ht = results.get("hypothesis_testing")

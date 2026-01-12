@@ -112,6 +112,48 @@ def _extract_choice_letter(text: str, *, choices: str) -> str:
     return ""
 
 
+def _starts_with_answer_like(text: str, *, mode: str) -> bool:
+    """Heuristic for 'answer-first' detection.
+
+    Modes:
+    - 'numeric': begins with a number (optionally $ or -)
+    - 'letter': begins with A/B/C/D (or other supplied letters already extracted upstream)
+    - 'bool': begins with yes/no/true/false
+
+    This is intentionally cheap and robust (used as a secondary metric).
+    """
+
+    t = (text or "").lstrip()
+    if not t:
+        return False
+
+    if mode == "numeric":
+        return re.match(r"^[\$\-]?\d", t) is not None
+    if mode == "letter":
+        return re.match(r"^[A-Za-z]", t) is not None
+    if mode == "bool":
+        return re.match(r"^(yes|no|true|false)\b", t, flags=re.IGNORECASE) is not None
+    return False
+
+
+def _normalize_number_string(x: str) -> str:
+    if not x:
+        return ""
+    s = (x or "").strip()
+    s = s.replace(",", "")
+    if s.startswith("$"):
+        s = s[1:]
+    return s
+
+
+def _extract_last_number_like(text: str) -> str:
+    if not text:
+        return ""
+    # Includes optional $ and -, accepts commas and decimals.
+    nums = re.findall(r"[\$\-]?\d[\d,]*\.?\d*", text)
+    return nums[-1].strip() if nums else ""
+
+
 def load_bbeh_task_dataset(task_name: str) -> Tuple[HFDataset, str]:
     """Loads a BBEH task JSON from GitHub with a small local cache."""
 
@@ -210,11 +252,53 @@ class StandardizedEvaluator:
             # Secondary metric: not part of hypothesis test by default.
             results["efficiency"] = self._eval_efficiency(model, tokenizer, seed, generation_cfg)
 
+        # Secondary metrics (cheap): aggregate across the enabled tasks.
+        results["secondary_metrics"] = self._aggregate_secondary_metrics(results)
+
         # Scientific validity fix: keep a primary score based on task performance.
         results["primary_score"] = self._primary_score(results)
         # Backward-compatible aggregate (still recorded), but treated as secondary.
         results["overall_score"] = self._overall_score(results)
         return results
+
+    def _aggregate_secondary_metrics(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Aggregate cheap, run-level metrics across tasks.
+
+        This intentionally does not affect primary score/hypothesis testing.
+        """
+
+        total_items = 0
+        total_generated_tokens = 0.0
+        total_answer_first = 0.0
+
+        def _accumulate(section: Dict[str, Any], *, key_total: str = "total") -> None:
+            nonlocal total_items, total_generated_tokens, total_answer_first
+            if not section:
+                return
+            sec = section.get("secondary") or {}
+            try:
+                n = int(section.get(key_total) or 0)
+            except Exception:
+                n = 0
+            if n <= 0:
+                return
+
+            # Values are means at the task level.
+            gen_mean = float(sec.get("generated_tokens_mean", 0.0) or 0.0)
+            af_rate = float(sec.get("answer_first_rate", 0.0) or 0.0)
+            total_items += n
+            total_generated_tokens += gen_mean * n
+            total_answer_first += af_rate * n
+
+        _accumulate(results.get("gsm8k", {}) or {}, key_total="total")
+        _accumulate(results.get("bbh", {}) or {}, key_total="tasks_evaluated")  # BBH 'total' is per-task.
+        _accumulate(results.get("obqa", {}) or {}, key_total="total")
+
+        return {
+            "answer_first_rate": float(total_answer_first / total_items) if total_items else 0.0,
+            "generated_tokens_mean": float(total_generated_tokens / total_items) if total_items else 0.0,
+            "items_covered": int(total_items),
+        }
 
     def _primary_score(self, results: Dict[str, Any]) -> float:
         gsm_present = "gsm8k" in results
@@ -259,6 +343,8 @@ class StandardizedEvaluator:
 
         correct = 0
         total = 0
+        generated_token_lens: List[int] = []
+        answer_first: List[int] = []
 
         for idx in tqdm(indices, desc="Eval OBQA"):
             ex = ds[int(idx)]
@@ -299,14 +385,26 @@ class StandardizedEvaluator:
                     repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
                 )
 
+            try:
+                input_len = int(inputs["input_ids"].shape[1])
+                out_len = int(outputs.shape[1])
+                generated_token_lens.append(max(0, out_len - input_len))
+            except Exception:
+                pass
+
             generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
             gen_answer = generated[len(prompt) :].strip() if len(generated) > len(prompt) else generated.strip()
+            answer_first.append(1 if _starts_with_answer_like(gen_answer, mode="letter") else 0)
             pred = _extract_choice_letter(gen_answer, choices=valid_letters)
             if pred and gold and pred == gold:
                 correct += 1
             total += 1
 
-        return {"accuracy": correct / total if total else 0.0, "correct": int(correct), "total": int(total)}
+        sec = {
+            "generated_tokens_mean": float(np.mean(generated_token_lens)) if generated_token_lens else 0.0,
+            "answer_first_rate": float(np.mean(answer_first)) if answer_first else 0.0,
+        }
+        return {"accuracy": correct / total if total else 0.0, "correct": int(correct), "total": int(total), "secondary": sec}
 
     def _eval_gsm8k(self, model, tokenizer, seed: int, use_cot_prompt: bool, gen_cfg: GenerationConfig) -> Dict[str, Any]:
         from datasets import load_dataset
@@ -321,6 +419,10 @@ class StandardizedEvaluator:
 
         correct = 0
         total = 0
+        generated_token_lens: List[int] = []
+        cot_token_lens: List[int] = []
+        answer_first: List[int] = []
+        consistency: List[int] = []
         for idx in tqdm(indices, desc="Eval GSM8K"):
             ex = ds[int(idx)]
             question = ex.get("question", "")
@@ -344,13 +446,58 @@ class StandardizedEvaluator:
                     repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
                 )
 
+            cont_text = ""
+            try:
+                input_len = int(inputs["input_ids"].shape[1])
+                out_len = int(outputs.shape[1])
+                cont_len = max(0, out_len - input_len)
+                generated_token_lens.append(cont_len)
+            except Exception:
+                cont_len = 0
+
             generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            cont_text = generated[len(prompt) :].strip() if len(generated) > len(prompt) else generated.strip()
             pred = extract_gsm8k_answer(generated)
             if pred == gold and gold != "":
                 correct += 1
             total += 1
 
-        return {"accuracy": correct / total if total else 0.0, "correct": int(correct), "total": int(total)}
+            # Answer-first: numeric-looking continuation.
+            answer_first.append(1 if _starts_with_answer_like(cont_text, mode="numeric") else 0)
+
+            # CoT token proxy: generated tokens minus tokens for extracted final answer.
+            if use_cot_prompt and cont_len > 0:
+                try:
+                    ans_ids = tokenizer(pred or "", add_special_tokens=False).get("input_ids") or []
+                    ans_len = int(len(ans_ids))
+                except Exception:
+                    ans_len = 0
+                cot_token_lens.append(max(0, int(cont_len) - int(ans_len)))
+
+            # Simple rationale/answer consistency: compare last number in 'reasoning' vs final extracted answer.
+            if use_cot_prompt:
+                # Prefer '####' split when present.
+                if "####" in generated:
+                    reasoning_text = generated.split("####")[0]
+                else:
+                    # Fallback: look before the last occurrence of the extracted answer string.
+                    if pred:
+                        pos = generated.rfind(str(pred))
+                        reasoning_text = generated[:pos] if pos > 0 else generated
+                    else:
+                        reasoning_text = generated
+                r_last = _normalize_number_string(_extract_last_number_like(reasoning_text))
+                a_norm = _normalize_number_string(pred)
+                if r_last and a_norm:
+                    consistency.append(1 if r_last == a_norm else 0)
+
+        sec = {
+            "generated_tokens_mean": float(np.mean(generated_token_lens)) if generated_token_lens else 0.0,
+            "cot_tokens_mean": float(np.mean(cot_token_lens)) if cot_token_lens else 0.0,
+            "answer_first_rate": float(np.mean(answer_first)) if answer_first else 0.0,
+            "consistency_rate": float(np.mean(consistency)) if consistency else 0.0,
+        }
+        return {"accuracy": correct / total if total else 0.0, "correct": int(correct), "total": int(total), "secondary": sec}
 
     def _eval_bbh(self, model, tokenizer, seed: int, gen_cfg: GenerationConfig) -> Dict[str, Any]:
         task_names = ["logical_deduction_five_objects", "causal_judgement", "formal_fallacies"]
@@ -361,6 +508,8 @@ class StandardizedEvaluator:
 
         all_results: Dict[str, Any] = {}
         total_accuracy = 0.0
+        per_task_generated_tokens: List[float] = []
+        per_task_answer_first: List[float] = []
 
         for task in task_names:
             ds, src = load_bbeh_task_dataset(task)
@@ -370,6 +519,8 @@ class StandardizedEvaluator:
             indices = rng.choice(len(ds), limit, replace=False)
 
             task_correct = 0
+            generated_token_lens: List[int] = []
+            answer_first: List[int] = []
             for idx in tqdm(indices, desc=f"Eval BBH {task}"):
                 ex = ds[int(idx)]
                 input_text = ex.get("input", "") or ex.get("prompt", "")
@@ -388,8 +539,15 @@ class StandardizedEvaluator:
                         pad_token_id=getattr(tokenizer, "eos_token_id", None),
                         repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
                     )
+                try:
+                    input_len = int(inputs["input_ids"].shape[1])
+                    out_len = int(outputs.shape[1])
+                    generated_token_lens.append(max(0, out_len - input_len))
+                except Exception:
+                    pass
                 gen = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 gen_answer = gen[len(prompt):].strip() if len(gen) > len(prompt) else gen.strip()
+                answer_first.append(1 if _starts_with_answer_like(gen_answer, mode="bool") or _starts_with_answer_like(gen_answer, mode="letter") else 0)
                 if bbh_answer_match(gen_answer, target or ""):
                     task_correct += 1
 
@@ -397,8 +555,17 @@ class StandardizedEvaluator:
             all_results[task] = {"accuracy": float(task_acc), "correct": int(task_correct), "total": int(limit), "source": src}
             total_accuracy += task_acc
 
+            if generated_token_lens:
+                per_task_generated_tokens.append(float(np.mean(generated_token_lens)))
+            if answer_first:
+                per_task_answer_first.append(float(np.mean(answer_first)))
+
         avg_accuracy = total_accuracy / len(task_names) if task_names else 0.0
-        return {"tasks": all_results, "average_accuracy": float(avg_accuracy), "tasks_evaluated": len(task_names)}
+        sec = {
+            "generated_tokens_mean": float(np.mean(per_task_generated_tokens)) if per_task_generated_tokens else 0.0,
+            "answer_first_rate": float(np.mean(per_task_answer_first)) if per_task_answer_first else 0.0,
+        }
+        return {"tasks": all_results, "average_accuracy": float(avg_accuracy), "tasks_evaluated": len(task_names), "secondary": sec}
 
     def _eval_efficiency(self, model, tokenizer, seed: int, gen_cfg: GenerationConfig) -> Dict[str, Any]:
         torch.manual_seed(seed)
