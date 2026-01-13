@@ -328,7 +328,19 @@ def cache_teacher_logits(
             "attention_mask": inputs["attention_mask"].cpu(),
         }
         shard_file = out_dir / f"teacher_logits_shard_{shard_idx}.pt"
-        torch.save(payload, shard_file)
+        # Atomic-ish write to reduce corrupted shards on flaky storage.
+        tmp_file = out_dir / f"teacher_logits_shard_{shard_idx}.pt.tmp"
+        torch.save(payload, tmp_file)
+        try:
+            os.replace(str(tmp_file), str(shard_file))
+        except Exception:
+            # Best-effort fallback.
+            torch.save(payload, shard_file)
+            try:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+            except Exception:
+                pass
 
     return out_dir
 

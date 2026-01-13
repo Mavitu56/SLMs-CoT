@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,6 +29,8 @@ def scan_logits_cache(
     max_shards: Optional[int] = None,
     top: int = 10,
     fail_on_nonfinite: bool = False,
+    retries: int = 2,
+    continue_on_load_error: bool = True,
 ) -> int:
     try:
         import torch
@@ -70,13 +73,34 @@ def scan_logits_cache(
 
     total = 0
     total_nonfinite = 0
+    load_errors = 0
+    load_error_paths: List[Path] = []
     worst: List[Tuple[int, float, int, Path]] = []  # (idx, max_abs, nonfinite, path)
 
     print(f"Scan logits cache: {logits_dir}")
     print(f"Shards: {len(shards)}")
 
     for i, shard_path in enumerate(shards):
-        payload = torch.load(shard_path, map_location="cpu")
+        payload = None
+        last_exc: Optional[BaseException] = None
+        for attempt in range(max(1, int(retries) + 1)):
+            try:
+                payload = torch.load(shard_path, map_location="cpu")
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                # Colab/Drive can intermittently disconnect (Errno 107); retry helps.
+                time.sleep(0.5)
+
+        if payload is None:
+            load_errors += 1
+            load_error_paths.append(shard_path)
+            print(f"(ioerr) shard={i} failed_to_load file={shard_path.name} err={type(last_exc).__name__}: {last_exc}")
+            if not continue_on_load_error:
+                return 2
+            continue
+
         logits = payload.get("logits")
         if logits is None:
             print(f"(warn) shard sem 'logits': {shard_path}")
@@ -98,6 +122,14 @@ def scan_logits_cache(
     print("Resumo")
     print(f"  shards_lidos: {total}")
     print(f"  nonfinite_total: {total_nonfinite}")
+    print(f"  load_errors: {load_errors}")
+
+    if load_error_paths:
+        # Show a few to make it actionable.
+        show = load_error_paths[: min(10, len(load_error_paths))]
+        print(f"  load_error_examples ({len(show)}/{len(load_error_paths)}):")
+        for p in show:
+            print(f"    - {p}")
 
     if worst_sorted:
         print(f"Top {min(top, len(worst_sorted))} shards por (nonfinite, max_abs):")
@@ -213,6 +245,12 @@ def main() -> int:
     p.add_argument("--top", type=int, default=10, help="Top shards para report")
     p.add_argument("--fail_on_nonfinite", action="store_true", help="Retorna exit code 1 se achar NaN/Inf em logits")
     p.add_argument("--fail_on_bad_json", action="store_true", help="Retorna exit code 1 se achar JSON inválido no CoT")
+    p.add_argument("--retries", type=int, default=2, help="Retries ao carregar um shard .pt (útil para Google Drive instável)")
+    p.add_argument(
+        "--stop_on_load_error",
+        action="store_true",
+        help="Para no primeiro erro de leitura de shard (por padrão, continua e reporta)",
+    )
 
     args = p.parse_args()
 
@@ -232,6 +270,8 @@ def main() -> int:
                 max_shards=args.max_shards,
                 top=int(args.top),
                 fail_on_nonfinite=bool(args.fail_on_nonfinite),
+                retries=int(args.retries),
+                continue_on_load_error=(not bool(args.stop_on_load_error)),
             ),
         )
 
