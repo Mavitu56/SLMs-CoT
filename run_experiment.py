@@ -107,6 +107,28 @@ def _train_sft_lora(
     )
 
     scaler = make_grad_scaler(device)
+
+    def _env_flag(name: str, default: str = "0") -> bool:
+        v = os.environ.get(name, default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _env_int(name: str, default: int) -> int:
+        v = os.environ.get(name)
+        if v is None:
+            return int(default)
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return int(default)
+
+    debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
+    skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
+    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 1.0))
+    try:
+        clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
+    except Exception:
+        pass
+    log_every = max(1, _env_int("SLM_TRAIN_LOG_EVERY", 50))
     metrics: Dict[str, Any] = {
         "epochs": num_epochs,
         "batch_size": batch_size,
@@ -141,9 +163,35 @@ def _train_sft_lora(
                     )
                 loss_to_backprop = loss / float(max(1, grad_accum_steps))
 
+            # Early catch: if loss already NaN/Inf, don't backprop.
+            if not torch.isfinite(loss.detach()).all():
+                if debug_nan:
+                    lr_now = None
+                    try:
+                        lr_now = float(lr_scheduler.get_last_lr()[0])
+                    except Exception:
+                        pass
+                    print(f" (warn) SFT loss não-finita; epoch={epoch} step={step} lr={lr_now} loss={loss.detach().cpu()}")
+                optimizer.zero_grad(set_to_none=True)
+                if not skip_nonfinite_batch:
+                    raise RuntimeError("SFT: loss não-finita detectada.")
+                continue
+
             scaler.scale(loss_to_backprop).backward()
 
             if (step % grad_accum_steps) == 0:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(clip_grad_norm))
+                if isinstance(grad_norm, torch.Tensor):
+                    grad_norm_val = float(grad_norm.detach().cpu().item())
+                else:
+                    grad_norm_val = float(grad_norm)
+                if (not (grad_norm_val == grad_norm_val)) or (grad_norm_val == float("inf")):
+                    if debug_nan:
+                        print(f" (warn) SFT grad_norm não-finito; pulando step. epoch={epoch} step={step}")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -153,6 +201,12 @@ def _train_sft_lora(
             if metrics["losses"]:
                 recent = metrics["losses"][-min(50, len(metrics["losses"])) :]
                 pbar.set_postfix({"loss": f"{sum(recent)/len(recent):.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+
+            if debug_nan and (step % log_every == 0):
+                try:
+                    print(f" (dbg) SFT epoch={epoch} step={step} loss={metrics['losses'][-1]:.6f}")
+                except Exception:
+                    pass
 
     if metrics["losses"]:
         metrics["loss_mean"] = float(sum(metrics["losses"]) / len(metrics["losses"]))
@@ -230,6 +284,28 @@ def _train_cascod_lora(
     )
 
     scaler = make_grad_scaler(device)
+
+    def _env_flag(name: str, default: str = "0") -> bool:
+        v = os.environ.get(name, default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _env_int(name: str, default: int) -> int:
+        v = os.environ.get(name)
+        if v is None:
+            return int(default)
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return int(default)
+
+    debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
+    skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
+    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 1.0))
+    try:
+        clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
+    except Exception:
+        pass
+    log_every = max(1, _env_int("SLM_TRAIN_LOG_EVERY", 50))
     metrics: Dict[str, Any] = {
         "epochs": num_epochs,
         "batch_size": batch_size,
@@ -272,9 +348,38 @@ def _train_cascod_lora(
                 loss = (1.0 - alpha) * loss_r + alpha * loss_a
                 loss_to_backprop = loss / float(max(1, grad_accum_steps))
 
+            if (not torch.isfinite(loss.detach()).all()) or (not torch.isfinite(loss_r.detach()).all()) or (not torch.isfinite(loss_a.detach()).all()):
+                if debug_nan:
+                    lr_now = None
+                    try:
+                        lr_now = float(lr_scheduler.get_last_lr()[0])
+                    except Exception:
+                        pass
+                    print(
+                        " (warn) CasCoD loss não-finita; "
+                        f"epoch={epoch} step={step} lr={lr_now} "
+                        f"loss={loss.detach().cpu()} loss_r={loss_r.detach().cpu()} loss_a={loss_a.detach().cpu()}"
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                if not skip_nonfinite_batch:
+                    raise RuntimeError("CasCoD: loss não-finita detectada.")
+                continue
+
             scaler.scale(loss_to_backprop).backward()
 
             if (step % grad_accum_steps) == 0:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(clip_grad_norm))
+                if isinstance(grad_norm, torch.Tensor):
+                    grad_norm_val = float(grad_norm.detach().cpu().item())
+                else:
+                    grad_norm_val = float(grad_norm)
+                if (not (grad_norm_val == grad_norm_val)) or (grad_norm_val == float("inf")):
+                    if debug_nan:
+                        print(f" (warn) CasCoD grad_norm não-finito; pulando step. epoch={epoch} step={step}")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -285,6 +390,15 @@ def _train_cascod_lora(
             metrics["losses_answer"].append(float(loss_a.detach().cpu().item()))
             recent = metrics["losses"][-min(50, len(metrics["losses"])) :]
             pbar.set_postfix({"loss": f"{sum(recent)/len(recent):.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+
+            if debug_nan and (step % log_every == 0):
+                try:
+                    print(
+                        f" (dbg) CasCoD epoch={epoch} step={step} loss={metrics['losses'][-1]:.6f} "
+                        f"r={metrics['losses_rationale'][-1]:.6f} a={metrics['losses_answer'][-1]:.6f}"
+                    )
+                except Exception:
+                    pass
 
     if metrics["losses"]:
         metrics["loss_mean"] = float(sum(metrics["losses"]) / len(metrics["losses"]))

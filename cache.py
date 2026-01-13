@@ -5,7 +5,7 @@ import json
 import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -227,6 +227,35 @@ def cache_teacher_logits(
     print(f" Gerando cache de logits: {out_dir}")
     write_cache_metadata(out_dir, metadata)
 
+    def _env_flag(name: str, default: str = "0") -> bool:
+        v = os.environ.get(name, default)
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _env_int(name: str, default: int) -> int:
+        v = os.environ.get(name)
+        if v is None:
+            return int(default)
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return int(default)
+
+    def _env_float(name: str, default: float) -> float:
+        v = os.environ.get(name)
+        if v is None:
+            return float(default)
+        try:
+            return float(str(v).strip())
+        except Exception:
+            return float(default)
+
+    cache_debug = _env_flag("SLM_CACHE_DEBUG", "1")
+    cache_log_every = max(1, _env_int("SLM_CACHE_LOG_EVERY", 50))
+    sanitize_logits = _env_flag("SLM_CACHE_SANITIZE_LOGITS", "1")
+    clamp_for_fp16 = _env_flag("SLM_CACHE_CLAMP_FP16", "1")
+    fp16_safe_abs = _env_float("SLM_CACHE_FP16_SAFE_ABS", 60000.0)
+    shard_stats_path = out_dir / "shard_stats.jsonl"
+
     target_device = resolve_device(device)
     teacher_model = safe_model_to(teacher_model, target_device)
     teacher_model.eval()
@@ -256,10 +285,45 @@ def cache_teacher_logits(
                 attention_mask=inputs["attention_mask"],
                 use_cache=False,
             )
-            logits = out.logits.detach().cpu()
+            logits = out.logits.detach().cpu().to(torch.float32)
+
+        # Diagnostics + optional sanitization before fp16 cast.
+        nonfinite = (~torch.isfinite(logits)).sum().item()
+        max_abs = float(logits.abs().max().item()) if logits.numel() else 0.0
+        above_fp16 = int((logits.abs() > fp16_safe_abs).sum().item()) if logits.numel() else 0
+
+        if cache_debug and (nonfinite or above_fp16 or ((shard_idx + 1) % cache_log_every == 0)):
+            print(
+                f" (cache) shard={shard_idx} max|logit|={max_abs:.2f} nonfinite={int(nonfinite)} above_fp16={int(above_fp16)}"
+            )
+
+        logits_to_save = logits
+        if sanitize_logits:
+            logits_to_save = torch.nan_to_num(logits_to_save, nan=0.0, posinf=fp16_safe_abs, neginf=-fp16_safe_abs)
+        if clamp_for_fp16 and fp16_safe_abs > 0:
+            logits_to_save = logits_to_save.clamp(min=-fp16_safe_abs, max=fp16_safe_abs)
+
+        logits_fp16 = logits_to_save.to(torch.float16)
+        nonfinite_fp16 = (~torch.isfinite(logits_fp16)).sum().item()
+
+        try:
+            # Persist per-shard stats for postmortem scanning.
+            rec = {
+                "shard": int(shard_idx),
+                "shape": list(logits.shape),
+                "dtype": str(logits.dtype),
+                "max_abs": float(max_abs),
+                "nonfinite": int(nonfinite),
+                "above_fp16": int(above_fp16),
+                "nonfinite_after_fp16": int(nonfinite_fp16),
+            }
+            with open(shard_stats_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
         payload = {
-            "logits": logits.to(torch.float16),
+            "logits": logits_fp16,
             "input_ids": inputs["input_ids"].cpu(),
             "attention_mask": inputs["attention_mask"].cpu(),
         }

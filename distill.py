@@ -238,6 +238,52 @@ class TraditionalKDDistiller:
         if not cache_available and teacher_model is None:
             raise ValueError("teacher_model precisa ser fornecido quando no h cache de logits.")
 
+        def _env_flag(name: str, default: str = "0") -> bool:
+            v = os.environ.get(name, default)
+            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        def _env_float(name: str, default: float) -> float:
+            v = os.environ.get(name)
+            if v is None:
+                return float(default)
+            try:
+                return float(str(v).strip())
+            except Exception:
+                return float(default)
+
+        def _env_int(name: str, default: int) -> int:
+            v = os.environ.get(name)
+            if v is None:
+                return int(default)
+            try:
+                return int(str(v).strip())
+            except Exception:
+                return int(default)
+
+        # Debug/stability knobs (env-driven to avoid changing CLI/Config surface).
+        debug_nan = _env_flag("SLM_KD_DEBUG_NAN", "1")
+        log_every = max(1, _env_int("SLM_KD_LOG_EVERY", 50))
+        skip_nonfinite_batch = _env_flag("SLM_KD_SKIP_NONFINITE_BATCH", "1")
+        clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 1.0))
+        clip_grad_norm = float(os.environ.get("SLM_KD_CLIP_GRAD_NORM", clip_grad_norm))
+        max_logit_abs = _env_float("SLM_KD_MAX_LOGIT_ABS", 100.0)
+        apply_logit_sanitize = _env_flag("SLM_KD_SANITIZE_LOGITS", "1")
+
+        def _sanitize_logits(x: torch.Tensor) -> torch.Tensor:
+            if not apply_logit_sanitize:
+                return x
+            # Replace NaN/inf to keep softmax/log_softmax stable.
+            x = torch.nan_to_num(x, nan=0.0, posinf=max_logit_abs, neginf=-max_logit_abs)
+            if max_logit_abs > 0:
+                x = x.clamp(min=-max_logit_abs, max=max_logit_abs)
+            return x
+
+        def _has_nonfinite(x: torch.Tensor) -> bool:
+            try:
+                return bool((~torch.isfinite(x)).any().item())
+            except Exception:
+                return True
+
         tokenized = preprocess_and_tokenize(raw_dataset, student_tokenizer, max_length=self.config.max_length)
         student_model = self._ensure_vocab_alignment(student_model, student_tokenizer)
 
@@ -311,6 +357,10 @@ class TraditionalKDDistiller:
 
         metrics = {"losses": [], "kd_losses": [], "ce_losses": []}
 
+        nonfinite_batches = 0
+        nonfinite_teacher_shards = 0
+        nonfinite_student_logits = 0
+
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             temperature = get_schedule_value(temperature_schedule, epoch, default=3.0)
@@ -334,47 +384,130 @@ class TraditionalKDDistiller:
                     # Stability: fp16 logits + softmax can be numerically fragile.
                     teacher_logits = data["logits"].to(device=device, dtype=torch.float32)
                     teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
+                    if _has_nonfinite(teacher_logits):
+                        nonfinite_teacher_shards += 1
+                        if debug_nan:
+                            print(f" (warn) teacher_logits não-finitos no shard: {shard_path}")
+                        teacher_logits = _sanitize_logits(teacher_logits)
                 else:
                     with torch.no_grad():
                         t_out = teacher_model(**inputs)
                         teacher_logits = self._align_teacher_logits(t_out.logits, vocab_size)
                         teacher_logits = teacher_logits.to(dtype=torch.float32)
+                        if _has_nonfinite(teacher_logits):
+                            nonfinite_teacher_shards += 1
+                            if debug_nan:
+                                print(" (warn) teacher_model produziu logits não-finitos (on-the-fly)")
+                            teacher_logits = _sanitize_logits(teacher_logits)
 
+                # Forward can be AMP, but compute losses in fp32 outside autocast.
                 with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
-                    vocab_size = s_logits.size(-1)
-                    ce_loss = F.cross_entropy(s_logits.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=-100)
-                    # KD math in fp32 for stability (especially with large vocabs).
-                    s_logits_kd = s_logits.to(dtype=torch.float32)
-                    t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
-                    s_logp = F.log_softmax(s_logits_kd / float(temperature), dim=-1)
-                    token_kl = F.kl_div(s_logp, t_probs, reduction="none")
-                    mask = (labels != -100).unsqueeze(-1).float()
-                    kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
-                    kd_loss *= temperature**2
-                    loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
 
-                    if grad_accum_steps > 1:
-                        loss = loss / float(grad_accum_steps)
+                s_logits_f32 = s_logits.to(dtype=torch.float32)
+                if _has_nonfinite(s_logits_f32):
+                    nonfinite_student_logits += 1
+                    if debug_nan:
+                        print(f" (warn) student logits não-finitos em epoch={epoch} batch={batch_idx}")
+                    s_logits_f32 = _sanitize_logits(s_logits_f32)
+
+                teacher_logits = _sanitize_logits(teacher_logits)
+
+                vocab_size = s_logits_f32.size(-1)
+                ce_loss = F.cross_entropy(s_logits_f32.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=-100)
+
+                # KD math in fp32 for stability (especially with large vocabs).
+                t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
+                s_logp = F.log_softmax(s_logits_f32 / float(temperature), dim=-1)
+                token_kl = F.kl_div(s_logp, t_probs, reduction="none")
+                mask = (labels != -100).unsqueeze(-1).float()
+                kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
+                kd_loss *= temperature**2
+                loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
+
+                if _has_nonfinite(loss) or _has_nonfinite(kd_loss) or _has_nonfinite(ce_loss):
+                    nonfinite_batches += 1
+                    if debug_nan:
+                        lr_now = None
+                        try:
+                            lr_now = float(lr_scheduler.get_last_lr()[0])
+                        except Exception:
+                            pass
+                        print(
+                            " (warn) loss não-finita; pulando batch. "
+                            f"epoch={epoch} batch={batch_idx} lr={lr_now} "
+                            f"loss={float(loss.detach().cpu().item()) if torch.isfinite(loss).all() else 'nonfinite'} "
+                            f"kd={float(kd_loss.detach().cpu().item()) if torch.isfinite(kd_loss).all() else 'nonfinite'} "
+                            f"ce={float(ce_loss.detach().cpu().item()) if torch.isfinite(ce_loss).all() else 'nonfinite'}"
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    if not skip_nonfinite_batch:
+                        raise RuntimeError("Encontrado loss/logits não-finitos durante KD. Veja logs acima.")
+                    continue
+
+                if grad_accum_steps > 1:
+                    loss = loss / float(grad_accum_steps)
 
                 scaler.scale(loss).backward()
 
                 do_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(dataloader))
                 if do_step:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(student_model.parameters(), float(clip_grad_norm))
+                    if isinstance(grad_norm, torch.Tensor):
+                        grad_norm_val = float(grad_norm.detach().cpu().item())
+                    else:
+                        grad_norm_val = float(grad_norm)
+                    if (not (grad_norm_val == grad_norm_val)) or (grad_norm_val == float("inf")):
+                        nonfinite_batches += 1
+                        if debug_nan:
+                            print(f" (warn) grad_norm não-finito; zerando grad e pulando step. epoch={epoch} batch={batch_idx}")
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        continue
                     scaler.step(optimizer)
                     scaler.update()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                metrics["losses"].append(float(loss.item()))
-                metrics["kd_losses"].append(float(kd_loss.item()))
-                metrics["ce_losses"].append(float(ce_loss.item()))
+                # Store *unscaled* loss values for monitoring.
+                try:
+                    metrics["losses"].append(float((loss.detach().cpu().item() * grad_accum_steps) if grad_accum_steps > 1 else loss.detach().cpu().item()))
+                    metrics["kd_losses"].append(float(kd_loss.detach().cpu().item()))
+                    metrics["ce_losses"].append(float(ce_loss.detach().cpu().item()))
+                except Exception:
+                    pass
                 # Track unscaled loss for reporting.
-                epoch_loss += float((loss.item() * grad_accum_steps) if grad_accum_steps > 1 else loss.item())
+                epoch_loss += float((loss.detach().cpu().item() * grad_accum_steps) if grad_accum_steps > 1 else loss.detach().cpu().item())
+
+                if debug_nan and ((batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(dataloader)):
+                    lr_now = None
+                    try:
+                        lr_now = float(lr_scheduler.get_last_lr()[0])
+                    except Exception:
+                        pass
+                    loss_val = metrics["losses"][-1] if metrics["losses"] else float("nan")
+                    kd_val = metrics["kd_losses"][-1] if metrics["kd_losses"] else float("nan")
+                    ce_val = metrics["ce_losses"][-1] if metrics["ce_losses"] else float("nan")
+                    with torch.no_grad():
+                        s_abs = float(s_logits_f32.detach().abs().max().cpu().item()) if s_logits_f32.numel() else 0.0
+                        t_abs = float(teacher_logits.detach().abs().max().cpu().item()) if teacher_logits.numel() else 0.0
+                    print(
+                        f" (dbg) epoch={epoch} batch={batch_idx+1}/{len(dataloader)} lr={lr_now} "
+                        f"loss={loss_val:.6f} kd={kd_val:.6f} ce={ce_val:.6f} "
+                        f"max|s_logit|={s_abs:.2f} max|t_logit|={t_abs:.2f} "
+                        f"nonfinite_batches={nonfinite_batches}"
+                    )
 
             print(f" KD Tradicional - poca {epoch}: Loss = {epoch_loss / max(1, len(dataloader)):.4f}")
+
+        if debug_nan and (nonfinite_batches or nonfinite_teacher_shards or nonfinite_student_logits):
+            print(
+                " (dbg) Resumo numérico KD: "
+                f"nonfinite_batches={nonfinite_batches}, "
+                f"nonfinite_teacher_shards={nonfinite_teacher_shards}, "
+                f"nonfinite_student_logits={nonfinite_student_logits}"
+            )
 
         metrics["final_loss"] = metrics["losses"][-1] if metrics["losses"] else None
         return student_model, metrics
@@ -430,6 +563,50 @@ class ReasoningAwareDistiller:
     ):
         set_seed(seed)
         device = self.config.device
+
+        def _env_flag(name: str, default: str = "0") -> bool:
+            v = os.environ.get(name, default)
+            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        def _env_float(name: str, default: float) -> float:
+            v = os.environ.get(name)
+            if v is None:
+                return float(default)
+            try:
+                return float(str(v).strip())
+            except Exception:
+                return float(default)
+
+        def _env_int(name: str, default: int) -> int:
+            v = os.environ.get(name)
+            if v is None:
+                return int(default)
+            try:
+                return int(str(v).strip())
+            except Exception:
+                return int(default)
+
+        debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
+        log_every = max(1, _env_int("SLM_TRAIN_LOG_EVERY", 50))
+        skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
+        clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 1.0))
+        clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
+        max_logit_abs = _env_float("SLM_TRAIN_MAX_LOGIT_ABS", 100.0)
+        apply_logit_sanitize = _env_flag("SLM_TRAIN_SANITIZE_LOGITS", "1")
+
+        def _sanitize_logits(x: torch.Tensor) -> torch.Tensor:
+            if not apply_logit_sanitize:
+                return x
+            x = torch.nan_to_num(x, nan=0.0, posinf=max_logit_abs, neginf=-max_logit_abs)
+            if max_logit_abs > 0:
+                x = x.clamp(min=-max_logit_abs, max=max_logit_abs)
+            return x
+
+        def _has_nonfinite(x: torch.Tensor) -> bool:
+            try:
+                return bool((~torch.isfinite(x)).any().item())
+            except Exception:
+                return True
 
         logits_ready = bool(use_teacher_logits and use_logits_cache and self.logits_cache_dir and os.path.isdir(self.logits_cache_dir))
         cot_ready = bool(use_cot_cache and self.cot_cache_path and os.path.exists(self.cot_cache_path))
@@ -704,6 +881,10 @@ class ReasoningAwareDistiller:
             "reasoning_mask_audit": mask_audit,
         }
 
+        nonfinite_batches = 0
+        nonfinite_teacher = 0
+        nonfinite_student = 0
+
         for epoch in range(num_epochs):
             temperature = get_schedule_value(temperature_schedule, epoch, default=1.0)
             alpha = get_schedule_value(alpha_schedule, epoch, default=0.5)
@@ -718,56 +899,119 @@ class ReasoningAwareDistiller:
                 labels = batch["labels"].to(device)
                 reasoning_mask = batch["reasoning_mask"].to(device)
 
+                # Forward can be AMP, but compute losses in fp32 outside autocast.
                 with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
-                    vocab_size = s_logits.size(-1)
 
-                    labels_ce = labels.long().clamp(min=-100, max=vocab_size - 1)
-                    labels_ce, _san = sanitize_labels_for_ce(labels_ce, vocab_size)
+                s_logits_f32 = _sanitize_logits(s_logits.to(dtype=torch.float32))
+                if _has_nonfinite(s_logits_f32):
+                    nonfinite_student += 1
+                    if debug_nan:
+                        print(f" (warn) student logits não-finitos (reasoning) epoch={epoch} batch={batch_idx}")
+                    s_logits_f32 = _sanitize_logits(s_logits_f32)
 
-                    ce_loss = F.cross_entropy(s_logits.reshape(-1, vocab_size), labels_ce.reshape(-1), ignore_index=-100)
+                vocab_size = s_logits_f32.size(-1)
 
-                    if use_teacher_logits:
-                        if "teacher_logits" in batch:
-                            teacher_logits = batch["teacher_logits"].to(device=device, dtype=torch.float32)
-                        else:
-                            with torch.inference_mode():
-                                teacher_logits = teacher_model(**inputs).logits
-                                teacher_logits = teacher_logits.to(dtype=torch.float32)
-                        teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
+                labels_ce = labels.long().clamp(min=-100, max=vocab_size - 1)
+                labels_ce, _san = sanitize_labels_for_ce(labels_ce, vocab_size)
 
-                        # KD math in fp32 for stability.
-                        s_logits_kd = s_logits.to(dtype=torch.float32)
-                        t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
-                        s_logp = F.log_softmax(s_logits_kd / float(temperature), dim=-1)
-                        token_kl = F.kl_div(s_logp, t_probs, reduction="none")
-                        mask = reasoning_mask.unsqueeze(-1).float()
-                        kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
-                        kd_loss *= temperature**2
-                        loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
+                ce_loss = F.cross_entropy(s_logits_f32.reshape(-1, vocab_size), labels_ce.reshape(-1), ignore_index=-100)
+
+                if use_teacher_logits:
+                    if "teacher_logits" in batch:
+                        teacher_logits = batch["teacher_logits"].to(device=device, dtype=torch.float32)
                     else:
-                        kd_loss = torch.tensor(0.0, device=device)
-                        loss = ce_loss
+                        with torch.inference_mode():
+                            teacher_logits = teacher_model(**inputs).logits
+                            teacher_logits = teacher_logits.to(dtype=torch.float32)
+                    teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
+                    if _has_nonfinite(teacher_logits):
+                        nonfinite_teacher += 1
+                        if debug_nan:
+                            print(f" (warn) teacher logits não-finitos (reasoning) epoch={epoch} batch={batch_idx}")
+                    teacher_logits = _sanitize_logits(teacher_logits)
 
-                    if grad_accum_steps > 1:
-                        loss = loss / float(grad_accum_steps)
+                    t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
+                    s_logp = F.log_softmax(s_logits_f32 / float(temperature), dim=-1)
+                    token_kl = F.kl_div(s_logp, t_probs, reduction="none")
+                    mask = reasoning_mask.unsqueeze(-1).float()
+                    kd_loss = (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
+                    kd_loss *= temperature**2
+                    loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
+                else:
+                    kd_loss = torch.tensor(0.0, device=device)
+                    loss = ce_loss
+
+                if _has_nonfinite(loss) or _has_nonfinite(ce_loss) or _has_nonfinite(kd_loss):
+                    nonfinite_batches += 1
+                    if debug_nan:
+                        lr_now = None
+                        try:
+                            lr_now = float(lr_scheduler.get_last_lr()[0])
+                        except Exception:
+                            pass
+                        print(
+                            " (warn) loss não-finita (reasoning); pulando batch. "
+                            f"epoch={epoch} batch={batch_idx} lr={lr_now} "
+                            f"ce={'nonfinite' if _has_nonfinite(ce_loss) else float(ce_loss.detach().cpu().item())} "
+                            f"kd={'nonfinite' if _has_nonfinite(kd_loss) else float(kd_loss.detach().cpu().item())}"
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    if not skip_nonfinite_batch:
+                        raise RuntimeError("Encontrado loss/logits não-finitos durante CoT/reasoning KD.")
+                    continue
+
+                if grad_accum_steps > 1:
+                    loss = loss / float(grad_accum_steps)
 
                 scaler.scale(loss).backward()
 
                 do_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(dataloader))
                 if do_step:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(student_model.parameters(), float(clip_grad_norm))
+                    if isinstance(grad_norm, torch.Tensor):
+                        grad_norm_val = float(grad_norm.detach().cpu().item())
+                    else:
+                        grad_norm_val = float(grad_norm)
+                    if (not (grad_norm_val == grad_norm_val)) or (grad_norm_val == float("inf")):
+                        nonfinite_batches += 1
+                        if debug_nan:
+                            print(f" (warn) grad_norm não-finito (reasoning); pulando step. epoch={epoch} batch={batch_idx}")
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        continue
                     scaler.step(optimizer)
                     scaler.update()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                metrics["losses"].append(float(loss.item()))
-                metrics["kd_losses"].append(float(kd_loss.item()))
-                metrics["ce_losses"].append(float(ce_loss.item()))
+                try:
+                    metrics["losses"].append(float((loss.detach().cpu().item() * grad_accum_steps) if grad_accum_steps > 1 else loss.detach().cpu().item()))
+                    metrics["kd_losses"].append(float(kd_loss.detach().cpu().item()))
+                    metrics["ce_losses"].append(float(ce_loss.detach().cpu().item()))
+                except Exception:
+                    pass
+
+                if debug_nan and ((batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(dataloader)):
+                    with torch.no_grad():
+                        s_abs = float(s_logits_f32.detach().abs().max().cpu().item()) if s_logits_f32.numel() else 0.0
+                        t_abs = float(teacher_logits.detach().abs().max().cpu().item()) if (use_teacher_logits and "teacher_logits" in locals() and teacher_logits.numel()) else 0.0
+                    print(
+                        f" (dbg) reasoning epoch={epoch} batch={batch_idx+1}/{len(dataloader)} "
+                        f"loss={metrics['losses'][-1] if metrics['losses'] else float('nan'):.6f} "
+                        f"kd={metrics['kd_losses'][-1] if metrics['kd_losses'] else float('nan'):.6f} "
+                        f"ce={metrics['ce_losses'][-1] if metrics['ce_losses'] else float('nan'):.6f} "
+                        f"max|s_logit|={s_abs:.2f} max|t_logit|={t_abs:.2f} nonfinite_batches={nonfinite_batches}"
+                    )
 
             print(f" CoT KD - poca {epoch} concluda")
+
+        if debug_nan and (nonfinite_batches or nonfinite_teacher or nonfinite_student):
+            print(
+                " (dbg) Resumo numérico CoT/reasoning: "
+                f"nonfinite_batches={nonfinite_batches}, nonfinite_teacher={nonfinite_teacher}, nonfinite_student={nonfinite_student}"
+            )
 
         metrics["final_loss"] = metrics["losses"][-1] if metrics["losses"] else None
         return student_model, metrics
