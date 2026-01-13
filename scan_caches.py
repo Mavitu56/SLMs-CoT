@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import gc
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +32,10 @@ def scan_logits_cache(
     fail_on_nonfinite: bool = False,
     retries: int = 2,
     continue_on_load_error: bool = True,
+    use_mmap: bool = True,
+    weights_only: bool = True,
+    stats_device: str = "cpu",
+    gc_every: int = 1,
 ) -> int:
     try:
         import torch
@@ -85,7 +90,17 @@ def scan_logits_cache(
         last_exc: Optional[BaseException] = None
         for attempt in range(max(1, int(retries) + 1)):
             try:
-                payload = torch.load(shard_path, map_location="cpu")
+                load_kwargs: Dict[str, Any] = {"map_location": "cpu"}
+                # Newer torch supports weights_only/mmap; older versions will throw TypeError.
+                if bool(weights_only):
+                    load_kwargs["weights_only"] = True
+                if bool(use_mmap):
+                    load_kwargs["mmap"] = True
+                try:
+                    payload = torch.load(shard_path, **load_kwargs)
+                except TypeError:
+                    # Fallback for older torch.
+                    payload = torch.load(shard_path, map_location="cpu")
                 last_exc = None
                 break
             except Exception as exc:
@@ -106,9 +121,16 @@ def scan_logits_cache(
             print(f"(warn) shard sem 'logits': {shard_path}")
             continue
 
-        logits_f32 = logits.to(torch.float32)
-        nonfinite = int((~torch.isfinite(logits_f32)).sum().item())
-        max_abs = float(logits_f32.abs().max().item()) if logits_f32.numel() else 0.0
+        # Keep fp16/bf16 if that's what is on disk to avoid doubling RAM.
+        # If there are NaN/Inf, isfinite works fine in fp16.
+        t = logits
+        if stats_device != "cpu":
+            # Optional: move to CUDA for faster reductions (won't reduce RAM; may use VRAM).
+            # Use non_blocking only if tensor is pinned (it isn't), but harmless.
+            t = t.to(stats_device)
+
+        nonfinite = int((~torch.isfinite(t)).sum().item())
+        max_abs = float(t.abs().max().item()) if t.numel() else 0.0
         total += 1
         total_nonfinite += nonfinite
         worst.append((i, max_abs, nonfinite, shard_path))
@@ -117,6 +139,24 @@ def scan_logits_cache(
             print(f"(bad) shard={i} nonfinite={nonfinite} max|logit|={max_abs:.2f} path={shard_path}")
         elif (i + 1) % 50 == 0:
             print(f"(ok) shard={i} max|logit|={max_abs:.2f}")
+
+        # Free memory aggressively (important on Colab with large shards).
+        try:
+            del t
+        except Exception:
+            pass
+        try:
+            del logits
+        except Exception:
+            pass
+        try:
+            del payload
+        except Exception:
+            pass
+        if gc_every and ((i + 1) % int(gc_every) == 0):
+            gc.collect()
+            if stats_device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     worst_sorted = sorted(worst, key=lambda t: (t[2] > 0, t[2], t[1]), reverse=True)
     print("Resumo")
@@ -251,6 +291,28 @@ def main() -> int:
         action="store_true",
         help="Para no primeiro erro de leitura de shard (por padrão, continua e reporta)",
     )
+    p.add_argument(
+        "--no_mmap",
+        action="store_true",
+        help="Desativa torch.load(mmap=True) quando disponível (pode aumentar RAM)",
+    )
+    p.add_argument(
+        "--no_weights_only",
+        action="store_true",
+        help="Desativa torch.load(weights_only=True) quando disponível",
+    )
+    p.add_argument(
+        "--stats_device",
+        type=str,
+        default="cpu",
+        help="Dispositivo para calcular estatísticas (cpu ou cuda). GPU não reduz RAM; só acelera reduções.",
+    )
+    p.add_argument(
+        "--gc_every",
+        type=int,
+        default=1,
+        help="Faz gc.collect() a cada N shards (reduz pico de RAM no Colab).",
+    )
 
     args = p.parse_args()
 
@@ -272,6 +334,10 @@ def main() -> int:
                 fail_on_nonfinite=bool(args.fail_on_nonfinite),
                 retries=int(args.retries),
                 continue_on_load_error=(not bool(args.stop_on_load_error)),
+                use_mmap=(not bool(args.no_mmap)),
+                weights_only=(not bool(args.no_weights_only)),
+                stats_device=str(args.stats_device),
+                gc_every=int(args.gc_every),
             ),
         )
 
