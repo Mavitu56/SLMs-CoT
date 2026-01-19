@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import os
+import json
 
 import torch
 import torch.nn.functional as F
@@ -238,6 +239,14 @@ class TraditionalKDDistiller:
         if not cache_available and teacher_model is None:
             raise ValueError("teacher_model precisa ser fornecido quando no h cache de logits.")
 
+        # Optional checkpointing + cache-alignment diagnostics (env-driven).
+        # These help pinpoint when training starts to drift and whether cached
+        # logits correspond to the same tokenized inputs.
+        from pathlib import Path
+
+        ckpt_root = os.environ.get("SLM_KD_CKPT_DIR")
+        ckpt_root_path = Path(ckpt_root) if ckpt_root else None
+
         def _env_flag(name: str, default: str = "0") -> bool:
             v = os.environ.get(name, default)
             return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -264,6 +273,8 @@ class TraditionalKDDistiller:
         debug_nan = _env_flag("SLM_KD_DEBUG_NAN", "1")
         log_every = max(1, _env_int("SLM_KD_LOG_EVERY", 50))
         skip_nonfinite_batch = _env_flag("SLM_KD_SKIP_NONFINITE_BATCH", "1")
+        save_every_epoch = _env_flag("SLM_KD_SAVE_EVERY_EPOCH", "0")
+        strict_cache_match = _env_flag("SLM_KD_STRICT_CACHE_MATCH", "0")
         clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 1.0))
         clip_grad_norm = float(os.environ.get("SLM_KD_CLIP_GRAD_NORM", clip_grad_norm))
         max_logit_abs = _env_float("SLM_KD_MAX_LOGIT_ABS", 100.0)
@@ -381,8 +392,48 @@ class TraditionalKDDistiller:
                         shard_iter = iter(teacher_logits_cache)
                         shard_path = next(shard_iter)
                     data = torch.load(shard_path, map_location="cpu")
+
+                    # Cache/input alignment checks: verifies the cached logits were
+                    # produced for the exact same token IDs and attention mask.
+                    # If this fails, logits-KD becomes scientifically invalid.
+                    try:
+                        cached_ids = data.get("input_ids")
+                        cached_mask = data.get("attention_mask")
+                        if cached_ids is not None and cached_mask is not None:
+                            cur_ids = inputs.get("input_ids").detach().to("cpu")
+                            cur_mask = inputs.get("attention_mask").detach().to("cpu")
+                            same_ids = bool(torch.equal(cached_ids, cur_ids))
+                            same_mask = bool(torch.equal(cached_mask, cur_mask))
+                            if not (same_ids and same_mask):
+                                msg = (
+                                    " (warn) Cache de logits parece desalinhado com o batch atual. "
+                                    f"epoch={epoch} batch={batch_idx} shard={Path(shard_path).name} "
+                                    f"same_input_ids={same_ids} same_attention_mask={same_mask}"
+                                )
+                                print(msg)
+                                if strict_cache_match:
+                                    raise RuntimeError(msg)
+                    except Exception as exc:
+                        if strict_cache_match:
+                            raise
+                        if debug_nan:
+                            print(f" (warn) Falha ao checar alinhamento do cache: {exc}")
+
                     # Stability: fp16 logits + softmax can be numerically fragile.
                     teacher_logits = data["logits"].to(device=device, dtype=torch.float32)
+
+                    # Sanity: cached logits batch dimension must match current batch.
+                    try:
+                        if int(teacher_logits.size(0)) != int(inputs["input_ids"].size(0)):
+                            raise RuntimeError(
+                                "Batch size mismatch entre cache e dataloader. "
+                                f"cache_bs={int(teacher_logits.size(0))} batch_bs={int(inputs['input_ids'].size(0))} "
+                                f"shard={Path(shard_path).name}. "
+                                "Isso normalmente indica train_limit diferente, batch_size diferente, ou cache incorreto."
+                            )
+                    except Exception:
+                        raise
+
                     teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
                     if _has_nonfinite(teacher_logits):
                         nonfinite_teacher_shards += 1
@@ -500,6 +551,32 @@ class TraditionalKDDistiller:
                     )
 
             print(f" KD Tradicional - poca {epoch}: Loss = {epoch_loss / max(1, len(dataloader)):.4f}")
+
+            # Optional: save intermediate checkpoints (adapter + tokenizer) per epoch.
+            if save_every_epoch and ckpt_root_path is not None:
+                try:
+                    out_dir = ckpt_root_path / f"epoch_{int(epoch) + 1:02d}"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    student_model.save_pretrained(out_dir)
+                    student_tokenizer.save_pretrained(out_dir)
+                    # Write minimal metadata for traceability.
+                    meta = {
+                        "epoch": int(epoch) + 1,
+                        "temperature": float(temperature),
+                        "alpha": float(alpha),
+                        "seed": int(seed),
+                        "max_length": int(self.config.max_length),
+                        "batch_size": int(batch_size),
+                        "grad_accum_steps": int(grad_accum_steps),
+                        "cache_dir": str(self.cache_dir) if self.cache_dir else None,
+                    }
+                    (out_dir / "checkpoint_meta.json").write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    print(f" (ckpt) Salvo checkpoint intermediário: {out_dir}")
+                except Exception as exc:
+                    print(f" (warn) Falha ao salvar checkpoint intermediário: {exc}")
 
         if debug_nan and (nonfinite_batches or nonfinite_teacher_shards or nonfinite_student_logits):
             print(

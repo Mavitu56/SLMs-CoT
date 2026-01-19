@@ -878,6 +878,12 @@ def run_kd_logits_baseline(
             torch.cuda.empty_cache()
 
         # Distill student using cache only.
+        # Optional: save intermediate checkpoints per epoch for postmortem debugging.
+        if str(os.environ.get("SLM_ENABLE_KD_EPOCH_CKPTS", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}:
+            ckpt_dir = cfg.models_dir / exp_id / f"kd_logits_seed{seed}_ckpts"
+            os.environ["SLM_KD_CKPT_DIR"] = str(ckpt_dir)
+            os.environ["SLM_KD_SAVE_EVERY_EPOCH"] = "1"
+
         distiller = TraditionalKDDistiller(cfg, cache_dir=str(logits_dir))
         trained_model, train_metrics = distiller.distill(
             student_model,
@@ -1655,6 +1661,13 @@ def run_experiment(
                         "Desabilitar logits-KD tornaria esta condição um SFT answer-only, "
                         "o que foge do desenho experimental atual."
                     )
+
+                # Optional: save intermediate checkpoints per epoch for debugging.
+                if str(os.environ.get("SLM_ENABLE_KD_EPOCH_CKPTS", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}:
+                    ckpt_dir = cfg.models_dir / exp_id / f"{cond_name}_seed{seed}_ckpts"
+                    os.environ["SLM_KD_CKPT_DIR"] = str(ckpt_dir)
+                    os.environ["SLM_KD_SAVE_EVERY_EPOCH"] = "1"
+
                 distiller = TraditionalKDDistiller(cfg, cache_dir=teacher_logits_traditional_dir)
                 trained_model, train_metrics = distiller.distill(
                     student_model,
