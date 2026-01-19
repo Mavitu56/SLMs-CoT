@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -11,6 +14,32 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_pad, resolve_device, set_seed
 from eval import StandardizedEvaluator
+
+
+def _collect_environment_metadata() -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "executable": sys.executable,
+    }
+    try:
+        meta["torch_version"] = getattr(torch, "__version__", None)
+        meta["cuda_available"] = bool(torch.cuda.is_available())
+        meta["cuda_version"] = getattr(torch.version, "cuda", None)
+        if bool(torch.cuda.is_available()):
+            try:
+                meta["gpu_name"] = str(torch.cuda.get_device_name(0))
+            except Exception:
+                meta["gpu_name"] = None
+    except Exception:
+        pass
+    try:
+        import transformers as _transformers
+
+        meta["transformers_version"] = getattr(_transformers, "__version__", None)
+    except Exception:
+        pass
+    return meta
 
 
 def _now_stamp() -> str:
@@ -185,6 +214,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override device (e.g., cuda, cuda:0, cpu). Default: auto.",
     )
+
+    p.add_argument("--deterministic", action="store_true", help="Enable deterministic mode for eval (best-effort)")
+    p.add_argument("--no_deterministic", action="store_true", help="Disable deterministic mode for eval")
     p.add_argument(
         "--load_dtype",
         choices=["auto", "bf16", "fp16", "fp32"],
@@ -204,6 +236,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+
+    deterministic = bool(getattr(args, "deterministic", False))
+    if bool(getattr(args, "no_deterministic", False)):
+        deterministic = False
+    if bool(deterministic):
+        try:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        except Exception:
+            pass
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
 
     # Resolve model dirs
     model_paths: List[str] = list(args.model_dirs or [])
@@ -307,6 +353,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "model_dir": str(model_dir),
             "device": str(device),
             "seed": int(args.seed),
+            "environment": _collect_environment_metadata(),
+            "reproducibility": {"deterministic": bool(deterministic)},
             "eval_flags": {
                 "eval_gsm8k": eval_gsm8k,
                 "eval_bbh": eval_bbh,

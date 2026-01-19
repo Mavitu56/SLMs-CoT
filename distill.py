@@ -602,17 +602,202 @@ class ReasoningAwareDistiller:
         with open(path, "r", encoding="utf-8") as handle:
             return [json.loads(line) for line in handle]
 
-    def _load_logits_cache(self, directory: str) -> torch.Tensor:
+    class _LazyTeacherLogitsCache:
+        def __init__(self, shard_paths, shard_sizes):
+            self.shard_paths = list(shard_paths)
+            self.shard_sizes = list(int(x) for x in shard_sizes)
+            if len(self.shard_paths) != len(self.shard_sizes):
+                raise ValueError("LazyTeacherLogitsCache: shard_paths e shard_sizes com tamanhos diferentes")
+
+            # Prefix sums for global index -> shard mapping.
+            self._starts = []
+            total = 0
+            for n in self.shard_sizes:
+                self._starts.append(int(total))
+                total += int(n)
+            self._total = int(total)
+
+            # Single-shard cache (keeps RAM bounded).
+            self._cached_shard_idx = None
+            self._cached_logits = None
+
+        def __len__(self):
+            return int(self._total)
+
+        def _find_shard(self, idx: int) -> int:
+            # Linear search is OK for small shard counts; for large counts, use bisect.
+            import bisect
+
+            i = bisect.bisect_right(self._starts, int(idx)) - 1
+            if i < 0:
+                i = 0
+            return int(i)
+
+        def shard_ranges(self):
+            for shard_idx, (start, n) in enumerate(zip(self._starts, self.shard_sizes)):
+                yield int(shard_idx), int(start), int(start + n)
+
+        def _load_shard_logits(self, shard_idx: int) -> torch.Tensor:
+            # Load only one shard at a time.
+            payload = torch.load(self.shard_paths[int(shard_idx)], map_location="cpu")
+            logits = payload.get("logits")
+            if logits is None:
+                raise ValueError(f"Shard sem 'logits': {self.shard_paths[int(shard_idx)]}")
+            # Keep fp16 in RAM; convert on-the-fly in training.
+            return logits
+
+        def __getitem__(self, idx: int) -> torch.Tensor:
+            if idx < 0:
+                idx = int(self._total) + int(idx)
+            if idx < 0 or idx >= int(self._total):
+                raise IndexError(idx)
+
+            shard_idx = self._find_shard(int(idx))
+            if self._cached_shard_idx != int(shard_idx) or self._cached_logits is None:
+                self._cached_logits = self._load_shard_logits(int(shard_idx))
+                self._cached_shard_idx = int(shard_idx)
+
+            local = int(idx) - int(self._starts[int(shard_idx)])
+            return self._cached_logits[int(local)]
+
+    def _estimate_logits_cache_size_mb(self, directory: str) -> float:
         from pathlib import Path
+
+        stats_path = Path(directory) / "shard_stats.jsonl"
+        if not stats_path.exists():
+            return 0.0
+        try:
+            import json
+
+            total_elems = 0
+            for line in stats_path.read_text(encoding="utf-8").splitlines():
+                line = (line or "").strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                shape = rec.get("shape")
+                if not isinstance(shape, list) or not shape:
+                    continue
+                elems = 1
+                for d in shape:
+                    try:
+                        elems *= int(d)
+                    except Exception:
+                        elems = 0
+                        break
+                total_elems += int(elems)
+            # Cache is fp16 on disk (2 bytes).
+            return float(total_elems * 2) / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    def _read_shard_sizes(self, directory: str, shard_paths):
+        """Return per-shard batch sizes aligned to shard_paths.
+
+        Prefers shard_stats.jsonl (fast). Falls back to loading each shard (slow).
+        """
+
+        from pathlib import Path
+
+        # Parse shard index from filename.
+        def _idx(p: Path) -> int:
+            name = p.name
+            try:
+                # teacher_logits_shard_{i}.pt
+                mid = name.split("teacher_logits_shard_")[-1]
+                mid = mid.split(".pt")[0]
+                return int(mid)
+            except Exception:
+                return -1
+
+        stats_path = Path(directory) / "shard_stats.jsonl"
+        if stats_path.exists():
+            try:
+                import json
+
+                sizes_by_idx = {}
+                for line in stats_path.read_text(encoding="utf-8").splitlines():
+                    line = (line or "").strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    sidx = rec.get("shard")
+                    shape = rec.get("shape")
+                    if sidx is None or not isinstance(shape, list) or not shape:
+                        continue
+                    try:
+                        sizes_by_idx[int(sidx)] = int(shape[0])
+                    except Exception:
+                        continue
+
+                out = []
+                for p in shard_paths:
+                    out.append(int(sizes_by_idx.get(_idx(p), 0)))
+                if all(int(x) > 0 for x in out):
+                    return out
+            except Exception:
+                pass
+
+        # Slow fallback: load each shard to read logits shape.
+        out = []
+        for p in shard_paths:
+            payload = torch.load(p, map_location="cpu")
+            logits = payload.get("logits")
+            if logits is None:
+                out.append(0)
+            else:
+                out.append(int(logits.size(0)))
+        return out
+
+    def _load_logits_cache(self, directory: str):
+        """Load teacher logits cache.
+
+        Modes:
+        - eager: concatenates all shards into one tensor (legacy behavior, high RAM)
+        - lazy: keeps shards on disk and loads one shard at a time (low RAM)
+        - auto: chooses based on estimated cache size
+        """
+
+        from pathlib import Path
+
+        mode = str(os.environ.get("SLM_LOGITS_CACHE_LOAD_MODE", "auto")).strip().lower()
+        eager_max_mb = float(os.environ.get("SLM_LOGITS_CACHE_EAGER_MAX_MB", "2048"))
 
         shard_paths = sorted(Path(directory).glob("teacher_logits_shard_*.pt"))
         if not shard_paths:
             raise ValueError(f"Nenhum shard em {directory}")
-        tensors = []
-        for shard in shard_paths:
-            payload = torch.load(shard, map_location="cpu")
-            tensors.append(payload["logits"].to(torch.float32))
-        return torch.cat(tensors, dim=0)
+
+        est_mb = self._estimate_logits_cache_size_mb(directory)
+        if mode not in {"auto", "eager", "lazy"}:
+            print(f"[WARN] SLM_LOGITS_CACHE_LOAD_MODE inválido: '{mode}'. Usando 'auto'.")
+            mode = "auto"
+
+        chosen = mode
+        if mode == "auto":
+            # If stats are missing, be conservative and stay eager for small shard counts.
+            if est_mb > 0.0 and est_mb > eager_max_mb:
+                chosen = "lazy"
+            elif est_mb == 0.0 and len(shard_paths) > 16:
+                chosen = "lazy"
+            else:
+                chosen = "eager"
+
+        if chosen == "eager":
+            tensors = []
+            for shard in shard_paths:
+                payload = torch.load(shard, map_location="cpu")
+                tensors.append(payload["logits"].to(torch.float32))
+            return torch.cat(tensors, dim=0)
+
+        shard_sizes = self._read_shard_sizes(directory, shard_paths)
+        total = sum(int(x) for x in shard_sizes)
+        if total <= 0:
+            raise ValueError(f"Não foi possível inferir tamanhos dos shards em {directory}")
+        if est_mb > 0.0:
+            print(f" (info) logits_cache load=lazy est_size_mb={est_mb:.1f} shards={len(shard_paths)}")
+        else:
+            print(f" (info) logits_cache load=lazy shards={len(shard_paths)}")
+        return ReasoningAwareDistiller._LazyTeacherLogitsCache(shard_paths, shard_sizes)
 
     def _align_teacher_logits(self, teacher_logits: torch.Tensor, student_vocab: int) -> torch.Tensor:
         t_vocab = teacher_logits.size(-1)
@@ -671,6 +856,12 @@ class ReasoningAwareDistiller:
         max_logit_abs = _env_float("SLM_TRAIN_MAX_LOGIT_ABS", 100.0)
         apply_logit_sanitize = _env_flag("SLM_TRAIN_SANITIZE_LOGITS", "1")
 
+        # Reasoning mask QA controls (backward-compatible by default).
+        mask_fallback_to_completion = _env_flag("SLM_REASONING_MASK_FALLBACK_TO_COMPLETION", "1")
+        mask_strict = _env_flag("SLM_REASONING_MASK_STRICT", "0")
+        mask_max_fallback = _env_float("SLM_REASONING_MASK_MAX_FALLBACK", 0.30)
+        mask_min_reasoning_frac = _env_float("SLM_REASONING_MASK_MIN_REASONING_FRAC", 0.02)
+
         def _sanitize_logits(x: torch.Tensor) -> torch.Tensor:
             if not apply_logit_sanitize:
                 return x
@@ -695,9 +886,48 @@ class ReasoningAwareDistiller:
         teacher_logits_cache = self._load_logits_cache(self.logits_cache_dir) if logits_ready else None
         cot_records = self._load_cot_cache(self.cot_cache_path) if cot_ready else None
 
+        # CoT/logits cache QA: if examples built from CoT don't align with cached logits,
+        # logits-KD becomes scientifically invalid (silent misalignment). Default is to
+        # warn and disable cache; strict mode aborts.
+        cot_strict = _env_flag("SLM_COT_CACHE_STRICT", "0")
+        require_exact_logits_match = _env_flag("SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH", "0")
+
         # Build prompt + target sequences
         examples: List[Dict[str, str]] = []
         if cot_records is not None:
+            # Basic cache integrity audit (does NOT filter records; filtering would desync logits cache).
+            missing_prompt = 0
+            missing_reasoning = 0
+            missing_answer = 0
+            bad_json = 0
+            for rec in cot_records:
+                if not isinstance(rec, dict):
+                    bad_json += 1
+                    continue
+                p = rec.get("prompt")
+                r = rec.get("teacher_reasoning")
+                a = rec.get("teacher_answer")
+                if not (isinstance(p, str) and p.strip()) and not isinstance(rec.get("prompt_levels"), dict):
+                    missing_prompt += 1
+                if not (isinstance(r, str) and r.strip()) and not isinstance(rec.get("teacher_reasoning_levels"), dict):
+                    missing_reasoning += 1
+                if not (isinstance(a, str) and a.strip()) and not isinstance(rec.get("teacher_answer_levels"), dict):
+                    missing_answer += 1
+
+            if bad_json:
+                msg = f"CoT cache contém entradas não-dict: {bad_json}/{len(cot_records)}"
+                if bool(cot_strict):
+                    raise ValueError(msg)
+                print(f"[WARN] {msg}")
+            if missing_prompt or missing_reasoning or missing_answer:
+                msg = (
+                    "CoT cache parece incompleto (pode causar skips e desalinhamento de logits). "
+                    f"missing_prompt={missing_prompt}, missing_reasoning={missing_reasoning}, missing_answer={missing_answer}, total={len(cot_records)}"
+                )
+                if bool(cot_strict):
+                    raise ValueError(msg)
+                print(f"[WARN] {msg}")
+
             for rec in cot_records:
                 prompt_levels = rec.get("prompt_levels")
                 reasoning_levels = rec.get("teacher_reasoning_levels")
@@ -778,6 +1008,7 @@ class ReasoningAwareDistiller:
         mask_audit = {
             "n_examples": int(len(full_sequences)),
             "n_fallback": 0,
+            "n_mask_empty": 0,
             "n_reasoning_marker_found": 0,
             "n_final_marker_found": 0,
             "reasoning_tokens_sum": 0,
@@ -800,9 +1031,12 @@ class ReasoningAwareDistiller:
                 m = "### REASONING:"
                 start = _safe_find(seq, m)
                 if start < 0:
-                    reasoning_mask[i] = fallback_mask
-                    mask_audit["n_fallback"] += 1
-                    mask_audit["reasoning_tokens_sum"] += int(fallback_mask.sum().item())
+                    if mask_fallback_to_completion:
+                        reasoning_mask[i] = fallback_mask
+                        mask_audit["n_fallback"] += 1
+                        mask_audit["reasoning_tokens_sum"] += int(fallback_mask.sum().item())
+                    else:
+                        mask_audit["n_mask_empty"] += 1
                     continue
 
                 mask_audit["n_reasoning_marker_found"] += 1
@@ -814,7 +1048,15 @@ class ReasoningAwareDistiller:
                 positions_i = torch.arange(labels.size(1))
                 mask_i = (positions_i >= start_len) & (labels[i] != -100)
                 reasoning_mask[i][mask_i] = 1
-                mask_audit["reasoning_tokens_sum"] += int(reasoning_mask[i].sum().item())
+                rs = int(reasoning_mask[i].sum().item())
+                if rs <= 0:
+                    # Likely truncation: marker exists in raw text, but its token-space span fell outside max_length.
+                    mask_audit["n_mask_empty"] += 1
+                    if mask_fallback_to_completion:
+                        reasoning_mask[i] = fallback_mask
+                        mask_audit["n_fallback"] += 1
+                        rs = int(fallback_mask.sum().item())
+                mask_audit["reasoning_tokens_sum"] += int(rs)
                 continue
 
             # Non-post: prompt + "### REASONING:\n" + reasoning + "\n### FINAL_ANSWER: " + answer
@@ -823,9 +1065,12 @@ class ReasoningAwareDistiller:
             start = _safe_find(seq, m_start)
             end = _safe_find(seq, m_end)
             if start < 0:
-                reasoning_mask[i] = fallback_mask
-                mask_audit["n_fallback"] += 1
-                mask_audit["reasoning_tokens_sum"] += int(fallback_mask.sum().item())
+                if mask_fallback_to_completion:
+                    reasoning_mask[i] = fallback_mask
+                    mask_audit["n_fallback"] += 1
+                    mask_audit["reasoning_tokens_sum"] += int(fallback_mask.sum().item())
+                else:
+                    mask_audit["n_mask_empty"] += 1
                 continue
 
             mask_audit["n_reasoning_marker_found"] += 1
@@ -845,10 +1090,17 @@ class ReasoningAwareDistiller:
             positions_i = torch.arange(labels.size(1))
             mask_i = (positions_i >= start_len) & (positions_i < end_len) & (labels[i] != -100)
             reasoning_mask[i][mask_i] = 1
-            mask_audit["reasoning_tokens_sum"] += int(reasoning_mask[i].sum().item())
+            rs = int(reasoning_mask[i].sum().item())
+            if rs <= 0:
+                mask_audit["n_mask_empty"] += 1
+                if mask_fallback_to_completion:
+                    reasoning_mask[i] = fallback_mask
+                    mask_audit["n_fallback"] += 1
+                    rs = int(fallback_mask.sum().item())
+            mask_audit["reasoning_tokens_sum"] += int(rs)
 
         class COTDataset(TorchDataset):
-            def __init__(self, inputs, labels, reasoning_mask, teacher_logits: Optional[torch.Tensor]):
+            def __init__(self, inputs, labels, reasoning_mask, teacher_logits):
                 self.inputs = inputs
                 self.labels = labels
                 self.reasoning_mask = reasoning_mask
@@ -869,7 +1121,66 @@ class ReasoningAwareDistiller:
                 return item
 
         if teacher_logits_cache is not None:
-            teacher_logits_cache = teacher_logits_cache[: len(examples)]
+            try:
+                cached_n = int(len(teacher_logits_cache))
+            except Exception:
+                try:
+                    cached_n = int(teacher_logits_cache.size(0))
+                except Exception:
+                    cached_n = -1
+
+            built_n = int(len(examples))
+            if cached_n >= 0 and cached_n != built_n:
+                msg = (
+                    "Logits cache não alinha com exemplos construídos do CoT. "
+                    f"cached_n={cached_n} built_n={built_n}. "
+                    "Isso invalidaria logits-KD (teacher logits em exemplos errados)."
+                )
+                if bool(require_exact_logits_match):
+                    raise ValueError(msg + " Defina SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH=0 para desabilitar o cache automaticamente.")
+                print(f"[WARN] {msg} Desabilitando logits_cache e usando teacher_model on-the-fly.")
+                teacher_logits_cache = None
+
+        # Use shard-aware deterministic shuffling when we have a lazy cache.
+        sampler = None
+        is_lazy_cache = False
+        try:
+            is_lazy_cache = isinstance(teacher_logits_cache, ReasoningAwareDistiller._LazyTeacherLogitsCache)
+        except Exception:
+            is_lazy_cache = False
+
+        if bool(is_lazy_cache):
+            allow_shuffle = _env_flag("SLM_LOGITS_CACHE_ALLOW_SHUFFLE", "0")
+            if not allow_shuffle:
+                # Deterministic shard-wise shuffle: shuffle shards and indices within shards
+                # to keep IO bounded (avoid random shard thrashing).
+                class _ShardShuffleSampler(torch.utils.data.Sampler):
+                    def __init__(self, lazy_cache, *, base_seed: int):
+                        self.lazy_cache = lazy_cache
+                        self.base_seed = int(base_seed)
+                        self.epoch = 0
+
+                    def set_epoch(self, epoch: int) -> None:
+                        self.epoch = int(epoch)
+
+                    def __iter__(self):
+                        import random
+
+                        rng = random.Random(int(self.base_seed) + int(self.epoch))
+                        shards = [(s, a, b) for (s, a, b) in self.lazy_cache.shard_ranges()]
+                        rng.shuffle(shards)
+                        for (_sid, start, end) in shards:
+                            idxs = list(range(int(start), int(end)))
+                            rng.shuffle(idxs)
+                            for i in idxs:
+                                yield int(i)
+
+                    def __len__(self):
+                        return int(len(self.lazy_cache))
+
+                sampler = _ShardShuffleSampler(teacher_logits_cache, base_seed=int(seed))
+            else:
+                print("[WARN] SLM_LOGITS_CACHE_ALLOW_SHUFFLE=1 com cache lazy pode causar IO alto.")
 
         dataset = COTDataset(tok_full, labels, reasoning_mask, teacher_logits_cache)
 
@@ -920,7 +1231,14 @@ class ReasoningAwareDistiller:
         batch_size = int(self.config.kd_params.get("batch_size", 2))
         grad_accum_steps = int(self.config.kd_params.get("grad_accum_steps", 1))
         num_workers = int(self.config.kd_params.get("dataloader_num_workers", 0))
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=num_workers)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            pin_memory=True,
+            num_workers=num_workers,
+        )
 
         num_epochs = self.config.kd_params["epochs"]
         num_training_steps = num_epochs * len(dataloader)
@@ -950,12 +1268,52 @@ class ReasoningAwareDistiller:
         # For non-post mode, this checks whether FINAL marker was present; for post mode it may stay 0.
         mask_audit["final_marker_found_rate"] = _safe_div(mask_audit["n_final_marker_found"], mask_audit["n_examples"])
 
+        # Optional enforcement: avoid silently running a "reasoning" experiment with a broken mask.
+        if mask_audit["n_examples"] > 0:
+            fallback_rate = float(mask_audit.get("fallback_rate") or 0.0)
+            reasoning_frac = float(mask_audit.get("reasoning_token_fraction_mean") or 0.0)
+            if (fallback_rate > float(mask_max_fallback)) or (reasoning_frac < float(mask_min_reasoning_frac)):
+                msg = (
+                    "Reasoning mask quality appears low. "
+                    f"fallback_rate={fallback_rate:.3f} (max={float(mask_max_fallback):.3f}), "
+                    f"reasoning_frac={reasoning_frac:.3f} (min={float(mask_min_reasoning_frac):.3f}), "
+                    f"n_mask_empty={int(mask_audit.get('n_mask_empty') or 0)}. "
+                    "This can happen due to truncation (max_length) or format drift in cached CoT."
+                )
+                if bool(mask_strict):
+                    raise ValueError(
+                        msg
+                        + " Set SLM_REASONING_MASK_STRICT=0 to allow running, or adjust: "
+                        + "SLM_REASONING_MASK_MAX_FALLBACK / SLM_REASONING_MASK_MIN_REASONING_FRAC / max_length."
+                    )
+                print(f"[WARN] {msg}")
+
         metrics = {
             "losses": [],
             "kd_losses": [],
             "ce_losses": [],
             "use_teacher_logits": bool(use_teacher_logits),
             "reasoning_mask_audit": mask_audit,
+            "numeric_stability": {
+                "train_sanitize_logits": bool(apply_logit_sanitize),
+                "train_max_logit_abs": float(max_logit_abs),
+            },
+            "reasoning_mask_controls": {
+                "fallback_to_completion": bool(mask_fallback_to_completion),
+                "strict": bool(mask_strict),
+                "max_fallback": float(mask_max_fallback),
+                "min_reasoning_frac": float(mask_min_reasoning_frac),
+            },
+            "logits_cache_controls": {
+                "logits_ready": bool(logits_ready),
+                "cot_ready": bool(cot_ready),
+                "load_mode": str(os.environ.get("SLM_LOGITS_CACHE_LOAD_MODE", "auto")),
+                "eager_max_mb": float(os.environ.get("SLM_LOGITS_CACHE_EAGER_MAX_MB", "2048")),
+                "lazy": bool(is_lazy_cache),
+                "cot_cache_strict": bool(cot_strict),
+                "require_exact_logits_match": bool(require_exact_logits_match),
+                "allow_shuffle": bool(_env_flag("SLM_LOGITS_CACHE_ALLOW_SHUFFLE", "0")),
+            },
         }
 
         nonfinite_batches = 0
@@ -963,6 +1321,11 @@ class ReasoningAwareDistiller:
         nonfinite_student = 0
 
         for epoch in range(num_epochs):
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                try:
+                    sampler.set_epoch(int(epoch))
+                except Exception:
+                    pass
             temperature = get_schedule_value(temperature_schedule, epoch, default=1.0)
             alpha = get_schedule_value(alpha_schedule, epoch, default=0.5)
 

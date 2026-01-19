@@ -199,34 +199,6 @@ def cache_teacher_logits(
     ds_fp = _dataset_fingerprint(dataset, text_key=text_key)
     effective_max_len = int(max_length or get_safe_tokenizer_length(tokenizer, fallback=512, upper_bound=4096))
 
-    metadata = {
-        "kind": "teacher_logits",
-        "teacher": getattr(teacher_model, "name_or_path", None),
-        "tokenizer": getattr(tokenizer, "name_or_path", None),
-        "tokenizer_hash": _tokenizer_fingerprint(tokenizer),
-        "tokenizer_class": tokenizer.__class__.__name__,
-        "tokenizer_vocab_size": int(len(tokenizer.get_vocab())),
-        "max_length": effective_max_len,
-        "batch_size": batch_size,
-        "device": device,
-        "split": split,
-        "seed": seed,
-        "kd_mode": kd_mode,
-        "input_kind": input_kind,
-        "train_limit": train_limit,
-        "dataset_fingerprint": ds_fp,
-        "dataset_domains": _dataset_domains(dataset),
-        "generation": generation_cfg.to_jsonable(),
-    }
-
-    out_dir = resolve_versioned_cache_dir(cache_root, "teacher_logits", metadata)
-    if (out_dir / "metadata.json").exists() and list(out_dir.glob("teacher_logits_shard_*.pt")):
-        print(f" Reutilizando cache de logits: {out_dir}")
-        return out_dir
-
-    print(f" Gerando cache de logits: {out_dir}")
-    write_cache_metadata(out_dir, metadata)
-
     def _env_flag(name: str, default: str = "0") -> bool:
         v = os.environ.get(name, default)
         return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -254,6 +226,43 @@ def cache_teacher_logits(
     sanitize_logits = _env_flag("SLM_CACHE_SANITIZE_LOGITS", "1")
     clamp_for_fp16 = _env_flag("SLM_CACHE_CLAMP_FP16", "1")
     fp16_safe_abs = _env_float("SLM_CACHE_FP16_SAFE_ABS", 60000.0)
+
+    metadata = {
+        "kind": "teacher_logits",
+        "teacher": getattr(teacher_model, "name_or_path", None),
+        "tokenizer": getattr(tokenizer, "name_or_path", None),
+        "tokenizer_hash": _tokenizer_fingerprint(tokenizer),
+        "tokenizer_class": tokenizer.__class__.__name__,
+        "tokenizer_vocab_size": int(len(tokenizer.get_vocab())),
+        "max_length": effective_max_len,
+        "batch_size": batch_size,
+        "device": device,
+        "split": split,
+        "seed": seed,
+        "kd_mode": kd_mode,
+        "input_kind": input_kind,
+        "train_limit": train_limit,
+        "dataset_fingerprint": ds_fp,
+        "dataset_domains": _dataset_domains(dataset),
+        "generation": generation_cfg.to_jsonable(),
+        "logits_cache_policy": {
+            "debug": bool(cache_debug),
+            "log_every": int(cache_log_every),
+            "sanitize_logits": bool(sanitize_logits),
+            "clamp_for_fp16": bool(clamp_for_fp16),
+            "fp16_safe_abs": float(fp16_safe_abs),
+        },
+    }
+
+    out_dir = resolve_versioned_cache_dir(cache_root, "teacher_logits", metadata)
+    if (out_dir / "metadata.json").exists() and list(out_dir.glob("teacher_logits_shard_*.pt")):
+        print(f" Reutilizando cache de logits: {out_dir}")
+        return out_dir
+
+    print(f" Gerando cache de logits: {out_dir}")
+    write_cache_metadata(out_dir, metadata)
+
+    # env policy already resolved above (and included in cache fingerprint/metadata)
     shard_stats_path = out_dir / "shard_stats.jsonl"
 
     target_device = resolve_device(device)

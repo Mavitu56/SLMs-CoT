@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -18,6 +20,58 @@ from prompts import build_cascod_answer_prompt, build_cascod_rationale_prompt
 from eval import StandardizedEvaluator
 from report import ScientificLogger, write_plots, write_report_json, write_summary_txt
 from stats import StatisticalAnalyst
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    v = os.environ.get(name, default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _collect_environment_metadata() -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "executable": sys.executable,
+    }
+
+    # Optional libs (best-effort).
+    try:
+        import torch as _torch
+
+        meta["torch_version"] = getattr(_torch, "__version__", None)
+        meta["cuda_available"] = bool(_torch.cuda.is_available())
+        meta["cuda_version"] = getattr(_torch.version, "cuda", None)
+        try:
+            meta["cudnn_version"] = int(_torch.backends.cudnn.version() or 0)
+        except Exception:
+            meta["cudnn_version"] = None
+        if bool(_torch.cuda.is_available()):
+            try:
+                meta["gpu_name"] = str(_torch.cuda.get_device_name(0))
+            except Exception:
+                meta["gpu_name"] = None
+    except Exception:
+        pass
+
+    try:
+        import transformers as _transformers
+
+        meta["transformers_version"] = getattr(_transformers, "__version__", None)
+    except Exception:
+        pass
+    try:
+        import peft as _peft
+
+        meta["peft_version"] = getattr(_peft, "__version__", None)
+    except Exception:
+        pass
+    try:
+        import datasets as _datasets
+
+        meta["datasets_version"] = getattr(_datasets, "__version__", None)
+    except Exception:
+        pass
+    return meta
 
 
 def _train_sft_lora(
@@ -267,11 +321,50 @@ def _train_cascod_lora(
     grad_accum_steps = int(cfg.kd_params.get("grad_accum_steps", 1))
     num_workers = int(cfg.kd_params.get("dataloader_num_workers", 0))
 
-    dl_r = DataLoader(tok_r, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=num_workers)
-    dl_a = DataLoader(tok_a, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=num_workers)
+    # Critical scientific validity fix: rationale and answer batches must be aligned.
+    # Two independently shuffled DataLoaders zipped together will mix examples.
+    n_pairs = min(len(tok_r), len(tok_a))
+    if len(tok_r) != len(tok_a):
+        print(f"[WARN] CasCoD: tamanhos diferentes ds_rationale={len(tok_r)} ds_answer={len(tok_a)}; usando n_pairs={n_pairs}.")
+
+    class _PairedCasCoDDataset(torch.utils.data.Dataset):
+        def __init__(self, ds_r, ds_a, n: int):
+            self.ds_r = ds_r
+            self.ds_a = ds_a
+            self.n = int(n)
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, idx: int):
+            r = self.ds_r[int(idx)]
+            a = self.ds_a[int(idx)]
+            return {
+                "r_input_ids": r["input_ids"],
+                "r_attention_mask": r.get("attention_mask"),
+                "r_labels": r["labels"],
+                "a_input_ids": a["input_ids"],
+                "a_attention_mask": a.get("attention_mask"),
+                "a_labels": a["labels"],
+            }
+
+    paired = _PairedCasCoDDataset(tok_r, tok_a, n_pairs)
+    generator = torch.Generator()
+    try:
+        generator.manual_seed(int(seed))
+    except Exception:
+        pass
+    dataloader = DataLoader(
+        paired,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=num_workers,
+        generator=generator,
+    )
 
     num_epochs = int(cfg.kd_params.get("epochs", 1))
-    num_training_steps = max(1, num_epochs * min(len(dl_r), len(dl_a)))
+    num_training_steps = max(1, num_epochs * len(dataloader))
     warmup_steps = max(0, int(0.1 * num_training_steps))
 
     lr = float(cfg.kd_params.get("learning_rates", {}).get("kd", 5e-5))
@@ -321,16 +414,15 @@ def _train_cascod_lora(
     model.zero_grad(set_to_none=True)
     step = 0
     for epoch in range(num_epochs):
-        pbar = tqdm(zip(dl_r, dl_a), desc=f"CasCoD Epoch {epoch}", total=min(len(dl_r), len(dl_a)))
-        for batch_r, batch_a in pbar:
+        pbar = tqdm(dataloader, desc=f"CasCoD Epoch {epoch}", total=len(dataloader))
+        for batch in pbar:
             step += 1
 
-            def _forward_loss(batch):
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch.get("attention_mask")
+            def _forward_loss(*, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor], labels: torch.Tensor):
+                input_ids = input_ids.to(device)
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device)
-                labels = batch["labels"].to(device)
+                labels = labels.to(device)
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = out.loss
                 if loss is None:
@@ -343,8 +435,16 @@ def _train_cascod_lora(
                 return loss
 
             with autocast_ctx(device):
-                loss_r = _forward_loss(batch_r)
-                loss_a = _forward_loss(batch_a)
+                loss_r = _forward_loss(
+                    input_ids=batch["r_input_ids"],
+                    attention_mask=batch.get("r_attention_mask"),
+                    labels=batch["r_labels"],
+                )
+                loss_a = _forward_loss(
+                    input_ids=batch["a_input_ids"],
+                    attention_mask=batch.get("a_attention_mask"),
+                    labels=batch["a_labels"],
+                )
                 loss = (1.0 - alpha) * loss_r + alpha * loss_a
                 loss_to_backprop = loss / float(max(1, grad_accum_steps))
 
@@ -1288,6 +1388,19 @@ def run_experiment(
     analyst = StatisticalAnalyst(alpha=cfg.alpha_level)
     evaluator = StandardizedEvaluator(cfg)
 
+    # Reproducibility controls (optional).
+    deterministic = _env_flag("SLM_DETERMINISTIC", "0")
+    if bool(deterministic):
+        try:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        except Exception:
+            pass
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+
     combo_d_enabled = "combo_d" in set(kd_modes or [])
 
     def _cot_variant_key(
@@ -1338,6 +1451,7 @@ def run_experiment(
         "post_cot_ig_top_frac": float(post_cot_ig_top_frac or 0.0),
         "cascod_filter_by_gold": bool(cascod_filter_by_gold),
         "combo_d_enabled": bool(combo_d_enabled),
+        "deterministic": bool(deterministic),
     }
 
     exp_id = _experiment_id(cfg, kd_modes, flags)
@@ -1347,6 +1461,7 @@ def run_experiment(
 
     logger.log_phase("EXPERIMENT", {"id": exp_id, "dir": str(exp_dir), "flags": flags})
     logger.log_hyperparameters(cfg.to_metadata())
+    logger.log_phase("ENVIRONMENT", _collect_environment_metadata())
 
     conditions: Dict[str, Dict[str, Any]] = {}
     if "traditional" in kd_modes:
@@ -1368,7 +1483,30 @@ def run_experiment(
         raise ValueError("Nenhum modo de KD selecionado.")
 
     # Prepare datasets once per seed (training)
-    results: Dict[str, Any] = {"metadata": cfg.to_metadata(), "conditions": {}}
+    results: Dict[str, Any] = {"metadata": cfg.to_metadata(), "conditions": {}, "eval_protocols": {}}
+    eval_protocol_strict = str(os.environ.get("SLM_EVAL_PROTOCOL_STRICT", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
+    results["metadata"].setdefault("environment", _collect_environment_metadata())
+    results["metadata"].setdefault("reproducibility", {})
+    results["metadata"]["reproducibility"].update(
+        {
+            "deterministic": bool(deterministic),
+        }
+    )
+    results["metadata"].setdefault("controls", {})
+    results["metadata"]["controls"].update(
+        {
+            "eval_protocol_strict": bool(eval_protocol_strict),
+            "logits_cache_load_mode": str(os.environ.get("SLM_LOGITS_CACHE_LOAD_MODE", "auto")),
+            "logits_cache_eager_max_mb": float(os.environ.get("SLM_LOGITS_CACHE_EAGER_MAX_MB", "2048")),
+            "reasoning_mask_strict": _env_flag("SLM_REASONING_MASK_STRICT", "0"),
+            "reasoning_mask_fallback_to_completion": _env_flag("SLM_REASONING_MASK_FALLBACK_TO_COMPLETION", "1"),
+            "train_sanitize_logits": _env_flag("SLM_TRAIN_SANITIZE_LOGITS", "1"),
+            "train_max_logit_abs": float(os.environ.get("SLM_TRAIN_MAX_LOGIT_ABS", "100.0")),
+            "cache_sanitize_logits": str(os.environ.get("SLM_CACHE_SANITIZE_LOGITS", "1")),
+            "cache_clamp_fp16": str(os.environ.get("SLM_CACHE_CLAMP_FP16", "1")),
+            "cache_fp16_safe_abs": float(os.environ.get("SLM_CACHE_FP16_SAFE_ABS", "60000.0")),
+        }
+    )
 
     # Optional cache preparation
     if prepare_caches:
@@ -1540,6 +1678,24 @@ def run_experiment(
 
     for cond_name, cond_cfg in conditions.items():
         cond_runs = []
+
+        # Record evaluation protocol per condition (independent of seed) so that
+        # downstream comparisons don't silently mix protocols.
+        cond_post_cot_preview = bool(post_cot) or bool(cond_cfg.get("force_post_cot", False))
+        protocol_preview = {
+            "use_cot_prompt": (False if bool(cond_post_cot_preview) else bool(use_cot_prompt_eval)),
+            "answer_first_eval": bool(cond_post_cot_preview),
+            "cascod_two_stage": bool(cond_cfg["mode"] == "cascod"),
+        }
+        prev = results.get("eval_protocols", {}).get(cond_name)
+        if prev is None:
+            results["eval_protocols"][cond_name] = dict(protocol_preview)
+        elif prev != protocol_preview:
+            raise ValueError(
+                "Inconsistência interna: protocolo de avaliação variou dentro da mesma condição. "
+                f"cond={cond_name} prev={prev} now={protocol_preview}"
+            )
+
         for seed in cfg.seeds:
             run_key = f"{cond_name}_seed{seed}"
             if state.get("completed", {}).get(run_key):
@@ -1822,6 +1978,11 @@ def run_experiment(
             print(f" Modelo salvo em: {save_dir}")
 
             # Eval
+            eval_protocol = {
+                "use_cot_prompt": (False if bool(cond_post_cot) else bool(use_cot_prompt_eval)),
+                "answer_first_eval": bool(cond_post_cot),
+                "cascod_two_stage": bool(cond_cfg["mode"] == "cascod"),
+            }
             eval_results = evaluator.evaluate(
                 trained_model,
                 student_tok,
@@ -1830,9 +1991,9 @@ def run_experiment(
                 eval_bbh=eval_bbh,
                 eval_obqa=bool(eval_obqa),
                 eval_efficiency=eval_efficiency,
-                use_cot_prompt=(False if bool(cond_post_cot) else use_cot_prompt_eval),
-                answer_first_eval=bool(cond_post_cot),
-                cascod_two_stage=(True if cond_cfg["mode"] == "cascod" else False),
+                use_cot_prompt=bool(eval_protocol["use_cot_prompt"]),
+                answer_first_eval=bool(eval_protocol["answer_first_eval"]),
+                cascod_two_stage=bool(eval_protocol["cascod_two_stage"]),
                 generation_cfg=cfg.eval_generation,
             )
 
@@ -1841,6 +2002,7 @@ def run_experiment(
                 "condition": cond_name,
                 "description": cond_cfg["description"],
                 "training": train_metrics,
+                "evaluation_protocol": dict(eval_protocol),
                 "evaluation": eval_results,
             }
 
@@ -1865,41 +2027,70 @@ def run_experiment(
 
         results["conditions"][cond_name] = {"description": cond_cfg["description"], "runs": cond_runs}
 
+    # Global protocol comparability check (warn by default; strict can abort).
+    try:
+        proto_items = list((results.get("eval_protocols") or {}).items())
+        uniq = {}
+        for k, v in proto_items:
+            sig = json.dumps(v, sort_keys=True, default=str)
+            uniq.setdefault(sig, []).append(k)
+        if len(uniq) > 1:
+            msg = "Múltiplos protocolos de avaliação detectados entre condições: " + "; ".join(
+                [f"conds={names} proto={json.loads(sig)}" for sig, names in uniq.items()]
+            )
+            results.setdefault("warnings", []).append(msg)
+            if bool(eval_protocol_strict):
+                raise ValueError(msg)
+            print(f"[WARN] {msg}")
+    except Exception:
+        pass
+
     # Hypothesis testing: compare metric across runs (paired by seed)
     if "kd_traditional" in results["conditions"] and "kd_with_reasoning" in results["conditions"]:
-        trad = results["conditions"]["kd_traditional"]["runs"]
-        reas = results["conditions"]["kd_with_reasoning"]["runs"]
-
-        def _by_seed(runs: List[Dict[str, Any]]):
-            m = {}
-            for r in runs:
-                ev = r.get("evaluation", {})
-                m[int(r.get("seed"))] = float(ev.get(hypothesis_metric, ev.get("primary_score", ev.get("overall_score", 0.0))))
-            return m
-
-        a = _by_seed(trad)
-        b = _by_seed(reas)
-        common = sorted(set(a.keys()) & set(b.keys()))
-        metrics_a = [a[s] for s in common]
-        metrics_b = [b[s] for s in common]
-
-        if len(common) < 2 and not allow_insufficient_runs:
-            raise ValueError(
-                "Validade estatística insuficiente: n_runs < 2. "
-                "Adicione mais seeds (ex.: --seed 42 --seed 43) ou passe --allow_insufficient_runs para apenas registrar resultados sem inferência."  # noqa: E501
+        p_a = (results.get("eval_protocols") or {}).get("kd_traditional")
+        p_b = (results.get("eval_protocols") or {}).get("kd_with_reasoning")
+        if p_a != p_b:
+            msg = (
+                "Protocolos de avaliação diferem entre condições; comparação estatística pode ser inválida. "
+                f"kd_traditional={p_a}, kd_with_reasoning={p_b}."
             )
+            if bool(eval_protocol_strict):
+                raise ValueError(msg + " Defina SLM_EVAL_PROTOCOL_STRICT=0 para apenas avisar.")
+            print(f"[WARN] {msg} Pulando hypothesis_testing.")
+        else:
+            trad = results["conditions"]["kd_traditional"]["runs"]
+            reas = results["conditions"]["kd_with_reasoning"]["runs"]
 
-        ht = analyst.paired_bootstrap_over_runs(metrics_a, metrics_b, n_bootstrap=cfg.bootstrap_samples, rng_seed=42)
-        results["hypothesis_testing"] = {
-            "h1": {
-                "statement": cfg.scientific_hypotheses.get("main"),
-                "metric": hypothesis_metric,
-                "n_runs": len(common),
-                "traditional_mean": float(sum(metrics_a) / len(metrics_a)) if metrics_a else None,
-                "reasoning_mean": float(sum(metrics_b) / len(metrics_b)) if metrics_b else None,
-                "test": ht,
+            def _by_seed(runs: List[Dict[str, Any]]):
+                m = {}
+                for r in runs:
+                    ev = r.get("evaluation", {})
+                    m[int(r.get("seed"))] = float(ev.get(hypothesis_metric, ev.get("primary_score", ev.get("overall_score", 0.0))))
+                return m
+
+            a = _by_seed(trad)
+            b = _by_seed(reas)
+            common = sorted(set(a.keys()) & set(b.keys()))
+            metrics_a = [a[s] for s in common]
+            metrics_b = [b[s] for s in common]
+
+            if len(common) < 2 and not allow_insufficient_runs:
+                raise ValueError(
+                    "Validade estatística insuficiente: n_runs < 2. "
+                    "Adicione mais seeds (ex.: --seed 42 --seed 43) ou passe --allow_insufficient_runs para apenas registrar resultados sem inferência."  # noqa: E501
+                )
+
+            ht = analyst.paired_bootstrap_over_runs(metrics_a, metrics_b, n_bootstrap=cfg.bootstrap_samples, rng_seed=42)
+            results["hypothesis_testing"] = {
+                "h1": {
+                    "statement": cfg.scientific_hypotheses.get("main"),
+                    "metric": hypothesis_metric,
+                    "n_runs": len(common),
+                    "traditional_mean": float(sum(metrics_a) / len(metrics_a)) if metrics_a else None,
+                    "reasoning_mean": float(sum(metrics_b) / len(metrics_b)) if metrics_b else None,
+                    "test": ht,
+                }
             }
-        }
 
     # Reports
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1994,6 +2185,104 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--allow_insufficient_runs",
         action="store_true",
         help="Allow n_runs<2 (no valid hypothesis test); still writes reports.",
+    )
+
+    # Scientific QA / reproducibility controls (map to env vars consumed across the repo).
+    p.add_argument("--deterministic", action="store_true", help="Enable deterministic mode (sets SLM_DETERMINISTIC=1)")
+    p.add_argument("--no_deterministic", action="store_true", help="Disable deterministic mode (sets SLM_DETERMINISTIC=0)")
+
+    p.add_argument(
+        "--eval_protocol_strict",
+        action="store_true",
+        help="Abort when comparing conditions with different eval protocols (sets SLM_EVAL_PROTOCOL_STRICT=1)",
+    )
+    p.add_argument(
+        "--no_eval_protocol_strict",
+        action="store_true",
+        help="Warn-only on eval protocol mismatch (sets SLM_EVAL_PROTOCOL_STRICT=0)",
+    )
+
+    # Reasoning mask quality gating (ReasoningAwareDistiller).
+    p.add_argument("--reasoning_mask_strict", action="store_true", help="Abort on low-quality reasoning mask (SLM_REASONING_MASK_STRICT=1)")
+    p.add_argument("--no_reasoning_mask_strict", action="store_true", help="Warn-only on low-quality reasoning mask (SLM_REASONING_MASK_STRICT=0)")
+    p.add_argument(
+        "--reasoning_mask_fallback_to_completion",
+        action="store_true",
+        help="If markers are missing/empty mask, fallback KD mask to completion (SLM_REASONING_MASK_FALLBACK_TO_COMPLETION=1)",
+    )
+    p.add_argument(
+        "--no_reasoning_mask_fallback_to_completion",
+        action="store_true",
+        help="Disable fallback-to-completion for KD mask (SLM_REASONING_MASK_FALLBACK_TO_COMPLETION=0)",
+    )
+    p.add_argument(
+        "--reasoning_mask_max_fallback",
+        type=float,
+        default=None,
+        help="Max allowed fallback_rate before warning/abort (SLM_REASONING_MASK_MAX_FALLBACK)",
+    )
+    p.add_argument(
+        "--reasoning_mask_min_reasoning_frac",
+        type=float,
+        default=None,
+        help="Min allowed reasoning_token_fraction_mean before warning/abort (SLM_REASONING_MASK_MIN_REASONING_FRAC)",
+    )
+
+    # Logits cache loading (avoid OOM by streaming shards).
+    p.add_argument(
+        "--logits_cache_load_mode",
+        choices=["auto", "eager", "lazy"],
+        default=None,
+        help="How to load logits cache: auto/eager/lazy (SLM_LOGITS_CACHE_LOAD_MODE)",
+    )
+    p.add_argument(
+        "--logits_cache_eager_max_mb",
+        type=float,
+        default=None,
+        help="When load_mode=auto, max estimated MB for eager concatenation (SLM_LOGITS_CACHE_EAGER_MAX_MB)",
+    )
+    p.add_argument(
+        "--logits_cache_require_exact_match",
+        action="store_true",
+        help="Abort if logits cache length != built examples (SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH=1)",
+    )
+    p.add_argument(
+        "--no_logits_cache_require_exact_match",
+        action="store_true",
+        help="Warn and auto-disable cache on mismatch (SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH=0)",
+    )
+    p.add_argument("--cot_cache_strict", action="store_true", help="Abort on CoT cache integrity warnings (SLM_COT_CACHE_STRICT=1)")
+    p.add_argument("--no_cot_cache_strict", action="store_true", help="Warn-only on CoT cache issues (SLM_COT_CACHE_STRICT=0)")
+    p.add_argument(
+        "--logits_cache_allow_shuffle",
+        action="store_true",
+        help="Allow full random shuffle with lazy logits cache (may increase IO) (SLM_LOGITS_CACHE_ALLOW_SHUFFLE=1)",
+    )
+    p.add_argument(
+        "--no_logits_cache_allow_shuffle",
+        action="store_true",
+        help="Use shard-aware shuffle for lazy cache (default) (SLM_LOGITS_CACHE_ALLOW_SHUFFLE=0)",
+    )
+
+    # Numeric stability policy (sanitization/clamp).
+    p.add_argument("--train_sanitize_logits", action="store_true", help="Enable training logit sanitization (SLM_TRAIN_SANITIZE_LOGITS=1)")
+    p.add_argument("--no_train_sanitize_logits", action="store_true", help="Disable training logit sanitization (SLM_TRAIN_SANITIZE_LOGITS=0)")
+    p.add_argument(
+        "--train_max_logit_abs",
+        type=float,
+        default=None,
+        help="Clamp abs(logit) during training sanitization (SLM_TRAIN_MAX_LOGIT_ABS)",
+    )
+
+    p.add_argument("--cache_sanitize_logits", action="store_true", help="Enable cache sanitization before fp16 cast (SLM_CACHE_SANITIZE_LOGITS=1)")
+    p.add_argument("--no_cache_sanitize_logits", action="store_true", help="Disable cache sanitization (SLM_CACHE_SANITIZE_LOGITS=0)")
+    p.add_argument("--cache_clamp_fp16", action="store_true", help="Clamp logits to fp16-safe range when caching (SLM_CACHE_CLAMP_FP16=1)")
+    p.add_argument("--no_cache_clamp_fp16", action="store_true", help="Disable fp16 clamp when caching (SLM_CACHE_CLAMP_FP16=0)")
+    p.add_argument(
+        "--cache_fp16_safe_abs",
+        type=float,
+        default=None,
+        help="Max abs(logit) allowed in fp16 cache (SLM_CACHE_FP16_SAFE_ABS)",
     )
 
     p.add_argument(
@@ -2150,6 +2439,64 @@ def main(argv: Optional[Sequence[str]] = None):
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args = build_arg_parser().parse_args(argv)
     cfg = EvidenceBasedConfig(drive_root=Path(args.drive_root)) if args.drive_root else EvidenceBasedConfig()
+
+    # Map CLI flags -> env vars used across modules.
+    if bool(getattr(args, "deterministic", False)):
+        os.environ["SLM_DETERMINISTIC"] = "1"
+    if bool(getattr(args, "no_deterministic", False)):
+        os.environ["SLM_DETERMINISTIC"] = "0"
+    if bool(getattr(args, "eval_protocol_strict", False)):
+        os.environ["SLM_EVAL_PROTOCOL_STRICT"] = "1"
+    if bool(getattr(args, "no_eval_protocol_strict", False)):
+        os.environ["SLM_EVAL_PROTOCOL_STRICT"] = "0"
+
+    if bool(getattr(args, "reasoning_mask_strict", False)):
+        os.environ["SLM_REASONING_MASK_STRICT"] = "1"
+    if bool(getattr(args, "no_reasoning_mask_strict", False)):
+        os.environ["SLM_REASONING_MASK_STRICT"] = "0"
+    if bool(getattr(args, "reasoning_mask_fallback_to_completion", False)):
+        os.environ["SLM_REASONING_MASK_FALLBACK_TO_COMPLETION"] = "1"
+    if bool(getattr(args, "no_reasoning_mask_fallback_to_completion", False)):
+        os.environ["SLM_REASONING_MASK_FALLBACK_TO_COMPLETION"] = "0"
+    if getattr(args, "reasoning_mask_max_fallback", None) is not None:
+        os.environ["SLM_REASONING_MASK_MAX_FALLBACK"] = str(float(args.reasoning_mask_max_fallback))
+    if getattr(args, "reasoning_mask_min_reasoning_frac", None) is not None:
+        os.environ["SLM_REASONING_MASK_MIN_REASONING_FRAC"] = str(float(args.reasoning_mask_min_reasoning_frac))
+
+    if getattr(args, "logits_cache_load_mode", None):
+        os.environ["SLM_LOGITS_CACHE_LOAD_MODE"] = str(args.logits_cache_load_mode)
+    if getattr(args, "logits_cache_eager_max_mb", None) is not None:
+        os.environ["SLM_LOGITS_CACHE_EAGER_MAX_MB"] = str(float(args.logits_cache_eager_max_mb))
+    if bool(getattr(args, "logits_cache_require_exact_match", False)):
+        os.environ["SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH"] = "1"
+    if bool(getattr(args, "no_logits_cache_require_exact_match", False)):
+        os.environ["SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH"] = "0"
+    if bool(getattr(args, "cot_cache_strict", False)):
+        os.environ["SLM_COT_CACHE_STRICT"] = "1"
+    if bool(getattr(args, "no_cot_cache_strict", False)):
+        os.environ["SLM_COT_CACHE_STRICT"] = "0"
+    if bool(getattr(args, "logits_cache_allow_shuffle", False)):
+        os.environ["SLM_LOGITS_CACHE_ALLOW_SHUFFLE"] = "1"
+    if bool(getattr(args, "no_logits_cache_allow_shuffle", False)):
+        os.environ["SLM_LOGITS_CACHE_ALLOW_SHUFFLE"] = "0"
+
+    if bool(getattr(args, "train_sanitize_logits", False)):
+        os.environ["SLM_TRAIN_SANITIZE_LOGITS"] = "1"
+    if bool(getattr(args, "no_train_sanitize_logits", False)):
+        os.environ["SLM_TRAIN_SANITIZE_LOGITS"] = "0"
+    if getattr(args, "train_max_logit_abs", None) is not None:
+        os.environ["SLM_TRAIN_MAX_LOGIT_ABS"] = str(float(args.train_max_logit_abs))
+
+    if bool(getattr(args, "cache_sanitize_logits", False)):
+        os.environ["SLM_CACHE_SANITIZE_LOGITS"] = "1"
+    if bool(getattr(args, "no_cache_sanitize_logits", False)):
+        os.environ["SLM_CACHE_SANITIZE_LOGITS"] = "0"
+    if bool(getattr(args, "cache_clamp_fp16", False)):
+        os.environ["SLM_CACHE_CLAMP_FP16"] = "1"
+    if bool(getattr(args, "no_cache_clamp_fp16", False)):
+        os.environ["SLM_CACHE_CLAMP_FP16"] = "0"
+    if getattr(args, "cache_fp16_safe_abs", None) is not None:
+        os.environ["SLM_CACHE_FP16_SAFE_ABS"] = str(float(args.cache_fp16_safe_abs))
 
     if args.seeds:
         cfg.seeds = list(args.seeds)
