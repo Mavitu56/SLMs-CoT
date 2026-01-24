@@ -91,11 +91,11 @@ def build_cot_prompt(
     post_cot: bool = False,
     one_shot_prefix: Optional[str] = None,
 ) -> Tuple[str, str]:
-    """Prompt used for STUDENT distillation (and student-side caches).
+    """Prompt used for STUDENT distillation.
 
     Returns:
     - prompt: full prompt string
-    - prompt_version: stable identifier for cache versioning
+    - prompt_version: stable identifier for prompt/version tracking
     """
 
     q = (question or "").strip()

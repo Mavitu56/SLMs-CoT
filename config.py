@@ -114,7 +114,6 @@ class EvidenceBasedConfig:
     output_dir: Path = field(init=False)
     models_dir: Path = field(init=False)
     reports_dir: Path = field(init=False)
-    cache_dir: Path = field(init=False)
     experiments_dir: Path = field(init=False)
 
     # Defaults for the hypothesis H1 experiment
@@ -154,13 +153,11 @@ class EvidenceBasedConfig:
         self.output_dir = self.drive_root / "scientific_results"
         self.models_dir = self.output_dir / "models"
         self.reports_dir = self.output_dir / "reports"
-        self.cache_dir = self.output_dir / "cache"
         self.experiments_dir = self.output_dir / "experiments"
         for path in (
             self.output_dir,
             self.models_dir,
             self.reports_dir,
-            self.cache_dir,
             self.experiments_dir,
         ):
             try:
@@ -169,7 +166,7 @@ class EvidenceBasedConfig:
                 raise RuntimeError(f"Falha ao criar diretório de saída: {path}. Erro: {e}")
 
     def to_metadata(self) -> Dict[str, Any]:
-        """Metadata snapshot for reports and cache versioning."""
+        """Metadata snapshot for reports and run traceability."""
 
         return {
             "timestamp": datetime.now().isoformat(),
@@ -178,7 +175,6 @@ class EvidenceBasedConfig:
                 "output_dir": str(self.output_dir),
                 "models_dir": str(self.models_dir),
                 "reports_dir": str(self.reports_dir),
-                "cache_dir": str(self.cache_dir),
                 "experiments_dir": str(self.experiments_dir),
             },
             "model_hierarchy": dict(self.model_hierarchy),

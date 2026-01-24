@@ -261,41 +261,8 @@ def _extract_last_number_like(text: str) -> str:
     return nums[-1].strip() if nums else ""
 
 
-def _resolve_bbeh_cache_dir() -> Path:
-    """Resolve a persistent cache dir for BBEH downloads.
-
-    Priority:
-    1) SLM_BBEH_CACHE_DIR (explicit override)
-    2) SLM_DRIVE_ROOT/scientific_results/cache/bbeh_cache
-    3) Colab Drive default (when mounted)
-    4) /content/bbeh_cache (Colab ephemeral)
-    5) ./bbeh_cache (local fallback)
-    """
-
-    env = os.environ.get("SLM_BBEH_CACHE_DIR")
-    if env:
-        return Path(env)
-
-    drive_root = os.environ.get("SLM_DRIVE_ROOT")
-    if drive_root:
-        return Path(drive_root) / "scientific_results" / "cache" / "bbeh_cache"
-
-    try:
-        if os.path.ismount("/content/drive") and Path("/content/drive/MyDrive").is_dir():
-            return Path("/content/drive/MyDrive/SLM_results") / "scientific_results" / "cache" / "bbeh_cache"
-    except Exception:
-        pass
-
-    if Path("/content").exists():
-        return Path("/content") / "bbeh_cache"
-    return Path.cwd() / "bbeh_cache"
-
-
 def load_bbeh_task_dataset(task_name: str) -> Tuple[HFDataset, str]:
-    """Loads a BBEH task JSON from GitHub with a small local cache."""
-
-    base_cache = _resolve_bbeh_cache_dir()
-    base_cache.mkdir(parents=True, exist_ok=True)
+    """Loads a BBEH task JSON from GitHub (no local caching)."""
 
     repo_alias_map = {
         "logical_deduction_five_objects": ["bbeh_word_sorting", "bbeh_boolean_expressions"],
@@ -308,7 +275,7 @@ def load_bbeh_task_dataset(task_name: str) -> Tuple[HFDataset, str]:
     last_err = None
     for directory in candidates:
         try:
-            dataset = _load_bbeh_task_from_repo(base_cache, directory)
+            dataset = _load_bbeh_task_from_repo(directory)
             if dataset is not None:
                 return dataset, directory
         except Exception as err:
@@ -317,22 +284,17 @@ def load_bbeh_task_dataset(task_name: str) -> Tuple[HFDataset, str]:
     raise RuntimeError(f"No foi possvel carregar task {task_name}: {last_err}")
 
 
-def _load_bbeh_task_from_repo(cache_dir: Path, directory_name: str) -> HFDataset:
+def _load_bbeh_task_from_repo(directory_name: str) -> HFDataset:
     from datasets import Dataset as HFDataset
 
     base_url = "https://raw.githubusercontent.com/google-deepmind/bbeh/main/bbeh/benchmark_tasks"
-    cache_file = cache_dir / f"{directory_name}.json"
 
-    if cache_file.exists():
-        payload = json.loads(cache_file.read_text(encoding="utf-8"))
-    else:
-        url = f"{base_url}/{directory_name}/task.json"
-        print(f" Baixando task '{directory_name}' do BBEH...")
-        response = requests.get(url, timeout=60)
-        if response.status_code >= 400:
-            raise RuntimeError(f"No foi possvel baixar {directory_name} ({response.status_code}).")
-        payload = response.json()
-        cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    url = f"{base_url}/{directory_name}/task.json"
+    print(f" Baixando task '{directory_name}' do BBEH...")
+    response = requests.get(url, timeout=60)
+    if response.status_code >= 400:
+        raise RuntimeError(f"No foi possvel baixar {directory_name} ({response.status_code}).")
+    payload = response.json()
 
     if isinstance(payload, dict) and "examples" in payload:
         examples = payload["examples"]
