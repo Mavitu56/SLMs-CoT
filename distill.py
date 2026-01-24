@@ -190,10 +190,12 @@ class TraditionalKDDistiller:
         log_every = max(1, _env_int("SLM_KD_LOG_EVERY", 50))
         skip_nonfinite_batch = _env_flag("SLM_KD_SKIP_NONFINITE_BATCH", "1")
         save_every_epoch = _env_flag("SLM_KD_SAVE_EVERY_EPOCH", "0")
-        clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 1.0))
+        clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 0.5))  # Padrão mais agressivo
         clip_grad_norm = float(os.environ.get("SLM_KD_CLIP_GRAD_NORM", clip_grad_norm))
-        max_logit_abs = _env_float("SLM_KD_MAX_LOGIT_ABS", 100.0)
+        max_logit_abs = _env_float("SLM_KD_MAX_LOGIT_ABS", 50.0)  # Antes: 100.0 - reduzido para estabilidade
         apply_logit_sanitize = _env_flag("SLM_KD_SANITIZE_LOGITS", "1")
+        # Guardrail: batches com poucos tokens supervisionados são instáveis
+        min_supervised_tokens = _env_int("SLM_KD_MIN_SUPERVISED_TOKENS", 8)
 
         def _sanitize_logits(x: torch.Tensor) -> torch.Tensor:
             if not apply_logit_sanitize:
@@ -290,14 +292,13 @@ class TraditionalKDDistiller:
                 labels = labels.long().clamp(min=-100, max=vocab_size - 1)
                 labels, _san = sanitize_labels_for_ce(labels, vocab_size)
 
-                # If prompt-masking + truncation removes the entire completion, then
-                # there are no supervised tokens in this batch. Some torch versions
-                # produce NaN for reduction='mean' CE in this case; also KD mask
-                # becomes empty -> kd_loss=0. We treat this as a harmless no-op.
+                # If prompt-masking + truncation removes most of the completion, the
+                # batch becomes statistically unreliable for KD. Skip batches with
+                # very few supervised tokens to prevent noisy/degenerate gradients.
                 valid_tokens = int((labels != -100).sum().detach().cpu().item())
-                if valid_tokens == 0:
+                if valid_tokens < min_supervised_tokens:
                     if debug_nan and ((batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(dataloader)):
-                        print(f" (dbg) batch sem tokens supervisionados; pulando. epoch={epoch} batch={batch_idx}")
+                        print(f" (dbg) batch com tokens supervisionados insuficientes ({valid_tokens} < {min_supervised_tokens}); pulando. epoch={epoch} batch={batch_idx}")
                     continue
 
                 with torch.no_grad():

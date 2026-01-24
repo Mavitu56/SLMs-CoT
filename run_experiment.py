@@ -213,7 +213,7 @@ def _train_sft_lora(
 
     debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
     skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
-    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 1.0))
+    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 0.5))  # Padrão mais agressivo para estabilidade
     try:
         clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
     except Exception:
@@ -429,7 +429,7 @@ def _train_cascod_lora(
 
     debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
     skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
-    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 1.0))
+    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 0.5))  # Padrão mais agressivo para estabilidade
     try:
         clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
     except Exception:

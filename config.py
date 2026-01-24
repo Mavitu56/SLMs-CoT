@@ -78,18 +78,25 @@ class EvidenceBasedConfig:
     # OOD commonsense (eval-only; not part of primary hypothesis by default)
     eval_limit_obqa: int = 200
 
-    # Distillation hyperparams
+    # Distillation hyperparams (otimizado para Google Colab A100 40/80GB)
+    # Ajustes de estabilidade:
+    #   - temperature_schedule reduzido: evita amplificação excessiva da KL divergence
+    #   - alpha_schedule reduzido: mais peso na CE (ground-truth) para estabilidade
+    #   - clip_grad_norm mais agressivo: previne explosão de gradientes
+    #   - batch_size aumentado para A100 (80GB suporta 8, 40GB suporta 4-6)
     kd_params: Dict[str, Any] = field(
         default_factory=lambda: {
-            "temperature_schedule": [5.0, 3.0, 1.0],
-            "alpha_schedule": [0.7, 0.5, 0.3],
-            "learning_rates": {"kd": 5e-5},
+            "temperature_schedule": [2.0, 1.5, 1.0],  # Antes: [5.0, 3.0, 1.0] - causava instabilidade
+            "alpha_schedule": [0.5, 0.4, 0.3],  # Antes: [0.7, 0.5, 0.3] - muito peso no KD loss
+            "learning_rates": {"kd": 3e-5},  # Antes: 5e-5 - reduzido para estabilidade
             "lora_rank": 16,
-            "epochs": 4,
-            # Qwen vocab (~150k) makes (B,T,V) losses memory-heavy; keep micro-batch small.
-            "batch_size": 2,
-            "grad_accum_steps": 6,
-            "dataloader_num_workers": 0,
+            "epochs": 3,  # Antes: 4 - suficiente com batch maior
+            # A100: 80GB suporta batch=8, 40GB suporta batch=4-6
+            # Qwen vocab (~150k) continua exigindo cuidado com (B,T,V) tensors
+            "batch_size": 4,  # Antes: 2 - A100 permite mais
+            "grad_accum_steps": 4,  # Antes: 6 - compensado pelo batch maior (effective=16)
+            "clip_grad_norm": 0.5,  # Antes: 1.0 - mais agressivo para estabilidade
+            "dataloader_num_workers": 2,  # Antes: 0 - A100 tem CPU suficiente
         }
     )
 
