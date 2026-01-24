@@ -73,8 +73,8 @@ class EvidenceBasedConfig:
 
     # Limits (for Colab runtime practicality)
     train_limit: Optional[int] = 3000
-    eval_limit_gsm8k: int = 200
-    eval_limit_bbh: int = 50
+    eval_limit_gsm8k: int = 100
+    eval_limit_bbh: int = 30
     # OOD commonsense (eval-only; not part of primary hypothesis by default)
     eval_limit_obqa: int = 200
 
@@ -119,10 +119,10 @@ class EvidenceBasedConfig:
 
     # Defaults for the hypothesis H1 experiment
     teacher_cot_generation: GenerationConfig = field(
-        default_factory=lambda: GenerationConfig(max_new_tokens=150, temperature=0.0, do_sample=False)
+        default_factory=lambda: GenerationConfig(max_new_tokens=128, temperature=0.0, do_sample=False)
     )
     eval_generation: GenerationConfig = field(
-        default_factory=lambda: GenerationConfig(max_new_tokens=256, temperature=0.0, do_sample=False)
+        default_factory=lambda: GenerationConfig(max_new_tokens=192, temperature=0.0, do_sample=False)
     )
 
     # Hypothesis (kept as documentation metadata)

@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset as TorchDataset
 from tqdm.auto import tqdm
 from transformers import get_scheduler
 
+from cache import compute_inputs_hash, dataset_fingerprint, read_cache_metadata, tokenizer_fingerprint
 from config import (
     EvidenceBasedConfig,
     get_schedule_value,
@@ -207,6 +208,75 @@ def sanitize_labels_for_ce(labels: torch.Tensor, vocab_size: int, ignore_index: 
     return labels, invalid_total
 
 
+def _normalize_cache_scope(meta: Dict[str, Any]) -> str:
+    raw = str(meta.get("cache_scope") or "").strip().lower()
+    if raw in {"per-seed", "global", "off"}:
+        return raw
+    # Backward-compat: infer from presence of seed.
+    return "global" if meta.get("seed") is None else "per-seed"
+
+
+def _validate_cache_metadata(
+    meta: Optional[Dict[str, Any]],
+    *,
+    expected_seed: Optional[int],
+    expected_max_length: Optional[int],
+    expected_tokenizer_hash: Optional[str],
+    expected_dataset_fp: Optional[str],
+    strict: bool,
+    context: str,
+    max_length_key: str = "max_length",
+) -> bool:
+    mismatches: List[str] = []
+    if not isinstance(meta, dict):
+        mismatches.append("metadata_missing")
+    else:
+        scope = _normalize_cache_scope(meta)
+        if expected_tokenizer_hash:
+            cache_hash = str(meta.get("tokenizer_hash") or "")
+            if not cache_hash:
+                mismatches.append("tokenizer_hash_missing")
+            elif cache_hash != expected_tokenizer_hash:
+                mismatches.append(f"tokenizer_hash mismatch cache={cache_hash} expected={expected_tokenizer_hash}")
+
+        if expected_dataset_fp:
+            cache_fp = str(meta.get("dataset_fingerprint") or "")
+            if not cache_fp:
+                mismatches.append("dataset_fingerprint_missing")
+            elif cache_fp != expected_dataset_fp:
+                mismatches.append(f"dataset_fingerprint mismatch cache={cache_fp} expected={expected_dataset_fp}")
+
+        if expected_max_length is not None:
+            cache_max = meta.get(max_length_key)
+            if cache_max is None:
+                mismatches.append(f"{max_length_key}_missing")
+            else:
+                try:
+                    if int(cache_max) != int(expected_max_length):
+                        mismatches.append(f"{max_length_key} mismatch cache={cache_max} expected={expected_max_length}")
+                except Exception:
+                    mismatches.append(f"{max_length_key}_invalid cache={cache_max}")
+
+        if expected_seed is not None and scope != "global":
+            cache_seed = meta.get("seed")
+            if cache_seed is None:
+                mismatches.append("seed_missing")
+            else:
+                try:
+                    if int(cache_seed) != int(expected_seed):
+                        mismatches.append(f"seed mismatch cache={cache_seed} expected={expected_seed}")
+                except Exception:
+                    mismatches.append(f"seed_invalid cache={cache_seed}")
+
+    if mismatches:
+        msg = f"{context}: cache metadata mismatch: " + "; ".join(mismatches)
+        if strict:
+            raise ValueError(msg)
+        print(f"[WARN] {msg}")
+        return False
+    return True
+
+
 class TraditionalKDDistiller:
     def __init__(self, config: EvidenceBasedConfig, cache_dir: Optional[str] = None):
         self.config = config
@@ -274,7 +344,7 @@ class TraditionalKDDistiller:
         log_every = max(1, _env_int("SLM_KD_LOG_EVERY", 50))
         skip_nonfinite_batch = _env_flag("SLM_KD_SKIP_NONFINITE_BATCH", "1")
         save_every_epoch = _env_flag("SLM_KD_SAVE_EVERY_EPOCH", "0")
-        strict_cache_match = _env_flag("SLM_KD_STRICT_CACHE_MATCH", "0")
+        strict_cache_match = _env_flag("SLM_KD_STRICT_CACHE_MATCH", "1")
         clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 1.0))
         clip_grad_norm = float(os.environ.get("SLM_KD_CLIP_GRAD_NORM", clip_grad_norm))
         max_logit_abs = _env_float("SLM_KD_MAX_LOGIT_ABS", 100.0)
@@ -294,6 +364,31 @@ class TraditionalKDDistiller:
                 return bool((~torch.isfinite(x)).any().item())
             except Exception:
                 return True
+
+        cache_meta = None
+        cache_store_inputs = "full"
+        if cache_available:
+            cache_meta = read_cache_metadata(Path(self.cache_dir)) if self.cache_dir else None
+            policy = (cache_meta or {}).get("logits_cache_policy") or {}
+            cache_store_inputs = str(policy.get("store_inputs") or "full").strip().lower()
+            if cache_store_inputs not in {"full", "hash", "none"}:
+                cache_store_inputs = "full"
+
+            expected_ds_fp = dataset_fingerprint(raw_dataset, text_key="text")
+            expected_tok_hash = tokenizer_fingerprint(student_tokenizer)
+            ok = _validate_cache_metadata(
+                cache_meta,
+                expected_seed=int(seed),
+                expected_max_length=int(self.config.max_length),
+                expected_tokenizer_hash=expected_tok_hash,
+                expected_dataset_fp=expected_ds_fp,
+                strict=bool(strict_cache_match),
+                context="logits cache",
+            )
+            if not ok:
+                if teacher_model is None:
+                    raise ValueError("Cache invalido e teacher_model ausente para fallback. Gere cache novo ou forneca teacher_model.")
+                cache_available = False
 
         tokenized = preprocess_and_tokenize(raw_dataset, student_tokenizer, max_length=self.config.max_length)
         student_model = self._ensure_vocab_alignment(student_model, student_tokenizer)
@@ -385,7 +480,18 @@ class TraditionalKDDistiller:
                 labels = labels.long().clamp(min=-100, max=vocab_size - 1)
                 labels, _san = sanitize_labels_for_ce(labels, vocab_size)
 
-                if shard_iter is not None:
+                # If prompt-masking + truncation removes the entire completion, then
+                # there are no supervised tokens in this batch. Some torch versions
+                # produce NaN for reduction='mean' CE in this case; also KD mask
+                # becomes empty -> kd_loss=0. We treat this as a harmless no-op.
+                valid_tokens = int((labels != -100).sum().detach().cpu().item())
+                if valid_tokens == 0:
+                    if debug_nan and ((batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(dataloader)):
+                        print(f" (dbg) batch sem tokens supervisionados; pulando. epoch={epoch} batch={batch_idx}")
+                    continue
+
+                use_cache_batch = shard_iter is not None
+                if use_cache_batch:
                     try:
                         shard_path = next(shard_iter)
                     except StopIteration:
@@ -393,54 +499,81 @@ class TraditionalKDDistiller:
                         shard_path = next(shard_iter)
                     data = torch.load(shard_path, map_location="cpu")
 
-                    # Cache/input alignment checks: verifies the cached logits were
-                    # produced for the exact same token IDs and attention mask.
-                    # If this fails, logits-KD becomes scientifically invalid.
+                    cache_error = None
                     try:
-                        cached_ids = data.get("input_ids")
-                        cached_mask = data.get("attention_mask")
-                        if cached_ids is not None and cached_mask is not None:
-                            cur_ids = inputs.get("input_ids").detach().to("cpu")
-                            cur_mask = inputs.get("attention_mask").detach().to("cpu")
-                            same_ids = bool(torch.equal(cached_ids, cur_ids))
-                            same_mask = bool(torch.equal(cached_mask, cur_mask))
-                            if not (same_ids and same_mask):
-                                msg = (
-                                    " (warn) Cache de logits parece desalinhado com o batch atual. "
-                                    f"epoch={epoch} batch={batch_idx} shard={Path(shard_path).name} "
-                                    f"same_input_ids={same_ids} same_attention_mask={same_mask}"
-                                )
-                                print(msg)
-                                if strict_cache_match:
-                                    raise RuntimeError(msg)
+                        if cache_store_inputs == "full":
+                            cached_ids = data.get("input_ids")
+                            cached_mask = data.get("attention_mask")
+                            if cached_ids is None or cached_mask is None:
+                                cache_error = "Cache sem input_ids/attention_mask (store_inputs=full)."
+                            else:
+                                cur_ids = inputs.get("input_ids").detach().to("cpu")
+                                cur_mask = inputs.get("attention_mask").detach().to("cpu")
+                                same_ids = bool(torch.equal(cached_ids, cur_ids))
+                                same_mask = bool(torch.equal(cached_mask, cur_mask))
+                                if not (same_ids and same_mask):
+                                    cache_error = (
+                                        "Cache de logits desalinhado com o batch atual. "
+                                        f"epoch={epoch} batch={batch_idx} shard={Path(shard_path).name} "
+                                        f"same_input_ids={same_ids} same_attention_mask={same_mask}"
+                                    )
+                        elif cache_store_inputs == "hash":
+                            cached_hash = data.get("input_hash")
+                            if not cached_hash:
+                                cache_error = "Cache sem input_hash (store_inputs=hash)."
+                            else:
+                                cur_hash = compute_inputs_hash(inputs.get("input_ids"), inputs.get("attention_mask"))
+                                if str(cached_hash) != str(cur_hash):
+                                    cache_error = (
+                                        "Cache de logits desalinhado por hash. "
+                                        f"epoch={epoch} batch={batch_idx} shard={Path(shard_path).name}"
+                                    )
+                        else:
+                            cache_error = None
                     except Exception as exc:
-                        if strict_cache_match:
-                            raise
-                        if debug_nan:
-                            print(f" (warn) Falha ao checar alinhamento do cache: {exc}")
+                        cache_error = f"Falha ao checar alinhamento do cache: {exc}"
 
+                    if cache_error:
+                        if strict_cache_match:
+                            raise RuntimeError(cache_error)
+                        if debug_nan:
+                            print(f" (warn) {cache_error} Desabilitando cache.")
+                        if teacher_model is None:
+                            raise RuntimeError("Cache invalido e teacher_model ausente para fallback.")
+                        teacher_logits_cache = None
+                        shard_iter = None
+                        use_cache_batch = False
+
+                if use_cache_batch:
                     # Stability: fp16 logits + softmax can be numerically fragile.
                     teacher_logits = data["logits"].to(device=device, dtype=torch.float32)
 
-                    # Sanity: cached logits batch dimension must match current batch.
-                    try:
-                        if int(teacher_logits.size(0)) != int(inputs["input_ids"].size(0)):
-                            raise RuntimeError(
-                                "Batch size mismatch entre cache e dataloader. "
-                                f"cache_bs={int(teacher_logits.size(0))} batch_bs={int(inputs['input_ids'].size(0))} "
-                                f"shard={Path(shard_path).name}. "
-                                "Isso normalmente indica train_limit diferente, batch_size diferente, ou cache incorreto."
-                            )
-                    except Exception:
-                        raise
+                    if int(teacher_logits.size(0)) != int(inputs["input_ids"].size(0)):
+                        msg = (
+                            "Batch size mismatch entre cache e dataloader. "
+                            f"cache_bs={int(teacher_logits.size(0))} batch_bs={int(inputs['input_ids'].size(0))} "
+                            f"shard={Path(shard_path).name}. "
+                            "Isso normalmente indica train_limit diferente, batch_size diferente, ou cache incorreto."
+                        )
+                        if strict_cache_match:
+                            raise RuntimeError(msg)
+                        if debug_nan:
+                            print(f" (warn) {msg} Desabilitando cache.")
+                        if teacher_model is None:
+                            raise RuntimeError("Cache invalido e teacher_model ausente para fallback.")
+                        teacher_logits_cache = None
+                        shard_iter = None
+                        use_cache_batch = False
 
+                if use_cache_batch:
                     teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
                     if _has_nonfinite(teacher_logits):
                         nonfinite_teacher_shards += 1
                         if debug_nan:
-                            print(f" (warn) teacher_logits não-finitos no shard: {shard_path}")
+                            print(f" (warn) teacher_logits n?o-finitos no shard: {shard_path}")
                         teacher_logits = _sanitize_logits(teacher_logits)
-                else:
+
+                if not use_cache_batch:
                     with torch.no_grad():
                         t_out = teacher_model(**inputs)
                         teacher_logits = self._align_teacher_logits(t_out.logits, vocab_size)
@@ -448,9 +581,8 @@ class TraditionalKDDistiller:
                         if _has_nonfinite(teacher_logits):
                             nonfinite_teacher_shards += 1
                             if debug_nan:
-                                print(" (warn) teacher_model produziu logits não-finitos (on-the-fly)")
+                                print(" (warn) teacher_model produziu logits n?o-finitos (on-the-fly)")
                             teacher_logits = _sanitize_logits(teacher_logits)
-
                 # Forward can be AMP, but compute losses in fp32 outside autocast.
                 with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
@@ -465,7 +597,15 @@ class TraditionalKDDistiller:
                 teacher_logits = _sanitize_logits(teacher_logits)
 
                 vocab_size = s_logits_f32.size(-1)
-                ce_loss = F.cross_entropy(s_logits_f32.reshape(-1, vocab_size), labels.reshape(-1), ignore_index=-100)
+                # Safe CE: compute only over supervised positions to avoid NaN when
+                # all labels are ignore_index (and to make the denominator explicit).
+                s_flat = s_logits_f32.reshape(-1, vocab_size)
+                y_flat = labels.reshape(-1)
+                keep = (y_flat != -100)
+                if bool(keep.any().item()):
+                    ce_loss = F.cross_entropy(s_flat[keep], y_flat[keep])
+                else:
+                    ce_loss = s_flat.sum() * 0.0
 
                 # KD math in fp32 for stability (especially with large vocabs).
                 t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
@@ -760,7 +900,7 @@ class ReasoningAwareDistiller:
 
         from pathlib import Path
 
-        mode = str(os.environ.get("SLM_LOGITS_CACHE_LOAD_MODE", "auto")).strip().lower()
+        mode = str(os.environ.get("SLM_LOGITS_CACHE_LOAD_MODE", "lazy")).strip().lower()
         eager_max_mb = float(os.environ.get("SLM_LOGITS_CACHE_EAGER_MAX_MB", "2048"))
 
         shard_paths = sorted(Path(directory).glob("teacher_logits_shard_*.pt"))
@@ -883,14 +1023,46 @@ class ReasoningAwareDistiller:
         if use_teacher_logits and not logits_ready and teacher_model is None:
             raise ValueError("Precisa de teacher_model quando não há cache de logits e use_teacher_logits=True.")
 
+        # CoT/logits cache QA: if examples built from CoT don't align with cached logits,
+        # logits-KD becomes scientifically invalid (silent misalignment). Default is strict.
+        cot_strict = _env_flag("SLM_COT_CACHE_STRICT", "1")
+        require_exact_logits_match = _env_flag("SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH", "1")
+
+        cot_meta = read_cache_metadata(Path(self.cot_cache_path).parent) if cot_ready else None
+        logits_meta = read_cache_metadata(Path(self.logits_cache_dir)) if logits_ready else None
+
+        if cot_ready:
+            expected_ds_fp = dataset_fingerprint(raw_dataset, text_key="text")
+            _validate_cache_metadata(
+                cot_meta,
+                expected_seed=int(seed),
+                expected_max_length=int(self.config.max_length),
+                expected_tokenizer_hash=None,
+                expected_dataset_fp=expected_ds_fp,
+                strict=bool(cot_strict),
+                context="cot cache",
+                max_length_key="prompt_max_length",
+            )
+
+        if logits_ready:
+            expected_tok_hash = tokenizer_fingerprint(student_tokenizer)
+            ok = _validate_cache_metadata(
+                logits_meta,
+                expected_seed=int(seed),
+                expected_max_length=int(self.config.max_length),
+                expected_tokenizer_hash=expected_tok_hash,
+                expected_dataset_fp=None,
+                strict=bool(require_exact_logits_match),
+                context="logits cache",
+            )
+            if not ok:
+                if teacher_model is None:
+                    raise ValueError("Logits cache invalido e teacher_model ausente para fallback.")
+                logits_ready = False
+                logits_meta = None
+
         teacher_logits_cache = self._load_logits_cache(self.logits_cache_dir) if logits_ready else None
         cot_records = self._load_cot_cache(self.cot_cache_path) if cot_ready else None
-
-        # CoT/logits cache QA: if examples built from CoT don't align with cached logits,
-        # logits-KD becomes scientifically invalid (silent misalignment). Default is to
-        # warn and disable cache; strict mode aborts.
-        cot_strict = _env_flag("SLM_COT_CACHE_STRICT", "0")
-        require_exact_logits_match = _env_flag("SLM_LOGITS_CACHE_REQUIRE_EXACT_MATCH", "0")
 
         # Build prompt + target sequences
         examples: List[Dict[str, str]] = []
@@ -988,6 +1160,22 @@ class ReasoningAwareDistiller:
         prompts = [e["prompt"] for e in examples]
         targets = [e["teacher_full"] for e in examples]
         full_sequences = [p + t for p, t in zip(prompts, targets)]
+
+        if logits_meta is not None:
+            expected_seq_fp = dataset_fingerprint(full_sequences, text_key="text")
+            ok = _validate_cache_metadata(
+                logits_meta,
+                expected_seed=int(seed),
+                expected_max_length=int(self.config.max_length),
+                expected_tokenizer_hash=None,
+                expected_dataset_fp=expected_seq_fp,
+                strict=bool(require_exact_logits_match),
+                context="logits cache (sequences)",
+            )
+            if not ok:
+                if teacher_model is None:
+                    raise ValueError("Logits cache invalido e teacher_model ausente para fallback.")
+                teacher_logits_cache = None
 
         tok_prompts = student_tokenizer(prompts, truncation=True, padding="max_length", max_length=self.config.max_length, return_tensors="pt")
         prompt_lengths = tok_prompts["attention_mask"].sum(dim=1)
@@ -1307,7 +1495,7 @@ class ReasoningAwareDistiller:
             "logits_cache_controls": {
                 "logits_ready": bool(logits_ready),
                 "cot_ready": bool(cot_ready),
-                "load_mode": str(os.environ.get("SLM_LOGITS_CACHE_LOAD_MODE", "auto")),
+                "load_mode": str(os.environ.get("SLM_LOGITS_CACHE_LOAD_MODE", "lazy")),
                 "eager_max_mb": float(os.environ.get("SLM_LOGITS_CACHE_EAGER_MAX_MB", "2048")),
                 "lazy": bool(is_lazy_cache),
                 "cot_cache_strict": bool(cot_strict),

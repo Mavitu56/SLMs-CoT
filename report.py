@@ -84,7 +84,7 @@ def write_summary_txt(path: Path, results: Dict[str, Any]) -> None:
         lines.append(f"Primary score (média): {_fmt_mean(primary_scores)}")
         lines.append(f"GSM8K acc (média): {_fmt_mean(gsm8k_scores)}")
         lines.append(f"BBH acc (média): {_fmt_mean(bbh_scores)}")
-        lines.append(f"Overall (média): {_fmt_mean(overall_scores)}")
+        lines.append(f"Overall (sec, média): {_fmt_mean(overall_scores)}")
         lines.append(f"Inference time s (média): {_fmt_mean(inf_times)}")
 
         # Optional secondary metrics (cheap).

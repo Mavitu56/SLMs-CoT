@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -83,6 +84,26 @@ def _tokenizer_fingerprint(tokenizer) -> str:
     except Exception:
         pass
     return digest
+
+
+def dataset_fingerprint(dataset: Any, *, text_key: str = "text", max_examples: int = 128) -> str:
+    """Public dataset fingerprint helper for cache validation."""
+
+    return _dataset_fingerprint(dataset, text_key=text_key, max_examples=max_examples)
+
+
+def compute_inputs_hash(input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> str:
+    """Hash input_ids (+ attention_mask) for cache alignment without storing inputs."""
+
+    h = hashlib.sha256()
+    ids = input_ids.detach().to("cpu").contiguous()
+    h.update(str(list(ids.shape)).encode("utf-8"))
+    h.update(ids.numpy().tobytes())
+    if attention_mask is not None:
+        mask = attention_mask.detach().to("cpu").contiguous()
+        h.update(str(list(mask.shape)).encode("utf-8"))
+        h.update(mask.numpy().tobytes())
+    return h.hexdigest()
 
 
 def _dataset_fingerprint(dataset: Any, *, text_key: str = "text", max_examples: int = 128) -> str:
@@ -186,6 +207,8 @@ def cache_teacher_logits(
     train_limit: Optional[int] = None,
     text_key: str = "text",
     max_length: Optional[int] = None,
+    cache_scope: str = "per-seed",
+    cache_store_inputs: str = "hash",
 ) -> Path:
     """Compute teacher logits and persist shards.
 
@@ -194,6 +217,14 @@ def cache_teacher_logits(
     """
 
     generation_cfg = generation_cfg or GenerationConfig(max_new_tokens=0, temperature=0.0, do_sample=False)
+
+    cache_scope = str(cache_scope or "per-seed").strip().lower()
+    if cache_scope not in {"per-seed", "global", "off"}:
+        raise ValueError(f"cache_scope invalido: {cache_scope}. Use per-seed|global|off.")
+    cache_nonce = uuid.uuid4().hex[:8] if cache_scope == "off" else None
+    store_inputs = str(cache_store_inputs or "hash").strip().lower()
+    if store_inputs not in {"full", "hash", "none"}:
+        raise ValueError(f"cache_store_inputs invalido: {store_inputs}. Use full|hash|none.")
 
     dataset = _normalize_text_iterable(dataset, text_key=text_key)
     ds_fp = _dataset_fingerprint(dataset, text_key=text_key)
@@ -238,7 +269,9 @@ def cache_teacher_logits(
         "batch_size": batch_size,
         "device": device,
         "split": split,
-        "seed": seed,
+        "cache_scope": cache_scope,
+        "cache_nonce": cache_nonce,
+        "seed": (int(seed) if cache_scope in {"per-seed", "off"} else None),
         "kd_mode": kd_mode,
         "input_kind": input_kind,
         "train_limit": train_limit,
@@ -251,6 +284,8 @@ def cache_teacher_logits(
             "sanitize_logits": bool(sanitize_logits),
             "clamp_for_fp16": bool(clamp_for_fp16),
             "fp16_safe_abs": float(fp16_safe_abs),
+            "store_inputs": store_inputs,
+            "input_hash_alg": ("sha256" if store_inputs == "hash" else None),
         },
     }
 
@@ -331,11 +366,12 @@ def cache_teacher_logits(
         except Exception:
             pass
 
-        payload = {
-            "logits": logits_fp16,
-            "input_ids": inputs["input_ids"].cpu(),
-            "attention_mask": inputs["attention_mask"].cpu(),
-        }
+        payload = {"logits": logits_fp16}
+        if store_inputs == "full":
+            payload["input_ids"] = inputs["input_ids"].cpu()
+            payload["attention_mask"] = inputs["attention_mask"].cpu()
+        elif store_inputs == "hash":
+            payload["input_hash"] = compute_inputs_hash(inputs["input_ids"], inputs.get("attention_mask"))
         shard_file = out_dir / f"teacher_logits_shard_{shard_idx}.pt"
         # Atomic-ish write to reduce corrupted shards on flaky storage.
         tmp_file = out_dir / f"teacher_logits_shard_{shard_idx}.pt.tmp"
@@ -377,8 +413,14 @@ def cache_teacher_cot(
     post_cot_ig_steps: int = 8,
     post_cot_ig_top_frac: float = 0.3,
     filter_by_gold_answer: bool = False,
+    cache_scope: str = "per-seed",
 ) -> Path:
     """Generate and persist Chain-of-Thought traces as JSONL."""
+
+    cache_scope = str(cache_scope or "per-seed").strip().lower()
+    if cache_scope not in {"per-seed", "global", "off"}:
+        raise ValueError(f"cache_scope invalido: {cache_scope}. Use per-seed|global|off.")
+    cache_nonce = uuid.uuid4().hex[:8] if cache_scope == "off" else None
 
     dataset = _normalize_text_iterable(dataset, text_key=text_key)
     ds_fp = _dataset_fingerprint(dataset, text_key=text_key)
@@ -392,7 +434,9 @@ def cache_teacher_cot(
         "batch_size": batch_size,
         "device": device,
         "split": split,
-        "seed": seed,
+        "cache_scope": cache_scope,
+        "cache_nonce": cache_nonce,
+        "seed": (int(seed) if cache_scope in {"per-seed", "off"} else None),
         "prompt_max_length": prompt_max_length,
         "prompt_version": PROMPT_VERSION,
         "granularity_level": int(granularity_level or 0),

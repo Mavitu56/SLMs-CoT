@@ -836,6 +836,12 @@ class StandardizedEvaluator:
             "Explain in one paragraph what a prime number is.",
         ]
 
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+
         total_time = 0.0
         for text in test_texts:
             inputs = tokenizer(text, return_tensors="pt").to(self.config.device)
