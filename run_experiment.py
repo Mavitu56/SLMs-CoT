@@ -28,6 +28,11 @@ def tokenizer_fingerprint(tokenizer) -> str:
 
     This replaces the old tokenizer fingerprinting; it's only used to gate
     logits-KD when teacher/student tokenization differs.
+    
+    IMPORTANT: We intentionally do NOT include name_or_path because the same
+    tokenizer saved to different directories would produce different hashes,
+    even though the vocabulary is identical (e.g., Qwen teacher saved as
+    checkpoint vs Qwen student loaded from HuggingFace).
     """
 
     try:
@@ -36,11 +41,11 @@ def tokenizer_fingerprint(tokenizer) -> str:
         vocab = None
 
     h = hashlib.sha256()
+    # Only include class name (not path) to avoid false negatives from saved checkpoints
     h.update(str(getattr(tokenizer, "__class__", type(tokenizer)).__name__).encode("utf-8"))
     h.update(b"\n")
-    h.update(str(getattr(tokenizer, "name_or_path", "")).encode("utf-8"))
-    h.update(b"\n")
-    for attr in ("vocab_size", "model_max_length", "bos_token_id", "eos_token_id", "pad_token_id"):
+    # Compare vocab_size and special token IDs (the actual compatibility requirements)
+    for attr in ("vocab_size", "bos_token_id", "eos_token_id", "pad_token_id"):
         h.update(f"{attr}={getattr(tokenizer, attr, None)}\n".encode("utf-8"))
 
     if isinstance(vocab, dict) and vocab:
