@@ -59,6 +59,8 @@ def _batched_generate_continuations(
     if not prompts:
         return []
 
+    from tqdm.auto import tqdm
+
     try:
         model.eval()
     except Exception:
@@ -71,7 +73,10 @@ def _batched_generate_continuations(
     if pad_token_id is None:
         pad_token_id = getattr(tokenizer, "eos_token_id", None)
 
-    for start in range(0, len(prompts), batch_size):
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    pbar = tqdm(range(0, len(prompts), batch_size), desc="Teacher CoT generation", total=total_batches)
+    
+    for start in pbar:
         chunk = list(prompts[start : start + batch_size])
         enc = tokenizer(
             chunk,
@@ -290,6 +295,18 @@ def generate_teacher_cot_records(
 
         for i, comp in enumerate(completions):
             reasoning, ans = _parse_teacher_completion(comp, post_cot=bool(params.post_cot), gold_answer=golds[i])
+            
+            # DEBUG: mostrar primeiros 5 exemplos para verificar qualidade
+            if i < 5:
+                print(f"\n[DEBUG Teacher Gen] Example {i}:")
+                print(f"  Question: {questions[i][:100]}...")
+                print(f"  Gold answer: {golds[i]}")
+                print(f"  Completion: {comp[:200]}...")
+                print(f"  Parsed reasoning: {reasoning[:100]}..." if reasoning else "  Parsed reasoning: EMPTY")
+                print(f"  Parsed answer: {ans}")
+                has_marker = "### FINAL_ANSWER" in comp.upper()
+                print(f"  Has ### FINAL_ANSWER marker: {has_marker}")
+            
             if len(levels) == 1:
                 per_example[i]["teacher_reasoning"] = reasoning
                 per_example[i]["teacher_answer"] = ans

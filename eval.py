@@ -134,11 +134,45 @@ def split_bbeh_dataset(ds: HFDataset, *, seed: int, eval_fraction: float = 0.2) 
     return ds.select(train_idx), ds.select(eval_idx)
 
 
+def _normalize_gsm8k_number(s: str) -> str:
+    """Normalize a number string for comparison.
+    
+    Handles: commas, trailing zeros, dollar signs, percentage signs.
+    E.g., "1,234.00" -> "1234", "$50" -> "50", "25%" -> "25"
+    """
+    if not s:
+        return ""
+    # Remove common prefixes/suffixes
+    s = s.replace("$", "").replace("%", "").replace(",", "").strip()
+    # Try to parse as float and normalize
+    try:
+        val = float(s)
+        # If it's a whole number, return as int string
+        if val == int(val):
+            return str(int(val))
+        return str(val)
+    except ValueError:
+        return s
+
+
 def extract_gsm8k_answer(text: str) -> str:
     if not text:
         return ""
+    
+    # Check for ### FINAL_ANSWER: marker first (matches training format)
+    if "### FINAL_ANSWER" in text.upper():
+        m = re.search(r"###\s*FINAL_ANSWER\s*:\s*(.+)", text, flags=re.IGNORECASE)
+        if m:
+            ans = m.group(1).strip()
+            # Extract just the number from the answer
+            nums = re.findall(r"[\d,]+\.?\d*", ans)
+            if nums:
+                return _normalize_gsm8k_number(nums[0])
+            return ans.split()[0] if ans else ""
+    
     if "####" in text:
-        return text.split("####")[-1].strip()
+        ans = text.split("####")[-1].strip()
+        return _normalize_gsm8k_number(ans)
     patterns = [
         r"answer[\s:\-]*([\$\d\.,]+)",
         r"final[\s:\-]*([\$\d\.,]+)",
@@ -147,9 +181,9 @@ def extract_gsm8k_answer(text: str) -> str:
     for pattern in patterns:
         matches = re.findall(pattern, text.lower())
         if matches:
-            return matches[-1].strip()
+            return _normalize_gsm8k_number(matches[-1].strip())
     numbers = re.findall(r"\d+\.?\d*", text)
-    return numbers[-1] if numbers else ""
+    return _normalize_gsm8k_number(numbers[-1]) if numbers else ""
 
 
 def extract_gsm8k_answer_first(text: str) -> str:
@@ -611,8 +645,9 @@ class StandardizedEvaluator:
 
         else:
             # Single-pass generation.
+            # IMPORTANT: prompt must match training format with ### REASONING: marker
             if use_cot_prompt:
-                prompts = [f"Q: {q}\nA: Let's think step by step." for q in questions]
+                prompts = [f"Q: {q}\nA: Let's think step by step.\n### REASONING:\n" for q in questions]
             else:
                 prompts = [f"Q: {q}\nA:" for q in questions]
 
@@ -628,6 +663,10 @@ class StandardizedEvaluator:
                 batch_size=batch_size,
             )
 
+            # DEBUG: track examples for analysis
+            debug_eval = os.environ.get("SLM_DEBUG_EVAL", "1").strip().lower() in {"1", "true", "yes"}
+            debug_shown = 0
+            
             for cont_text, cont_len, gold in tqdm(
                 list(zip(conts, cont_lens, golds)),
                 desc="Eval GSM8K",
@@ -638,6 +677,18 @@ class StandardizedEvaluator:
                     pred = extract_gsm8k_answer_first(cont_text)
                 else:
                     pred = extract_gsm8k_answer(cont_text)
+
+                # DEBUG: mostrar primeiros 10 exemplos para análise
+                if debug_eval and debug_shown < 10:
+                    is_correct = (pred == gold and gold != "")
+                    print(f"\n[DEBUG Eval GSM8K] Example {debug_shown}:")
+                    print(f"  Gold: '{gold}'")
+                    print(f"  Pred: '{pred}'")
+                    print(f"  Match: {is_correct}")
+                    print(f"  Generation (first 300 chars): {cont_text[:300]}...")
+                    has_marker = "### FINAL_ANSWER" in cont_text.upper()
+                    print(f"  Has ### FINAL_ANSWER marker: {has_marker}")
+                    debug_shown += 1
 
                 if pred == gold and gold != "":
                     correct += 1

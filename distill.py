@@ -571,6 +571,18 @@ class ReasoningAwareDistiller:
                 batch_size=int(self.config.kd_params.get("batch_size", 2)),
                 params=params,
             )
+            
+            # DEBUG: Sanity check - quantos teacher outputs têm resposta válida?
+            debug_train = os.environ.get("SLM_DEBUG_TRAIN", "1").strip().lower() in {"1", "true", "yes"}
+            if debug_train and cot_records:
+                n_with_reasoning = sum(1 for r in cot_records if r.get("teacher_reasoning", "").strip())
+                n_with_answer = sum(1 for r in cot_records if r.get("teacher_answer", "").strip())
+                n_with_marker = sum(1 for r in cot_records if "### FINAL_ANSWER" in (r.get("teacher_reasoning", "") + " " + r.get("teacher_answer", "")).upper())
+                print(f"\n[DEBUG CoT Records Stats]")
+                print(f"  Total records: {len(cot_records)}")
+                print(f"  With reasoning: {n_with_reasoning} ({100*n_with_reasoning/len(cot_records):.1f}%)")
+                print(f"  With answer: {n_with_answer} ({100*n_with_answer/len(cot_records):.1f}%)")
+                print(f"  NOTE: Teacher generates continuation, markers should be in target, not parsed fields")
 
         # NOTE: logits/CoT caches were removed; all teacher signals are computed on-the-fly.
 
@@ -666,6 +678,19 @@ class ReasoningAwareDistiller:
         prompts = [e["prompt"] for e in examples]
         targets = [e["teacher_full"] for e in examples]
         full_sequences = [p + t for p, t in zip(prompts, targets)]
+        
+        # DEBUG: mostrar primeiras sequências de treino
+        debug_train = os.environ.get("SLM_DEBUG_TRAIN", "1").strip().lower() in {"1", "true", "yes"}
+        if debug_train and len(full_sequences) > 0:
+            print("\n[DEBUG Training Data] First 3 full sequences:")
+            for i in range(min(3, len(full_sequences))):
+                print(f"\n=== Example {i} ===")
+                print(f"Prompt:\n{prompts[i]}")
+                print(f"Target:\n{targets[i][:300]}...")
+                has_reasoning = "### REASONING" in full_sequences[i].upper()
+                has_final = "### FINAL_ANSWER" in full_sequences[i].upper()
+                print(f"Has ### REASONING: {has_reasoning}")
+                print(f"Has ### FINAL_ANSWER: {has_final}")
 
         tok_prompts = student_tokenizer(prompts, truncation=True, padding="max_length", max_length=self.config.max_length, return_tensors="pt")
         prompt_lengths = tok_prompts["attention_mask"].sum(dim=1)

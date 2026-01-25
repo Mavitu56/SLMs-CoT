@@ -88,16 +88,16 @@ class EvidenceBasedConfig:
     #   - batch_size aumentado para A100 (80GB suporta 8, 40GB suporta 4-6)
     kd_params: Dict[str, Any] = field(
         default_factory=lambda: {
-            "temperature_schedule": [2.0, 1.5, 1.0],  # Antes: [5.0, 3.0, 1.0] - causava instabilidade
-            "alpha_schedule": [0.5, 0.4, 0.3],  # Antes: [0.7, 0.5, 0.3] - muito peso no KD loss
-            "learning_rates": {"kd": 3e-5},  # Antes: 5e-5 - reduzido para estabilidade
-            "lora_rank": 16,
-            "epochs": 3,  # Antes: 4 - suficiente com batch maior
+            "temperature_schedule": [2.0, 1.5, 1.0],  # Suavizado para estabilidade
+            "alpha_schedule": [0.3, 0.2, 0.1],  # REDUZIDO: mais peso na CE (student aprende do texto, não só logits)
+            "learning_rates": {"kd": 5e-5},  # AUMENTADO: 3e-5 era muito conservador
+            "lora_rank": 32,  # AUMENTADO: mais capacidade de aprendizado (antes: 16)
+            "epochs": 4,  # AUMENTADO: mais tempo para convergir (antes: 3)
             # A100: 80GB suporta batch=8, 40GB suporta batch=4-6
             # Qwen vocab (~150k) continua exigindo cuidado com (B,T,V) tensors
-            "batch_size": 4,  # Antes: 2 - A100 permite mais
-            "grad_accum_steps": 4,  # Antes: 6 - compensado pelo batch maior (effective=16)
-            "clip_grad_norm": 0.5,  # Antes: 1.0 - mais agressivo para estabilidade
+            "batch_size": 4,  # A100 permite mais
+            "grad_accum_steps": 4,  # Effective batch = 16
+            "clip_grad_norm": 1.0,  # Relaxado um pouco (antes: 0.5 era muito agressivo)
             "dataloader_num_workers": 2,  # Antes: 0 - A100 tem CPU suficiente
         }
     )
@@ -126,8 +126,10 @@ class EvidenceBasedConfig:
     experiments_dir: Path = field(init=False)
 
     # Defaults for the hypothesis H1 experiment
+    # NOTA: max_new_tokens do teacher aumentado para garantir que o modelo
+    # consiga gerar raciocínio completo + marcador ### FINAL_ANSWER: + resposta
     teacher_cot_generation: GenerationConfig = field(
-        default_factory=lambda: GenerationConfig(max_new_tokens=128, temperature=0.0, do_sample=False)
+        default_factory=lambda: GenerationConfig(max_new_tokens=256, temperature=0.0, do_sample=False)
     )
     eval_generation: GenerationConfig = field(
         default_factory=lambda: GenerationConfig(max_new_tokens=192, temperature=0.0, do_sample=False)
