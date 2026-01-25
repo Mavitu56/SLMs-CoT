@@ -114,6 +114,52 @@ def _batched_generate_continuations(
     return outs
 
 
+def _clean_teacher_reasoning(text: str) -> str:
+    """Remove prompt contamination from teacher-generated reasoning.
+    
+    Teacher may generate garbage when prompt is truncated:
+    - May include partial question text at the start
+    - May repeat 'Q:', 'A:', 'Let's think step by step' markers
+    
+    This function cleans up the reasoning to only keep actual reasoning content.
+    """
+    if not text:
+        return ""
+    
+    # If text starts with ### REASONING: marker, skip it
+    m = re.search(r"^###\s*REASONING\s*:\s*", text, flags=re.IGNORECASE)
+    if m:
+        text = text[m.end():].strip()
+    
+    # Remove any "Q:" or "A:" markers at the beginning (indicates contamination)
+    # Keep removing until we get to clean reasoning content
+    while True:
+        text = text.strip()
+        if not text:
+            break
+        
+        # Check for common contamination patterns at the start
+        patterns_to_remove = [
+            r"^Q:\s*[^\n]*\n?",  # Q: ... question text
+            r"^A:\s*[^\n]*\n?",  # A: ... 
+            r"^Let's think step by step\.?\s*\n?",
+            r"^###\s*REASONING\s*:\s*",  # Repeated marker
+        ]
+        
+        removed_any = False
+        for pat in patterns_to_remove:
+            m = re.match(pat, text, flags=re.IGNORECASE)
+            if m:
+                text = text[m.end():].strip()
+                removed_any = True
+                break
+        
+        if not removed_any:
+            break
+    
+    return text.strip()
+
+
 def _parse_teacher_completion(
     completion: str,
     *,
@@ -127,6 +173,7 @@ def _parse_teacher_completion(
     - post-CoT: <answer>\n### REASONING:\n<reasoning>
 
     Parsing is best-effort; if missing markers, we fall back conservatively.
+    Applies _clean_teacher_reasoning to remove prompt contamination.
     """
 
     text = (completion or "").strip()
@@ -137,21 +184,21 @@ def _parse_teacher_completion(
         m = re.search(r"###\s*REASONING\s*:\s*", text, flags=re.IGNORECASE)
         if m:
             ans = text[: m.start()].strip()
-            reasoning = text[m.end() :].strip()
+            reasoning = _clean_teacher_reasoning(text[m.end() :].strip())
             if not ans and gold_answer:
                 ans = gold_answer.strip()
             return reasoning, ans
         # No marker: treat first line as answer, remainder as reasoning.
         lines = text.splitlines()
         ans = (lines[0] if lines else "").strip()
-        reasoning = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+        reasoning = _clean_teacher_reasoning("\n".join(lines[1:]).strip()) if len(lines) > 1 else ""
         if not ans and gold_answer:
             ans = gold_answer.strip()
         return reasoning, ans
 
     m = re.search(r"###\s*FINAL_ANSWER\s*:\s*", text, flags=re.IGNORECASE)
     if m:
-        reasoning = text[: m.start()].strip()
+        reasoning = _clean_teacher_reasoning(text[: m.start()].strip())
         ans = text[m.end() :].strip()
         if not ans and gold_answer:
             ans = gold_answer.strip()
@@ -159,7 +206,7 @@ def _parse_teacher_completion(
 
     # No marker: if we have a gold answer, keep completion as reasoning.
     if gold_answer:
-        return text, gold_answer.strip()
+        return _clean_teacher_reasoning(text), gold_answer.strip()
 
     # Otherwise, heuristic: last non-empty line as answer.
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -167,7 +214,7 @@ def _parse_teacher_completion(
         return "", ""
     if len(lines) == 1:
         return "", lines[0]
-    return "\n".join(lines[:-1]).strip(), lines[-1].strip()
+    return _clean_teacher_reasoning("\n".join(lines[:-1]).strip()), lines[-1].strip()
 
 
 @dataclass
@@ -220,22 +267,22 @@ def generate_teacher_cot_records(
     else:
         levels = [int(params.granularity_level or 0)]
 
-    # Optional one-shot prefix.
-    one_shot_prefix = None
-    if bool(params.one_shot):
-        # Keep demo short and generic (no dataset-specific leakage).
+    # CRÍTICO: SEMPRE usar one-shot prefix para o teacher saber o formato esperado
+    # Sem isso, o teacher não sabe que deve terminar com ### FINAL_ANSWER: <answer>
+    # Keep demo short and generic (no dataset-specific leakage).
+    if bool(params.post_cot_gold_rationale) and bool(params.post_cot):
+        one_shot_prefix = build_one_shot_teacher_demo_for_post_cot_gold_rationale(
+            question="If you have 2 apples and buy 3 more, how many apples do you have?",
+            answer="5",
+            reasoning="Because 2 + 3 = 5.",
+        )
+    else:
         one_shot_prefix = build_one_shot_demo(
             question="If you have 2 apples and buy 3 more, how many apples do you have?",
             answer="5",
-            reasoning="Start with 2 and add 3 to get 5.",
+            reasoning="Start with 2 apples. Add 3 more. 2 + 3 = 5 apples total.",
             post_cot=bool(params.post_cot),
         )
-        if bool(params.post_cot_gold_rationale) and bool(params.post_cot):
-            one_shot_prefix = build_one_shot_teacher_demo_for_post_cot_gold_rationale(
-                question="If you have 2 apples and buy 3 more, how many apples do you have?",
-                answer="5",
-                reasoning="Because 2 + 3 = 5.",
-            )
 
     records: List[Dict[str, Any]] = []
 

@@ -69,7 +69,7 @@ class EvidenceBasedConfig:
     device: torch.device = field(
         default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
-    max_length: int = 512
+    max_length: int = 1024  # Aumentado de 512 - prompts longos eram truncados
 
     # Limits (ajustados para resultados científicos mais robustos)
     # GSM8K train tem ~7.5k exemplos; usar 5000 cobre ~67% do dataset
@@ -129,10 +129,11 @@ class EvidenceBasedConfig:
     # NOTA: max_new_tokens do teacher aumentado para garantir que o modelo
     # consiga gerar raciocínio completo + marcador ### FINAL_ANSWER: + resposta
     teacher_cot_generation: GenerationConfig = field(
-        default_factory=lambda: GenerationConfig(max_new_tokens=256, temperature=0.0, do_sample=False)
+        default_factory=lambda: GenerationConfig(max_new_tokens=512, temperature=0.0, do_sample=False)
     )
+    # Eval também precisa de mais tokens para gerar raciocínio + ### FINAL_ANSWER:
     eval_generation: GenerationConfig = field(
-        default_factory=lambda: GenerationConfig(max_new_tokens=192, temperature=0.0, do_sample=False)
+        default_factory=lambda: GenerationConfig(max_new_tokens=384, temperature=0.0, do_sample=False)
     )
 
     # Hypothesis (kept as documentation metadata)

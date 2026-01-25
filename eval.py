@@ -645,9 +645,18 @@ class StandardizedEvaluator:
 
         else:
             # Single-pass generation.
-            # IMPORTANT: prompt must match training format with ### REASONING: marker
+            # IMPORTANT: prompt must match training format with one-shot + explicit instruction
+            # O one-shot + instrução explícita ensina o modelo o formato esperado
+            one_shot_demo = (
+                "Example:\n"
+                "Q: If you have 2 apples and buy 3 more, how many apples do you have?\n"
+                "A: Let's think step by step. After reasoning, conclude with ### FINAL_ANSWER: <number>\n"
+                "### REASONING:\n"
+                "Start with 2 apples. Add 3 more. 2 + 3 = 5 apples total.\n"
+                "### FINAL_ANSWER: 5\n\n"
+            )
             if use_cot_prompt:
-                prompts = [f"Q: {q}\nA: Let's think step by step.\n### REASONING:\n" for q in questions]
+                prompts = [f"{one_shot_demo}Q: {q}\nA: Let's think step by step. After reasoning, conclude with ### FINAL_ANSWER: <number>\n### REASONING:\n" for q in questions]
             else:
                 prompts = [f"Q: {q}\nA:" for q in questions]
 

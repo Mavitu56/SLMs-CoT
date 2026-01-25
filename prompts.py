@@ -112,7 +112,9 @@ def build_cot_prompt(
         prompt = prefix + base + "\n### FINAL_ANSWER:\n"
         return prompt, PROMPT_VERSION
 
-    base = f"Q: {q}\nA: Let's think step by step."
+    # CRITICAL: Explicitly instruct model to end with ### FINAL_ANSWER: <number>
+    # Without this, teacher may not generate the marker, breaking downstream parsing
+    base = f"Q: {q}\nA: Let's think step by step. After reasoning, conclude with ### FINAL_ANSWER: <number>"
     if instr:
         base = base + f"\n[{PROMPT_VERSION}; granularity={int(max(1, min(6, int(granularity_level))))}] {instr}"
     prompt = prefix + base + "\n### REASONING:\n"
@@ -143,10 +145,12 @@ def build_one_shot_demo(
             + f"{r}\n"
         )
 
+    # Pre-CoT: reasoning first, then final answer
+    # MUST match the instruction in build_cot_prompt
     return (
         "Example:\n"
         + f"Q: {q}\n"
-        + "A: Let's think step by step.\n"
+        + "A: Let's think step by step. After reasoning, conclude with ### FINAL_ANSWER: <number>\n"
         + "### REASONING:\n"
         + f"{r}\n"
         + "### FINAL_ANSWER: "
