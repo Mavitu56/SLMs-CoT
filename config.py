@@ -71,10 +71,12 @@ class EvidenceBasedConfig:
     )
     max_length: int = 512
 
-    # Limits (for Colab runtime practicality)
-    train_limit: Optional[int] = 3000
-    eval_limit_gsm8k: int = 100
-    eval_limit_bbh: int = 30
+    # Limits (ajustados para resultados científicos mais robustos)
+    # GSM8K train tem ~7.5k exemplos; usar 5000 cobre ~67% do dataset
+    train_limit: Optional[int] = 5000  # Antes: 3000 - aumentado para melhor generalização
+    # Avaliação com mais exemplos reduz variância e aumenta confiabilidade estatística
+    eval_limit_gsm8k: int = 300  # Antes: 100 - GSM8K test tem 1319 exemplos
+    eval_limit_bbh: int = 100   # Antes: 30 - mais exemplos por task
     # OOD commonsense (eval-only; not part of primary hypothesis by default)
     eval_limit_obqa: int = 200
 

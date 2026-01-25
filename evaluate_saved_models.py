@@ -85,6 +85,7 @@ def _load_model_and_tokenizer(model_dir: Path, device: torch.device, load_dtype:
     """Load either a full HF model dir (config.json) or a PEFT adapter dir (adapter_config.json)."""
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer.padding_side = "left"  # Required for decoder-only models (Qwen, LLaMA, etc.)
     tokenizer_len = len(tokenizer)
 
     model_kwargs: Dict[str, Any] = {}

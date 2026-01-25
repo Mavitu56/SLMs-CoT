@@ -838,6 +838,7 @@ def _load_model_and_tokenizer_from_dir(model_dir: Path, device: torch.device, qu
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     tokenizer.model_max_length = get_safe_tokenizer_length(tokenizer, fallback=2048, upper_bound=4096)
+    tokenizer.padding_side = "left"  # Required for decoder-only models (Qwen, LLaMA, etc.)
     tokenizer_len = len(tokenizer)
 
     model_kwargs: Dict[str, Any] = {}
@@ -1287,6 +1288,7 @@ def assert_tokenizer_compatible_for_logits_kd(teacher_tokenizer, student_tokeniz
 def setup_model_and_tokenizer(model_name: str, device: torch.device, quant_cfg: Dict[str, Any]):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.model_max_length = get_safe_tokenizer_length(tokenizer, fallback=2048, upper_bound=4096)
+    tokenizer.padding_side = "left"  # Required for decoder-only models (Qwen, LLaMA, etc.)
 
     model_kwargs: Dict[str, Any] = {}
     if bool(quant_cfg.get("load_in_4bit")):
