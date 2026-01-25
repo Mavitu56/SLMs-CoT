@@ -159,16 +159,28 @@ def extract_gsm8k_answer(text: str) -> str:
     if not text:
         return ""
     
-    # Check for ### FINAL_ANSWER: marker first (matches training format)
+    # Check for ### FINAL_ANSWER: marker - use LAST occurrence with real number
+    # Teacher/student may repeat placeholder '<number>' before giving real answer
     if "### FINAL_ANSWER" in text.upper():
-        m = re.search(r"###\s*FINAL_ANSWER\s*:\s*(.+)", text, flags=re.IGNORECASE)
-        if m:
-            ans = m.group(1).strip()
-            # Extract just the number from the answer
-            nums = re.findall(r"[\d,]+\.?\d*", ans)
-            if nums:
-                return _normalize_gsm8k_number(nums[0])
-            return ans.split()[0] if ans else ""
+        matches = list(re.finditer(r"###\s*FINAL_ANSWER\s*:\s*", text, flags=re.IGNORECASE))
+        
+        # Try matches from last to first, looking for one with a real number
+        for m in reversed(matches):
+            ans_text = text[m.end():].strip()
+            # Get first line as answer
+            ans_line = ans_text.split('\n')[0].strip() if ans_text else ""
+            ans_token = ans_line.split()[0] if ans_line.split() else ""
+            
+            # Skip if this is the placeholder '<number>'
+            if ans_token and ans_token != "<number>" and not ans_token.startswith("<"):
+                # Extract just the number from the answer
+                nums = re.findall(r"[\d,]+\.?\d*", ans_token)
+                if nums:
+                    return _normalize_gsm8k_number(nums[0])
+                # If no number in first token, try the whole line
+                nums = re.findall(r"[\d,]+\.?\d*", ans_line)
+                if nums:
+                    return _normalize_gsm8k_number(nums[0])
     
     if "####" in text:
         ans = text.split("####")[-1].strip()

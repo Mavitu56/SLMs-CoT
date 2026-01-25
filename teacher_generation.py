@@ -117,9 +117,10 @@ def _batched_generate_continuations(
 def _clean_teacher_reasoning(text: str) -> str:
     """Remove prompt contamination from teacher-generated reasoning.
     
-    Teacher may generate garbage when prompt is truncated:
-    - May include partial question text at the start
+    Teacher may generate garbage when it repeats prompt instructions:
+    - May include partial instruction text like "step by step. After reasoning..."
     - May repeat 'Q:', 'A:', 'Let's think step by step' markers
+    - May include placeholder text like '<number>'
     
     This function cleans up the reasoning to only keep actual reasoning content.
     """
@@ -142,8 +143,13 @@ def _clean_teacher_reasoning(text: str) -> str:
         patterns_to_remove = [
             r"^Q:\s*[^\n]*\n?",  # Q: ... question text
             r"^A:\s*[^\n]*\n?",  # A: ... 
-            r"^Let's think step by step\.?\s*\n?",
+            r"^Let's think step by step[^#]*",  # Full instruction including "After reasoning..."
+            r"^step by step[^#]*",  # Partial instruction
+            r"^After reasoning[^#]*",  # Partial instruction
             r"^###\s*REASONING\s*:\s*",  # Repeated marker
+            r"^###\s*FINAL_ANSWER\s*:\s*<number>\s*\n?",  # Placeholder answer
+            r"^<number>\s*\n?",  # Just placeholder
+            r"^conclude with[^#]*",  # Partial instruction
         ]
         
         removed_any = False
@@ -160,6 +166,46 @@ def _clean_teacher_reasoning(text: str) -> str:
     return text.strip()
 
 
+def _extract_final_answer_from_completion(text: str, gold_answer: str) -> Tuple[str, str]:
+    """Extract the LAST ### FINAL_ANSWER from the completion.
+    
+    Teacher may generate the placeholder '<number>' first (from repeating instructions)
+    and the real answer later. We want the LAST occurrence with a real number.
+    """
+    if not text:
+        return "", (gold_answer or "").strip()
+    
+    # Find ALL occurrences of ### FINAL_ANSWER:
+    matches = list(re.finditer(r"###\s*FINAL_ANSWER\s*:\s*", text, flags=re.IGNORECASE))
+    
+    if not matches:
+        # No marker found
+        return text, (gold_answer or "").strip()
+    
+    # Try matches from last to first, looking for one with a real number
+    for m in reversed(matches):
+        ans_text = text[m.end():].strip()
+        # Get first line or first token as answer
+        ans_line = ans_text.split('\n')[0].strip() if ans_text else ""
+        ans_token = ans_line.split()[0] if ans_line.split() else ""
+        
+        # Check if this looks like a real answer (not <number> placeholder)
+        if ans_token and ans_token != "<number>" and not ans_token.startswith("<"):
+            # Found a real answer - extract reasoning (everything before this marker)
+            reasoning = text[:m.start()].strip()
+            # Extract just the number from the answer
+            nums = re.findall(r"[\d,]+\.?\d*", ans_token)
+            if nums:
+                return reasoning, nums[0].replace(",", "")
+            return reasoning, ans_token
+    
+    # All matches had placeholder, use gold answer
+    # Take reasoning from before the LAST marker
+    last_match = matches[-1]
+    reasoning = text[:last_match.start()].strip()
+    return reasoning, (gold_answer or "").strip()
+
+
 def _parse_teacher_completion(
     completion: str,
     *,
@@ -174,6 +220,7 @@ def _parse_teacher_completion(
 
     Parsing is best-effort; if missing markers, we fall back conservatively.
     Applies _clean_teacher_reasoning to remove prompt contamination.
+    Uses _extract_final_answer_from_completion to get the LAST real answer.
     """
 
     text = (completion or "").strip()
@@ -196,25 +243,10 @@ def _parse_teacher_completion(
             ans = gold_answer.strip()
         return reasoning, ans
 
-    m = re.search(r"###\s*FINAL_ANSWER\s*:\s*", text, flags=re.IGNORECASE)
-    if m:
-        reasoning = _clean_teacher_reasoning(text[: m.start()].strip())
-        ans = text[m.end() :].strip()
-        if not ans and gold_answer:
-            ans = gold_answer.strip()
-        return reasoning, ans
-
-    # No marker: if we have a gold answer, keep completion as reasoning.
-    if gold_answer:
-        return _clean_teacher_reasoning(text), gold_answer.strip()
-
-    # Otherwise, heuristic: last non-empty line as answer.
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return "", ""
-    if len(lines) == 1:
-        return "", lines[0]
-    return _clean_teacher_reasoning("\n".join(lines[:-1]).strip()), lines[-1].strip()
+    # Pre-CoT: Use smart extraction that handles repeated placeholder markers
+    reasoning, ans = _extract_final_answer_from_completion(text, gold_answer)
+    reasoning = _clean_teacher_reasoning(reasoning)
+    return reasoning, ans
 
 
 @dataclass
