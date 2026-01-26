@@ -59,9 +59,11 @@ class EvidenceBasedConfig:
         default_factory=lambda: {
             # Default to a single family to keep logits-KD scientifically valid
             # (token IDs must match across teacher/student).
-            "teacher_medium": "Qwen/Qwen2.5-7B-Instruct",
-            "student_primary": "Qwen/Qwen2.5-3B-Instruct",
-            "student_small": "Qwen/Qwen2.5-1.5B-Instruct",
+            # Teacher maior (14B) = raciocínio de melhor qualidade
+            # Student menor (0.5B) = mais fácil de treinar, menos overfitting
+            "teacher_medium": "Qwen/Qwen2.5-14B-Instruct",
+            "student_primary": "Qwen/Qwen2.5-0.5B-Instruct",
+            "student_small": "Qwen/Qwen2.5-0.5B-Instruct",
         }
     )
 
@@ -81,24 +83,23 @@ class EvidenceBasedConfig:
     eval_limit_obqa: int = 200
 
     # Distillation hyperparams (otimizado para Google Colab A100 40/80GB)
-    # Ajustes de estabilidade:
-    #   - temperature_schedule reduzido: evita amplificação excessiva da KL divergence
-    #   - alpha_schedule reduzido: mais peso na CE (ground-truth) para estabilidade
-    #   - clip_grad_norm mais agressivo: previne explosão de gradientes
-    #   - batch_size aumentado para A100 (80GB suporta 8, 40GB suporta 4-6)
+    # IMPORTANTE: Ajustes para EVITAR OVERFITTING
+    # Problema anterior: loss CE caiu para 0.19 (muito baixo = memorização)
+    # O modelo memorizou os exemplos mas não generaliza
+    # Solução: menos epochs, LR menor, regularização
     kd_params: Dict[str, Any] = field(
         default_factory=lambda: {
-            "temperature_schedule": [2.0, 1.5, 1.0],  # Suavizado para estabilidade
-            "alpha_schedule": [0.3, 0.2, 0.1],  # REDUZIDO: mais peso na CE (student aprende do texto, não só logits)
-            "learning_rates": {"kd": 5e-5},  # AUMENTADO: 3e-5 era muito conservador
-            "lora_rank": 32,  # AUMENTADO: mais capacidade de aprendizado (antes: 16)
-            "epochs": 4,  # AUMENTADO: mais tempo para convergir (antes: 3)
+            "temperature_schedule": [3.0, 2.5, 2.0],  # AUMENTADO: suaviza distribuição, evita overfitting
+            "alpha_schedule": [0.5, 0.4, 0.3],  # AUMENTADO: mais peso no KD (soft targets = regularização)
+            "learning_rates": {"kd": 2e-5},  # REDUZIDO: 5e-5 causava overfitting severo
+            "lora_rank": 16,  # REDUZIDO: menos parâmetros = menos overfitting
+            "epochs": 2,  # REDUZIDO: 4 epochs causava memorização total
             # A100: 80GB suporta batch=8, 40GB suporta batch=4-6
-            # Qwen vocab (~150k) continua exigindo cuidado com (B,T,V) tensors
-            "batch_size": 4,  # A100 permite mais
+            "batch_size": 4,
             "grad_accum_steps": 4,  # Effective batch = 16
-            "clip_grad_norm": 1.0,  # Relaxado um pouco (antes: 0.5 era muito agressivo)
-            "dataloader_num_workers": 2,  # Antes: 0 - A100 tem CPU suficiente
+            "clip_grad_norm": 1.0,
+            "weight_decay": 0.01,  # NOVO: regularização L2 para evitar overfitting
+            "dataloader_num_workers": 2,
         }
     )
 
@@ -132,8 +133,9 @@ class EvidenceBasedConfig:
         default_factory=lambda: GenerationConfig(max_new_tokens=512, temperature=0.0, do_sample=False)
     )
     # Eval também precisa de mais tokens para gerar raciocínio + ### FINAL_ANSWER:
+    # repetition_penalty aumentado para evitar loops de tokens repetidos
     eval_generation: GenerationConfig = field(
-        default_factory=lambda: GenerationConfig(max_new_tokens=384, temperature=0.0, do_sample=False)
+        default_factory=lambda: GenerationConfig(max_new_tokens=384, temperature=0.0, do_sample=False, repetition_penalty=1.2)
     )
 
     # Hypothesis (kept as documentation metadata)

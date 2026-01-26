@@ -260,7 +260,8 @@ class TraditionalKDDistiller:
         num_training_steps = num_epochs * len(dataloader)
         warmup_steps = int(0.1 * num_training_steps)
 
-        optimizer = torch.optim.AdamW(student_model.parameters(), lr=self.config.kd_params["learning_rates"]["kd"], weight_decay=0.01)
+        weight_decay = self.config.kd_params.get("weight_decay", 0.01)
+        optimizer = torch.optim.AdamW(student_model.parameters(), lr=self.config.kd_params["learning_rates"]["kd"], weight_decay=weight_decay)
         lr_scheduler = get_scheduler(
             name="cosine",
             optimizer=optimizer,
@@ -884,7 +885,8 @@ class ReasoningAwareDistiller:
         num_training_steps = num_epochs * len(dataloader)
         warmup_steps = int(0.1 * num_training_steps)
 
-        optimizer = torch.optim.AdamW(student_model.parameters(), lr=self.config.kd_params["learning_rates"]["kd"])
+        weight_decay = self.config.kd_params.get("weight_decay", 0.01)
+        optimizer = torch.optim.AdamW(student_model.parameters(), lr=self.config.kd_params["learning_rates"]["kd"], weight_decay=weight_decay)
         lr_scheduler = get_scheduler(
             name="cosine",
             optimizer=optimizer,
