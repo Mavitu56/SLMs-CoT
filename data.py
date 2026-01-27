@@ -28,7 +28,25 @@ def _maybe_limit(ds: HFDataset, limit: Optional[int]) -> HFDataset:
 
 
 def load_gsm8k(split: str = "train", limit: Optional[int] = None, seed: int = 42) -> HFDataset:
-    ds = load_dataset("gsm8k", "main", split=split)
+    # Try multiple dataset sources for GSM8K (original was deprecated/moved)
+    gsm8k_sources = [
+        ("openai/gsm8k", "main"),      # New official location
+        ("gsm8k", "main"),              # Original (may be unavailable)
+    ]
+    ds = None
+    last_error = None
+    for repo_id, config in gsm8k_sources:
+        try:
+            ds = load_dataset(repo_id, config, split=split, trust_remote_code=True)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    if ds is None:
+        raise RuntimeError(
+            f"Não foi possível carregar o GSM8K de nenhuma fonte conhecida. "
+            f"Último erro: {last_error}"
+        )
     ds = _maybe_limit(ds, limit)
 
     def format_ex(example: Dict[str, Any]) -> Dict[str, Any]:
