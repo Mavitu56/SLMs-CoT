@@ -46,9 +46,16 @@ class GenerationConfig:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = 1.1
+    # Stop sequences to prevent model from continuing beyond the answer
+    # These strings will be tokenized and used as additional EOS tokens
+    stop_sequences: Optional[List[str]] = None
 
     def to_jsonable(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Convert stop_sequences to list for JSON serialization
+        if d.get("stop_sequences") is not None:
+            d["stop_sequences"] = list(d["stop_sequences"])
+        return d
 
 
 @dataclass
@@ -62,7 +69,7 @@ class EvidenceBasedConfig:
             # Teacher maior (14B) = raciocínio de melhor qualidade
             # Student menor (0.5B) = mais fácil de treinar, menos overfitting
             "teacher_medium": "Qwen/Qwen2.5-14B-Instruct",
-            "student_primary": "Qwen/Qwen2.5-0.5B-Instruct",
+            "student_primary": "Qwen/Qwen2.5-0.5B-Instruct",    
             "student_small": "Qwen/Qwen2.5-0.5B-Instruct",
         }
     )
@@ -134,8 +141,16 @@ class EvidenceBasedConfig:
     )
     # Eval também precisa de mais tokens para gerar raciocínio + ### FINAL_ANSWER:
     # repetition_penalty aumentado para evitar loops de tokens repetidos
+    # stop_sequences: para quando encontrar "Q:" ou "\n\nQ:" (novo problema)
+    # Isso evita que o modelo continue gerando novos Q&A após responder
     eval_generation: GenerationConfig = field(
-        default_factory=lambda: GenerationConfig(max_new_tokens=384, temperature=0.0, do_sample=False, repetition_penalty=1.2)
+        default_factory=lambda: GenerationConfig(
+            max_new_tokens=384,
+            temperature=0.0,
+            do_sample=False,
+            repetition_penalty=1.2,
+            stop_sequences=["\nQ:", "\n\nQ:", "\nExample:", "\n\nExample:"]
+        )
     )
 
     # Hypothesis (kept as documentation metadata)

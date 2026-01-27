@@ -17,6 +17,59 @@ from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_p
 from prompts import build_cascod_answer_prompt, build_cascod_rationale_prompt
 
 
+def _truncate_at_stop_sequences(text: str, stop_sequences: Optional[List[str]]) -> str:
+    """Truncate generated text at the first occurrence of any stop sequence.
+    
+    This is a post-processing step to handle cases where the model doesn't
+    stop at the intended boundary (e.g., continues generating new Q&A pairs).
+    """
+    if not stop_sequences or not text:
+        return text
+    
+    earliest_pos = len(text)
+    for seq in stop_sequences:
+        pos = text.find(seq)
+        if pos != -1 and pos < earliest_pos:
+            earliest_pos = pos
+    
+    return text[:earliest_pos].strip() if earliest_pos < len(text) else text
+
+
+def _truncate_after_final_answer(text: str) -> str:
+    """Truncate text after ### FINAL_ANSWER: <number> to prevent continuation.
+    
+    The model should stop after providing the final answer, but sometimes
+    continues generating new Q&A pairs. This function ensures we only keep
+    the first complete answer.
+    """
+    if not text:
+        return text
+    
+    # Find ### FINAL_ANSWER: marker
+    import re
+    match = re.search(r"###\s*FINAL_ANSWER\s*:\s*", text, flags=re.IGNORECASE)
+    if not match:
+        return text
+    
+    # Extract the answer portion after the marker
+    after_marker = text[match.end():]
+    
+    # Find the end of the answer (first newline or end of string)
+    # The answer should be on the same line as the marker
+    lines = after_marker.split('\n')
+    if lines:
+        answer_line = lines[0].strip()
+        # Check if there's a number in the answer line
+        nums = re.findall(r"[\d,]+\.?\d*", answer_line)
+        if nums:
+            # Keep everything up to and including the answer
+            # Find where the answer ends (after the number)
+            answer_end = match.end() + len(answer_line)
+            return text[:answer_end].strip()
+    
+    return text
+
+
 def _batched_generate_continuations(
     model,
     tokenizer,
@@ -52,6 +105,33 @@ def _batched_generate_continuations(
     except Exception:
         pass
 
+    # Build stop token IDs from stop_sequences if provided
+    stop_token_ids = []
+    stop_sequences = getattr(gen_cfg, 'stop_sequences', None)
+    if stop_sequences:
+        for seq in stop_sequences:
+            try:
+                # Tokenize the stop sequence
+                ids = tokenizer.encode(seq, add_special_tokens=False)
+                if ids:
+                    # Use the first token as a stop signal
+                    # (HF generate can use eos_token_id as a list)
+                    stop_token_ids.extend(ids[:1])
+            except Exception:
+                pass
+    
+    # Combine with existing pad_token_id for eos_token_id parameter
+    eos_token_ids = None
+    if stop_token_ids:
+        # HF transformers >= 4.35 supports list of eos_token_id
+        base_eos = pad_token_id if pad_token_id is not None else getattr(tokenizer, 'eos_token_id', None)
+        if base_eos is not None:
+            eos_token_ids = list(set([base_eos] + stop_token_ids))
+        else:
+            eos_token_ids = list(set(stop_token_ids))
+    else:
+        eos_token_ids = pad_token_id
+
     for start in range(0, len(prompts), batch_size):
         chunk = prompts[start : start + batch_size]
         enc = tokenizer(
@@ -80,6 +160,7 @@ def _batched_generate_continuations(
                 top_p=gen_cfg.top_p,
                 top_k=gen_cfg.top_k,
                 pad_token_id=pad_token_id,
+                eos_token_id=eos_token_ids,
                 repetition_penalty=(gen_cfg.repetition_penalty or 1.0),
             )
 
@@ -89,7 +170,17 @@ def _batched_generate_continuations(
             out_row = outputs[row]
             cont_ids = out_row[in_len:]
             cont_token_lens.append(int(cont_ids.numel()))
-            continuations.append(tokenizer.decode(cont_ids, skip_special_tokens=True).strip())
+            
+            # Decode and apply post-processing
+            decoded = tokenizer.decode(cont_ids, skip_special_tokens=True).strip()
+            
+            # Apply stop sequence truncation (backup for token-level stopping)
+            decoded = _truncate_at_stop_sequences(decoded, stop_sequences)
+            
+            # Truncate after final answer to prevent continuation
+            decoded = _truncate_after_final_answer(decoded)
+            
+            continuations.append(decoded)
 
     return continuations, cont_token_lens
 
@@ -159,26 +250,26 @@ def extract_gsm8k_answer(text: str) -> str:
     if not text:
         return ""
     
-    # Check for ### FINAL_ANSWER: marker - use LAST occurrence with real number
-    # Teacher/student may repeat placeholder '<number>' before giving real answer
+    # Check for ### FINAL_ANSWER: marker - use FIRST occurrence with real number
+    # After post-processing truncation, there should only be one marker
+    # But we still skip placeholder '<number>' tokens
     if "### FINAL_ANSWER" in text.upper():
-        matches = list(re.finditer(r"###\s*FINAL_ANSWER\s*:\s*", text, flags=re.IGNORECASE))
+        match = re.search(r"###\s*FINAL_ANSWER\s*:\s*", text, flags=re.IGNORECASE)
         
-        # Try matches from last to first, looking for one with a real number
-        for m in reversed(matches):
-            ans_text = text[m.end():].strip()
+        if match:
+            ans_text = text[match.end():].strip()
             # Get first line as answer
             ans_line = ans_text.split('\n')[0].strip() if ans_text else ""
             ans_token = ans_line.split()[0] if ans_line.split() else ""
             
             # Skip if this is the placeholder '<number>'
             if ans_token and ans_token != "<number>" and not ans_token.startswith("<"):
-                # Extract just the number from the answer
-                nums = re.findall(r"[\d,]+\.?\d*", ans_token)
+                # Extract just the number from the answer token
+                nums = re.findall(r"-?[\d,]+\.?\d*", ans_token)
                 if nums:
                     return _normalize_gsm8k_number(nums[0])
                 # If no number in first token, try the whole line
-                nums = re.findall(r"[\d,]+\.?\d*", ans_line)
+                nums = re.findall(r"-?[\d,]+\.?\d*", ans_line)
                 if nums:
                     return _normalize_gsm8k_number(nums[0])
     
