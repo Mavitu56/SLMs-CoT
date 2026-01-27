@@ -669,7 +669,25 @@ class StandardizedEvaluator:
     ) -> Dict[str, Any]:
         from datasets import load_dataset
 
-        ds = load_dataset("gsm8k", "main", split="test")
+        # Try multiple dataset sources for GSM8K (original was deprecated/moved)
+        gsm8k_sources = [
+            ("openai/gsm8k", "main"),      # New official location
+            ("gsm8k", "main"),              # Original (may be unavailable)
+        ]
+        ds = None
+        last_error = None
+        for repo_id, config in gsm8k_sources:
+            try:
+                ds = load_dataset(repo_id, config, split="test", trust_remote_code=True)
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        if ds is None:
+            raise RuntimeError(
+                f"Não foi possível carregar o GSM8K de nenhuma fonte conhecida. "
+                f"Último erro: {last_error}"
+            )
         limit = min(self.config.eval_limit_gsm8k, len(ds))
         rng = np.random.RandomState(seed)
         indices = rng.choice(len(ds), limit, replace=False)
