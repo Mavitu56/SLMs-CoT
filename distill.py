@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -20,6 +20,7 @@ from config import (
     set_seed,
 )
 from prompts import build_cot_prompt
+from utils import env_flag, env_float, env_int, sanitize_logits, has_nonfinite
 
 
 def _resolve_amp_device_type(device: torch.device) -> str:
@@ -154,7 +155,7 @@ class TraditionalKDDistiller:
         set_seed(seed)
         device = self.config.device
         if teacher_model is None:
-            raise ValueError("teacher_model precisa ser fornecido para logits-KD sem persistência em disco.")
+            raise ValueError("teacher_model precisa ser fornecido para logits-KD sem persistÃªncia em disco.")
 
         # Optional checkpointing diagnostics (env-driven).
         # These help pinpoint when training starts to drift.
@@ -163,54 +164,19 @@ class TraditionalKDDistiller:
         ckpt_root = os.environ.get("SLM_KD_CKPT_DIR")
         ckpt_root_path = Path(ckpt_root) if ckpt_root else None
 
-        def _env_flag(name: str, default: str = "0") -> bool:
-            v = os.environ.get(name, default)
-            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-        def _env_float(name: str, default: float) -> float:
-            v = os.environ.get(name)
-            if v is None:
-                return float(default)
-            try:
-                return float(str(v).strip())
-            except Exception:
-                return float(default)
-
-        def _env_int(name: str, default: int) -> int:
-            v = os.environ.get(name)
-            if v is None:
-                return int(default)
-            try:
-                return int(str(v).strip())
-            except Exception:
-                return int(default)
-
-        # Debug/stability knobs (env-driven to avoid changing CLI/Config surface).
-        debug_nan = _env_flag("SLM_KD_DEBUG_NAN", "1")
-        log_every = max(1, _env_int("SLM_KD_LOG_EVERY", 50))
-        skip_nonfinite_batch = _env_flag("SLM_KD_SKIP_NONFINITE_BATCH", "1")
-        save_every_epoch = _env_flag("SLM_KD_SAVE_EVERY_EPOCH", "0")
-        clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 0.5))  # Padrão mais agressivo
+        # ConfiguraÃ§Ãµes de debug/estabilidade via env vars
+        debug_nan = env_flag("SLM_KD_DEBUG_NAN", "1")
+        log_every = max(1, env_int("SLM_KD_LOG_EVERY", 50))
+        skip_nonfinite_batch = env_flag("SLM_KD_SKIP_NONFINITE_BATCH", "1")
+        save_every_epoch = env_flag("SLM_KD_SAVE_EVERY_EPOCH", "0")
+        clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 0.5))
         clip_grad_norm = float(os.environ.get("SLM_KD_CLIP_GRAD_NORM", clip_grad_norm))
-        max_logit_abs = _env_float("SLM_KD_MAX_LOGIT_ABS", 50.0)  # Antes: 100.0 - reduzido para estabilidade
-        apply_logit_sanitize = _env_flag("SLM_KD_SANITIZE_LOGITS", "1")
-        # Guardrail: batches com poucos tokens supervisionados são instáveis
-        min_supervised_tokens = _env_int("SLM_KD_MIN_SUPERVISED_TOKENS", 8)
+        max_logit_abs = env_float("SLM_KD_MAX_LOGIT_ABS", 50.0)
+        apply_logit_sanitize = env_flag("SLM_KD_SANITIZE_LOGITS", "1")
+        min_supervised_tokens = env_int("SLM_KD_MIN_SUPERVISED_TOKENS", 8)
 
-        def _sanitize_logits(x: torch.Tensor) -> torch.Tensor:
-            if not apply_logit_sanitize:
-                return x
-            # Replace NaN/inf to keep softmax/log_softmax stable.
-            x = torch.nan_to_num(x, nan=0.0, posinf=max_logit_abs, neginf=-max_logit_abs)
-            if max_logit_abs > 0:
-                x = x.clamp(min=-max_logit_abs, max=max_logit_abs)
-            return x
-
-        def _has_nonfinite(x: torch.Tensor) -> bool:
-            try:
-                return bool((~torch.isfinite(x)).any().item())
-            except Exception:
-                return True
+        def _sanitize(x: torch.Tensor) -> torch.Tensor:
+            return sanitize_logits(x, max_logit_abs, apply_logit_sanitize)
 
         tokenized = preprocess_and_tokenize(raw_dataset, student_tokenizer, max_length=self.config.max_length)
         student_model = self._ensure_vocab_alignment(student_model, student_tokenizer)
@@ -306,23 +272,23 @@ class TraditionalKDDistiller:
                     t_out = teacher_model(**inputs)
                     teacher_logits = self._align_teacher_logits(t_out.logits, vocab_size)
                     teacher_logits = teacher_logits.to(dtype=torch.float32)
-                    if _has_nonfinite(teacher_logits):
+                    if has_nonfinite(teacher_logits):
                         nonfinite_teacher_shards += 1
                         if debug_nan:
-                            print(f" (warn) teacher_model produziu logits não-finitos em epoch={epoch} batch={batch_idx}")
-                        teacher_logits = _sanitize_logits(teacher_logits)
+                            print(f" (warn) teacher_model produziu logits nÃ£o-finitos em epoch={epoch} batch={batch_idx}")
+                        teacher_logits = _sanitize(teacher_logits)
                 # Forward can be AMP, but compute losses in fp32 outside autocast.
                 with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
 
                 s_logits_f32 = s_logits.to(dtype=torch.float32)
-                if _has_nonfinite(s_logits_f32):
+                if has_nonfinite(s_logits_f32):
                     nonfinite_student_logits += 1
                     if debug_nan:
-                        print(f" (warn) student logits não-finitos em epoch={epoch} batch={batch_idx}")
-                    s_logits_f32 = _sanitize_logits(s_logits_f32)
+                        print(f" (warn) student logits nÃ£o-finitos em epoch={epoch} batch={batch_idx}")
+                    s_logits_f32 = _sanitize(s_logits_f32)
 
-                teacher_logits = _sanitize_logits(teacher_logits)
+                teacher_logits = _sanitize(teacher_logits)
 
                 vocab_size = s_logits_f32.size(-1)
                 # Safe CE: compute only over supervised positions to avoid NaN when
@@ -344,7 +310,7 @@ class TraditionalKDDistiller:
                 kd_loss *= temperature**2
                 loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
 
-                if _has_nonfinite(loss) or _has_nonfinite(kd_loss) or _has_nonfinite(ce_loss):
+                if has_nonfinite(loss) or has_nonfinite(kd_loss) or has_nonfinite(ce_loss):
                     nonfinite_batches += 1
                     if debug_nan:
                         lr_now = None
@@ -353,7 +319,7 @@ class TraditionalKDDistiller:
                         except Exception:
                             pass
                         print(
-                            " (warn) loss não-finita; pulando batch. "
+                            " (warn) loss nÃ£o-finita; pulando batch. "
                             f"epoch={epoch} batch={batch_idx} lr={lr_now} "
                             f"loss={float(loss.detach().cpu().item()) if torch.isfinite(loss).all() else 'nonfinite'} "
                             f"kd={float(kd_loss.detach().cpu().item()) if torch.isfinite(kd_loss).all() else 'nonfinite'} "
@@ -361,7 +327,7 @@ class TraditionalKDDistiller:
                         )
                     optimizer.zero_grad(set_to_none=True)
                     if not skip_nonfinite_batch:
-                        raise RuntimeError("Encontrado loss/logits não-finitos durante KD. Veja logs acima.")
+                        raise RuntimeError("Encontrado loss/logits nÃ£o-finitos durante KD. Veja logs acima.")
                     continue
 
                 if grad_accum_steps > 1:
@@ -380,7 +346,7 @@ class TraditionalKDDistiller:
                     if (not (grad_norm_val == grad_norm_val)) or (grad_norm_val == float("inf")):
                         nonfinite_batches += 1
                         if debug_nan:
-                            print(f" (warn) grad_norm não-finito; zerando grad e pulando step. epoch={epoch} batch={batch_idx}")
+                            print(f" (warn) grad_norm nÃ£o-finito; zerando grad e pulando step. epoch={epoch} batch={batch_idx}")
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
                         continue
@@ -441,13 +407,13 @@ class TraditionalKDDistiller:
                         json.dumps(meta, ensure_ascii=False, indent=2, default=str),
                         encoding="utf-8",
                     )
-                    print(f" (ckpt) Salvo checkpoint intermediário: {out_dir}")
+                    print(f" (ckpt) Salvo checkpoint intermediÃ¡rio: {out_dir}")
                 except Exception as exc:
-                    print(f" (warn) Falha ao salvar checkpoint intermediário: {exc}")
+                    print(f" (warn) Falha ao salvar checkpoint intermediÃ¡rio: {exc}")
 
         if debug_nan and (nonfinite_batches or nonfinite_teacher_shards or nonfinite_student_logits):
             print(
-                " (dbg) Resumo numérico KD: "
+                " (dbg) Resumo numÃ©rico KD: "
                 f"nonfinite_batches={nonfinite_batches}, "
                 f"nonfinite_teacher_shards={nonfinite_teacher_shards}, "
                 f"nonfinite_student_logits={nonfinite_student_logits}"
@@ -487,55 +453,23 @@ class ReasoningAwareDistiller:
         set_seed(seed)
         device = self.config.device
 
-        def _env_flag(name: str, default: str = "0") -> bool:
-            v = os.environ.get(name, default)
-            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-        def _env_float(name: str, default: float) -> float:
-            v = os.environ.get(name)
-            if v is None:
-                return float(default)
-            try:
-                return float(str(v).strip())
-            except Exception:
-                return float(default)
-
-        def _env_int(name: str, default: int) -> int:
-            v = os.environ.get(name)
-            if v is None:
-                return int(default)
-            try:
-                return int(str(v).strip())
-            except Exception:
-                return int(default)
-
-        debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
-        log_every = max(1, _env_int("SLM_TRAIN_LOG_EVERY", 50))
-        skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
+        # ConfiguraÃ§Ãµes de debug/estabilidade via env vars
+        debug_nan = env_flag("SLM_TRAIN_DEBUG_NAN", "1")
+        log_every = max(1, env_int("SLM_TRAIN_LOG_EVERY", 50))
+        skip_nonfinite_batch = env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
         clip_grad_norm = float(self.config.kd_params.get("clip_grad_norm", 1.0))
         clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
-        max_logit_abs = _env_float("SLM_TRAIN_MAX_LOGIT_ABS", 100.0)
-        apply_logit_sanitize = _env_flag("SLM_TRAIN_SANITIZE_LOGITS", "1")
+        max_logit_abs = env_float("SLM_TRAIN_MAX_LOGIT_ABS", 100.0)
+        apply_logit_sanitize = env_flag("SLM_TRAIN_SANITIZE_LOGITS", "1")
 
-        # Reasoning mask QA controls (backward-compatible by default).
-        mask_fallback_to_completion = _env_flag("SLM_REASONING_MASK_FALLBACK_TO_COMPLETION", "1")
-        mask_strict = _env_flag("SLM_REASONING_MASK_STRICT", "0")
-        mask_max_fallback = _env_float("SLM_REASONING_MASK_MAX_FALLBACK", 0.30)
-        mask_min_reasoning_frac = _env_float("SLM_REASONING_MASK_MIN_REASONING_FRAC", 0.02)
+        # Reasoning mask QA controls
+        mask_fallback_to_completion = env_flag("SLM_REASONING_MASK_FALLBACK_TO_COMPLETION", "1")
+        mask_strict = env_flag("SLM_REASONING_MASK_STRICT", "0")
+        mask_max_fallback = env_float("SLM_REASONING_MASK_MAX_FALLBACK", 0.30)
+        mask_min_reasoning_frac = env_float("SLM_REASONING_MASK_MIN_REASONING_FRAC", 0.02)
 
-        def _sanitize_logits(x: torch.Tensor) -> torch.Tensor:
-            if not apply_logit_sanitize:
-                return x
-            x = torch.nan_to_num(x, nan=0.0, posinf=max_logit_abs, neginf=-max_logit_abs)
-            if max_logit_abs > 0:
-                x = x.clamp(min=-max_logit_abs, max=max_logit_abs)
-            return x
-
-        def _has_nonfinite(x: torch.Tensor) -> bool:
-            try:
-                return bool((~torch.isfinite(x)).any().item())
-            except Exception:
-                return True
+        def _sanitize(x: torch.Tensor) -> torch.Tensor:
+            return sanitize_logits(x, max_logit_abs, apply_logit_sanitize)
 
         if use_teacher_logits and teacher_model is None:
             raise ValueError("Precisa de teacher_model quando use_teacher_logits=True.")
@@ -573,7 +507,7 @@ class ReasoningAwareDistiller:
                 params=params,
             )
             
-            # DEBUG: Sanity check - quantos teacher outputs têm resposta válida?
+            # DEBUG: Sanity check - quantos teacher outputs tÃªm resposta vÃ¡lida?
             debug_train = os.environ.get("SLM_DEBUG_TRAIN", "1").strip().lower() in {"1", "true", "yes"}
             if debug_train and cot_records:
                 n_with_reasoning = sum(1 for r in cot_records if r.get("teacher_reasoning", "").strip())
@@ -610,7 +544,7 @@ class ReasoningAwareDistiller:
                     missing_answer += 1
 
             if bad_json:
-                msg = f"CoT records contém entradas não-dict: {bad_json}/{len(cot_records)}"
+                msg = f"CoT records contÃ©m entradas nÃ£o-dict: {bad_json}/{len(cot_records)}"
                 print(f"[WARN] {msg}")
             if missing_prompt or missing_reasoning or missing_answer:
                 msg = (
@@ -680,7 +614,7 @@ class ReasoningAwareDistiller:
         targets = [e["teacher_full"] for e in examples]
         full_sequences = [p + t for p, t in zip(prompts, targets)]
         
-        # DEBUG: mostrar primeiras sequências de treino
+        # DEBUG: mostrar primeiras sequÃªncias de treino
         debug_train = os.environ.get("SLM_DEBUG_TRAIN", "1").strip().lower() in {"1", "true", "yes"}
         if debug_train and len(full_sequences) > 0:
             print("\n[DEBUG Training Data] First 3 full sequences:")
@@ -970,12 +904,12 @@ class ReasoningAwareDistiller:
                 with autocast_ctx(device):
                     s_logits = student_model(**inputs).logits
 
-                s_logits_f32 = _sanitize_logits(s_logits.to(dtype=torch.float32))
-                if _has_nonfinite(s_logits_f32):
+                s_logits_f32 = _sanitize(s_logits.to(dtype=torch.float32))
+                if has_nonfinite(s_logits_f32):
                     nonfinite_student += 1
                     if debug_nan:
-                        print(f" (warn) student logits não-finitos (reasoning) epoch={epoch} batch={batch_idx}")
-                    s_logits_f32 = _sanitize_logits(s_logits_f32)
+                        print(f" (warn) student logits nÃ£o-finitos (reasoning) epoch={epoch} batch={batch_idx}")
+                    s_logits_f32 = _sanitize(s_logits_f32)
 
                 vocab_size = s_logits_f32.size(-1)
 
@@ -992,11 +926,11 @@ class ReasoningAwareDistiller:
                             teacher_logits = teacher_model(**inputs).logits
                             teacher_logits = teacher_logits.to(dtype=torch.float32)
                     teacher_logits = self._align_teacher_logits(teacher_logits, vocab_size)
-                    if _has_nonfinite(teacher_logits):
+                    if has_nonfinite(teacher_logits):
                         nonfinite_teacher += 1
                         if debug_nan:
-                            print(f" (warn) teacher logits não-finitos (reasoning) epoch={epoch} batch={batch_idx}")
-                    teacher_logits = _sanitize_logits(teacher_logits)
+                            print(f" (warn) teacher logits nÃ£o-finitos (reasoning) epoch={epoch} batch={batch_idx}")
+                    teacher_logits = _sanitize(teacher_logits)
 
                     t_probs = F.softmax(teacher_logits / float(temperature), dim=-1)
                     s_logp = F.log_softmax(s_logits_f32 / float(temperature), dim=-1)
@@ -1009,7 +943,7 @@ class ReasoningAwareDistiller:
                     kd_loss = torch.tensor(0.0, device=device)
                     loss = ce_loss
 
-                if _has_nonfinite(loss) or _has_nonfinite(ce_loss) or _has_nonfinite(kd_loss):
+                if has_nonfinite(loss) or has_nonfinite(ce_loss) or has_nonfinite(kd_loss):
                     nonfinite_batches += 1
                     if debug_nan:
                         lr_now = None
@@ -1018,14 +952,14 @@ class ReasoningAwareDistiller:
                         except Exception:
                             pass
                         print(
-                            " (warn) loss não-finita (reasoning); pulando batch. "
+                            " (warn) loss nÃ£o-finita (reasoning); pulando batch. "
                             f"epoch={epoch} batch={batch_idx} lr={lr_now} "
-                            f"ce={'nonfinite' if _has_nonfinite(ce_loss) else float(ce_loss.detach().cpu().item())} "
-                            f"kd={'nonfinite' if _has_nonfinite(kd_loss) else float(kd_loss.detach().cpu().item())}"
+                            f"ce={'nonfinite' if has_nonfinite(ce_loss) else float(ce_loss.detach().cpu().item())} "
+                            f"kd={'nonfinite' if has_nonfinite(kd_loss) else float(kd_loss.detach().cpu().item())}"
                         )
                     optimizer.zero_grad(set_to_none=True)
                     if not skip_nonfinite_batch:
-                        raise RuntimeError("Encontrado loss/logits não-finitos durante CoT/reasoning KD.")
+                        raise RuntimeError("Encontrado loss/logits nÃ£o-finitos durante CoT/reasoning KD.")
                     continue
 
                 if grad_accum_steps > 1:
@@ -1044,7 +978,7 @@ class ReasoningAwareDistiller:
                     if (not (grad_norm_val == grad_norm_val)) or (grad_norm_val == float("inf")):
                         nonfinite_batches += 1
                         if debug_nan:
-                            print(f" (warn) grad_norm não-finito (reasoning); pulando step. epoch={epoch} batch={batch_idx}")
+                            print(f" (warn) grad_norm nÃ£o-finito (reasoning); pulando step. epoch={epoch} batch={batch_idx}")
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
                         continue
@@ -1076,7 +1010,7 @@ class ReasoningAwareDistiller:
 
         if debug_nan and (nonfinite_batches or nonfinite_teacher or nonfinite_student):
             print(
-                " (dbg) Resumo numérico CoT/reasoning: "
+                " (dbg) Resumo numÃ©rico CoT/reasoning: "
                 f"nonfinite_batches={nonfinite_batches}, nonfinite_teacher={nonfinite_teacher}, nonfinite_student={nonfinite_student}"
             )
 

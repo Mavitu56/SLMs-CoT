@@ -20,99 +20,13 @@ from distill import ReasoningAwareDistiller, TraditionalKDDistiller, autocast_ct
 from prompts import build_cascod_answer_prompt, build_cascod_rationale_prompt
 from eval import StandardizedEvaluator
 from report import ScientificLogger, write_plots, write_report_json, write_summary_txt
-from stats import StatisticalAnalyst
+from utils import env_flag, env_int, collect_environment_metadata, tokenizer_fingerprint
+from baselines import generate_experiment_reports, cleanup_model, should_skip_run, save_run_state, create_run_payload, finalize_condition_results
+from cli import build_arg_parser
 
 
-def tokenizer_fingerprint(tokenizer) -> str:
-    """Compute a stable-ish fingerprint for tokenizer compatibility checks.
-
-    This replaces the old tokenizer fingerprinting; it's only used to gate
-    logits-KD when teacher/student tokenization differs.
-    
-    IMPORTANT: We intentionally do NOT include name_or_path because the same
-    tokenizer saved to different directories would produce different hashes,
-    even though the vocabulary is identical (e.g., Qwen teacher saved as
-    checkpoint vs Qwen student loaded from HuggingFace).
-    """
-
-    try:
-        vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else None
-    except Exception:
-        vocab = None
-
-    h = hashlib.sha256()
-    # Only include class name (not path) to avoid false negatives from saved checkpoints
-    h.update(str(getattr(tokenizer, "__class__", type(tokenizer)).__name__).encode("utf-8"))
-    h.update(b"\n")
-    # Compare vocab_size and special token IDs (the actual compatibility requirements)
-    for attr in ("vocab_size", "bos_token_id", "eos_token_id", "pad_token_id"):
-        h.update(f"{attr}={getattr(tokenizer, attr, None)}\n".encode("utf-8"))
-
-    if isinstance(vocab, dict) and vocab:
-        # Hash the token->id mapping deterministically.
-        try:
-            for token, idx in sorted(vocab.items(), key=lambda kv: (kv[0], kv[1])):
-                h.update(token.encode("utf-8", errors="ignore"))
-                h.update(b"=")
-                h.update(str(int(idx)).encode("utf-8"))
-                h.update(b"\n")
-        except Exception:
-            # Fall back to size-only.
-            h.update(f"vocab_len={len(vocab)}\n".encode("utf-8"))
-
-    return h.hexdigest()[:16]
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    v = os.environ.get(name, default)
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _collect_environment_metadata() -> Dict[str, Any]:
-    meta: Dict[str, Any] = {
-        "python_version": sys.version,
-        "platform": platform.platform(),
-        "executable": sys.executable,
-    }
-
-    # Optional libs (best-effort).
-    try:
-        import torch as _torch
-
-        meta["torch_version"] = getattr(_torch, "__version__", None)
-        meta["cuda_available"] = bool(_torch.cuda.is_available())
-        meta["cuda_version"] = getattr(_torch.version, "cuda", None)
-        try:
-            meta["cudnn_version"] = int(_torch.backends.cudnn.version() or 0)
-        except Exception:
-            meta["cudnn_version"] = None
-        if bool(_torch.cuda.is_available()):
-            try:
-                meta["gpu_name"] = str(_torch.cuda.get_device_name(0))
-            except Exception:
-                meta["gpu_name"] = None
-    except Exception:
-        pass
-
-    try:
-        import transformers as _transformers
-
-        meta["transformers_version"] = getattr(_transformers, "__version__", None)
-    except Exception:
-        pass
-    try:
-        import peft as _peft
-
-        meta["peft_version"] = getattr(_peft, "__version__", None)
-    except Exception:
-        pass
-    try:
-        import datasets as _datasets
-
-        meta["datasets_version"] = getattr(_datasets, "__version__", None)
-    except Exception:
-        pass
-    return meta
+# Removido: tokenizer_fingerprint, _env_flag, _collect_environment_metadata
+# Agora importados de utils.py
 
 
 def _train_sft_lora(
@@ -203,27 +117,14 @@ def _train_sft_lora(
 
     scaler = make_grad_scaler(device)
 
-    def _env_flag(name: str, default: str = "0") -> bool:
-        v = os.environ.get(name, default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-    def _env_int(name: str, default: int) -> int:
-        v = os.environ.get(name)
-        if v is None:
-            return int(default)
-        try:
-            return int(str(v).strip())
-        except Exception:
-            return int(default)
-
-    debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
-    skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
-    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 0.5))  # Padrão mais agressivo para estabilidade
+    debug_nan = env_flag("SLM_TRAIN_DEBUG_NAN", "1")
+    skip_nonfinite_batch = env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
+    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 0.5))
     try:
         clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
     except Exception:
         pass
-    log_every = max(1, _env_int("SLM_TRAIN_LOG_EVERY", 50))
+    log_every = max(1, env_int("SLM_TRAIN_LOG_EVERY", 50))
     metrics: Dict[str, Any] = {
         "epochs": num_epochs,
         "batch_size": batch_size,
@@ -419,27 +320,14 @@ def _train_cascod_lora(
 
     scaler = make_grad_scaler(device)
 
-    def _env_flag(name: str, default: str = "0") -> bool:
-        v = os.environ.get(name, default)
-        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-    def _env_int(name: str, default: int) -> int:
-        v = os.environ.get(name)
-        if v is None:
-            return int(default)
-        try:
-            return int(str(v).strip())
-        except Exception:
-            return int(default)
-
-    debug_nan = _env_flag("SLM_TRAIN_DEBUG_NAN", "1")
-    skip_nonfinite_batch = _env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
-    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 0.5))  # Padrão mais agressivo para estabilidade
+    debug_nan = env_flag("SLM_TRAIN_DEBUG_NAN", "1")
+    skip_nonfinite_batch = env_flag("SLM_TRAIN_SKIP_NONFINITE_BATCH", "1")
+    clip_grad_norm = float(cfg.kd_params.get("clip_grad_norm", 0.5))
     try:
         clip_grad_norm = float(os.environ.get("SLM_TRAIN_CLIP_GRAD_NORM", clip_grad_norm))
     except Exception:
         pass
-    log_every = max(1, _env_int("SLM_TRAIN_LOG_EVERY", 50))
+    log_every = max(1, env_int("SLM_TRAIN_LOG_EVERY", 50))
     metrics: Dict[str, Any] = {
         "epochs": num_epochs,
         "batch_size": batch_size,
@@ -1378,11 +1266,10 @@ def run_experiment(
     cascod_filter_by_gold: bool = True,
 ) -> Dict[str, Any]:
     logger = ScientificLogger()
-    analyst = StatisticalAnalyst(alpha=cfg.alpha_level)
     evaluator = StandardizedEvaluator(cfg)
 
     # Reproducibility controls (optional).
-    deterministic = _env_flag("SLM_DETERMINISTIC", "0")
+    deterministic = env_flag("SLM_DETERMINISTIC", "0")
     if bool(deterministic):
         try:
             torch.backends.cudnn.benchmark = False
@@ -1451,7 +1338,7 @@ def run_experiment(
 
     logger.log_phase("EXPERIMENT", {"id": exp_id, "dir": str(exp_dir), "flags": flags})
     logger.log_hyperparameters(cfg.to_metadata())
-    logger.log_phase("ENVIRONMENT", _collect_environment_metadata())
+    logger.log_phase("ENVIRONMENT", collect_environment_metadata())
 
     conditions: Dict[str, Dict[str, Any]] = {}
     if "traditional" in kd_modes:
@@ -1475,7 +1362,7 @@ def run_experiment(
     # Prepare datasets once per seed (training)
     results: Dict[str, Any] = {"metadata": cfg.to_metadata(), "conditions": {}, "eval_protocols": {}}
     eval_protocol_strict = str(os.environ.get("SLM_EVAL_PROTOCOL_STRICT", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
-    results["metadata"].setdefault("environment", _collect_environment_metadata())
+    results["metadata"].setdefault("environment", collect_environment_metadata())
     results["metadata"].setdefault("reproducibility", {})
     results["metadata"]["reproducibility"].update(
         {
@@ -1486,9 +1373,9 @@ def run_experiment(
     results["metadata"]["controls"].update(
         {
             "eval_protocol_strict": bool(eval_protocol_strict),
-            "reasoning_mask_strict": _env_flag("SLM_REASONING_MASK_STRICT", "0"),
-            "reasoning_mask_fallback_to_completion": _env_flag("SLM_REASONING_MASK_FALLBACK_TO_COMPLETION", "1"),
-            "train_sanitize_logits": _env_flag("SLM_TRAIN_SANITIZE_LOGITS", "1"),
+            "reasoning_mask_strict": env_flag("SLM_REASONING_MASK_STRICT", "0"),
+            "reasoning_mask_fallback_to_completion": env_flag("SLM_REASONING_MASK_FALLBACK_TO_COMPLETION", "1"),
+            "train_sanitize_logits": env_flag("SLM_TRAIN_SANITIZE_LOGITS", "1"),
             "train_max_logit_abs": float(os.environ.get("SLM_TRAIN_MAX_LOGIT_ABS", "100.0")),
         }
     )
@@ -1818,53 +1705,6 @@ def run_experiment(
             print(f"[WARN] {msg}")
     except Exception:
         pass
-
-    # Hypothesis testing: compare metric across runs (paired by seed)
-    if "kd_traditional" in results["conditions"] and "kd_with_reasoning" in results["conditions"]:
-        p_a = (results.get("eval_protocols") or {}).get("kd_traditional")
-        p_b = (results.get("eval_protocols") or {}).get("kd_with_reasoning")
-        if p_a != p_b:
-            msg = (
-                "Protocolos de avalia├º├úo diferem entre condi├º├Áes; compara├º├úo estat├¡stica pode ser inv├ílida. "
-                f"kd_traditional={p_a}, kd_with_reasoning={p_b}."
-            )
-            if bool(eval_protocol_strict):
-                raise ValueError(msg + " Defina SLM_EVAL_PROTOCOL_STRICT=0 para apenas avisar.")
-            print(f"[WARN] {msg} Pulando hypothesis_testing.")
-        else:
-            trad = results["conditions"]["kd_traditional"]["runs"]
-            reas = results["conditions"]["kd_with_reasoning"]["runs"]
-
-            def _by_seed(runs: List[Dict[str, Any]]):
-                m = {}
-                for r in runs:
-                    ev = r.get("evaluation", {})
-                    m[int(r.get("seed"))] = float(ev.get(hypothesis_metric, ev.get("primary_score", ev.get("overall_score", 0.0))))
-                return m
-
-            a = _by_seed(trad)
-            b = _by_seed(reas)
-            common = sorted(set(a.keys()) & set(b.keys()))
-            metrics_a = [a[s] for s in common]
-            metrics_b = [b[s] for s in common]
-
-            if len(common) < 2 and not allow_insufficient_runs:
-                raise ValueError(
-                    "Validade estat├¡stica insuficiente: n_runs < 2. "
-                    "Adicione mais seeds (ex.: --seed 42 --seed 43) ou passe --allow_insufficient_runs para apenas registrar resultados sem infer├¬ncia."  # noqa: E501
-                )
-
-            ht = analyst.paired_bootstrap_over_runs(metrics_a, metrics_b, n_bootstrap=cfg.bootstrap_samples, rng_seed=42)
-            results["hypothesis_testing"] = {
-                "h1": {
-                    "statement": cfg.scientific_hypotheses.get("main"),
-                    "metric": hypothesis_metric,
-                    "n_runs": len(common),
-                    "traditional_mean": float(sum(metrics_a) / len(metrics_a)) if metrics_a else None,
-                    "reasoning_mean": float(sum(metrics_b) / len(metrics_b)) if metrics_b else None,
-                    "test": ht,
-                }
-            }
 
     # Reports
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

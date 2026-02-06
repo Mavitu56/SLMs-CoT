@@ -64,13 +64,9 @@ class EvidenceBasedConfig:
 
     model_hierarchy: Dict[str, str] = field(
         default_factory=lambda: {
-            # Default to a single family to keep logits-KD scientifically valid
-            # (token IDs must match across teacher/student).
-            # Teacher maior (14B) = raciocínio de melhor qualidade
-            # Student menor (0.5B) = mais fácil de treinar, menos overfitting
+            # Mesma família = token IDs compatíveis para logits-KD
             "teacher_medium": "Qwen/Qwen2.5-14B-Instruct",
-            "student_primary": "Qwen/Qwen2.5-0.5B-Instruct",    
-            "student_small": "Qwen/Qwen2.5-0.5B-Instruct",
+            "student_primary": "Qwen/Qwen2.5-0.5B-Instruct",
         }
     )
 
@@ -78,42 +74,32 @@ class EvidenceBasedConfig:
     device: torch.device = field(
         default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
-    max_length: int = 1024  # Aumentado de 512 - prompts longos eram truncados
+    max_length: int = 1024
 
-    # Limits (ajustados para resultados científicos mais robustos)
-    # GSM8K train tem ~7.5k exemplos; usar 5000 cobre ~67% do dataset
-    train_limit: Optional[int] = 5000  # Antes: 3000 - aumentado para melhor generalização
-    # Avaliação com mais exemplos reduz variância e aumenta confiabilidade estatística
-    eval_limit_gsm8k: int = 300  # Antes: 100 - GSM8K test tem 1319 exemplos
-    eval_limit_bbh: int = 100   # Antes: 30 - mais exemplos por task
-    # OOD commonsense (eval-only; not part of primary hypothesis by default)
+    # Limites de dataset
+    train_limit: Optional[int] = 5000
+    eval_limit_gsm8k: int = 300
+    eval_limit_bbh: int = 100
     eval_limit_obqa: int = 200
 
-    # Distillation hyperparams (otimizado para Google Colab A100 40/80GB)
-    # IMPORTANTE: Ajustes para EVITAR OVERFITTING
-    # Problema anterior: loss CE caiu para 0.19 (muito baixo = memorização)
-    # O modelo memorizou os exemplos mas não generaliza
-    # Solução: menos epochs, LR menor, regularização
+    # Hiperparâmetros KD (ajustados contra overfitting: epochs reduzidos, LR menor, weight_decay)
     kd_params: Dict[str, Any] = field(
         default_factory=lambda: {
-            "temperature_schedule": [3.0, 2.5, 2.0],  # AUMENTADO: suaviza distribuição, evita overfitting
-            "alpha_schedule": [0.5, 0.4, 0.3],  # AUMENTADO: mais peso no KD (soft targets = regularização)
-            "learning_rates": {"kd": 2e-5},  # REDUZIDO: 5e-5 causava overfitting severo
-            "lora_rank": 16,  # REDUZIDO: menos parâmetros = menos overfitting
-            "epochs": 2,  # REDUZIDO: 4 epochs causava memorização total
-            # A100: 80GB suporta batch=8, 40GB suporta batch=4-6
-            "batch_size": 4,
-            "grad_accum_steps": 4,  # Effective batch = 16
+            "temperature_schedule": [3.0, 2.5, 2.0],
+            "alpha_schedule": [0.5, 0.4, 0.3],
+            "learning_rates": {"kd": 2e-5},
+            "lora_rank": 32,
+            "epochs": 5,
+            "batch_size": 8,
+            "grad_accum_steps": 4,
             "clip_grad_norm": 1.0,
-            "weight_decay": 0.01,  # NOVO: regularização L2 para evitar overfitting
+            "weight_decay": 0.01,
             "dataloader_num_workers": 2,
         }
     )
 
     # Experimental design
     seeds: List[int] = field(default_factory=lambda: [42])
-    bootstrap_samples: int = 5000
-    alpha_level: float = 0.05
 
     # Quantization (kept compatible with Colab)
     quantization: Dict[str, Any] = field(
@@ -133,16 +119,11 @@ class EvidenceBasedConfig:
     reports_dir: Path = field(init=False)
     experiments_dir: Path = field(init=False)
 
-    # Defaults for the hypothesis H1 experiment
-    # NOTA: max_new_tokens do teacher aumentado para garantir que o modelo
-    # consiga gerar raciocínio completo + marcador ### FINAL_ANSWER: + resposta
+    # Configuração de geração para teacher CoT
     teacher_cot_generation: GenerationConfig = field(
         default_factory=lambda: GenerationConfig(max_new_tokens=512, temperature=0.0, do_sample=False)
     )
-    # Eval também precisa de mais tokens para gerar raciocínio + ### FINAL_ANSWER:
-    # repetition_penalty aumentado para evitar loops de tokens repetidos
-    # stop_sequences: para quando encontrar "Q:" ou "\n\nQ:" (novo problema)
-    # Isso evita que o modelo continue gerando novos Q&A após responder
+    # Configuração de geração para avaliação
     eval_generation: GenerationConfig = field(
         default_factory=lambda: GenerationConfig(
             max_new_tokens=384,
@@ -216,8 +197,6 @@ class EvidenceBasedConfig:
             },
             "kd_params": json.loads(json.dumps(self.kd_params, default=str)),
             "seeds": list(self.seeds),
-            "bootstrap_samples": self.bootstrap_samples,
-            "alpha_level": self.alpha_level,
             "quantization": json.loads(json.dumps(self.quantization, default=str)),
             "teacher_cot_generation": self.teacher_cot_generation.to_jsonable(),
             "eval_generation": self.eval_generation.to_jsonable(),

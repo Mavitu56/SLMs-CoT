@@ -120,11 +120,6 @@ def write_summary_txt(path: Path, results: Dict[str, Any]) -> None:
                 lines.append(f"  (sec) {seed} | {af:.4f} | {gt:.2f} | {ct:.2f} | {cr:.4f}")
         lines.append("")
 
-    ht = results.get("hypothesis_testing")
-    if ht:
-        lines.append("=== Testes de Hipóteses ===")
-        lines.append(json.dumps(ht, indent=2, ensure_ascii=False, default=str))
-
     lines.append("\n=== FIM DO RESUMO ===")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")

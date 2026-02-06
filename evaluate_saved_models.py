@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -14,141 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import EvidenceBasedConfig, GenerationConfig, ensure_tokenizer_has_pad, resolve_device, set_seed
 from eval import StandardizedEvaluator
-
-
-def _collect_environment_metadata() -> Dict[str, Any]:
-    meta: Dict[str, Any] = {
-        "python_version": sys.version,
-        "platform": platform.platform(),
-        "executable": sys.executable,
-    }
-    try:
-        meta["torch_version"] = getattr(torch, "__version__", None)
-        meta["cuda_available"] = bool(torch.cuda.is_available())
-        meta["cuda_version"] = getattr(torch.version, "cuda", None)
-        if bool(torch.cuda.is_available()):
-            try:
-                meta["gpu_name"] = str(torch.cuda.get_device_name(0))
-            except Exception:
-                meta["gpu_name"] = None
-    except Exception:
-        pass
-    try:
-        import transformers as _transformers
-
-        meta["transformers_version"] = getattr(_transformers, "__version__", None)
-    except Exception:
-        pass
-    return meta
-
-
-def _now_stamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-
-
-def _iter_model_dirs(paths: Sequence[str], recursive: bool) -> List[Path]:
-    out: List[Path] = []
-    for p in paths:
-        root = Path(p)
-        if not root.exists():
-            continue
-        if root.is_dir() and ((root / "config.json").exists() or (root / "adapter_config.json").exists()):
-            out.append(root)
-            continue
-
-        if root.is_dir():
-            # Common case: a root directory containing many model subfolders.
-            for cand in root.glob("*/config.json"):
-                out.append(cand.parent)
-            for cand in root.glob("*/adapter_config.json"):
-                out.append(cand.parent)
-
-        if root.is_dir() and recursive:
-            for cand in root.rglob("config.json"):
-                out.append(cand.parent)
-            for cand in root.rglob("adapter_config.json"):
-                out.append(cand.parent)
-
-    # De-dup while preserving order
-    seen = set()
-    uniq: List[Path] = []
-    for d in out:
-        k = str(d.resolve())
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(d)
-    return uniq
-
-
-def _load_model_and_tokenizer(model_dir: Path, device: torch.device, load_dtype: str) -> Tuple[Any, Any]:
-    """Load either a full HF model dir (config.json) or a PEFT adapter dir (adapter_config.json)."""
-
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    tokenizer.padding_side = "left"  # Required for decoder-only models (Qwen, LLaMA, etc.)
-    tokenizer_len = len(tokenizer)
-
-    model_kwargs: Dict[str, Any] = {}
-    if load_dtype and load_dtype != "auto":
-        if load_dtype == "bf16":
-            model_kwargs["torch_dtype"] = torch.bfloat16
-        elif load_dtype == "fp16":
-            model_kwargs["torch_dtype"] = torch.float16
-        elif load_dtype == "fp32":
-            model_kwargs["torch_dtype"] = torch.float32
-
-    if (model_dir / "config.json").exists():
-        model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
-        model = model.to(device)
-        ensure_tokenizer_has_pad(tokenizer, model)
-        model.eval()
-        return model, tokenizer
-
-    if (model_dir / "adapter_config.json").exists():
-        # Adapter-only save (PEFT/LoRA). Load base model and attach adapter.
-        import json
-
-        adapter_cfg = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
-        base_name = str(adapter_cfg.get("base_model_name_or_path") or "").strip()
-        if not base_name:
-            raise ValueError(
-                f"adapter_config.json em {model_dir} não contém 'base_model_name_or_path'. "
-                "Não é possível carregar o modelo base para avaliação."
-            )
-
-        base_model = AutoModelForCausalLM.from_pretrained(base_name, **model_kwargs)
-
-        # If the adapter was saved with resized embeddings (PEFT may do this when
-        # tokenizer/model vocab sizes diverge), ensure the base model matches the
-        # tokenizer *before* loading adapter weights.
-        try:
-            emb = base_model.get_input_embeddings()
-            if emb is not None and tokenizer_len > int(emb.weight.shape[0]):
-                base_model.resize_token_embeddings(tokenizer_len)
-        except Exception:
-            # Best-effort; if resize isn't supported, loading may still fail.
-            pass
-        try:
-            from peft import PeftModel
-
-            model = PeftModel.from_pretrained(base_model, model_dir)
-        except Exception as exc:
-            raise RuntimeError(
-                "Falha ao carregar adapter PEFT. Instale 'peft' e verifique compatibilidade do adapter com o modelo base. "
-                f"Erro: {exc}"
-            )
-
-        model = model.to(device)
-        ensure_tokenizer_has_pad(tokenizer, model)
-        model.eval()
-        return model, tokenizer
-
-    raise ValueError(f"Diretório não parece ser um modelo HF nem um adapter PEFT: {model_dir}")
-
-
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+from utils import collect_environment_metadata, load_model_and_tokenizer, iter_model_dirs, now_stamp, write_json
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -257,12 +121,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.models_root:
         model_paths.append(args.models_root)
 
-    model_dirs = _iter_model_dirs(model_paths, recursive=bool(args.recursive))
+    model_dirs = iter_model_dirs(model_paths, recursive=bool(args.recursive))
 
     # Friendly fallback: if user passed a models_root but forgot --recursive, try it.
     if not model_dirs and args.models_root and not args.recursive:
         print("[eval] Nenhum model_dir encontrado sem --recursive; tentando busca recursiva...")
-        model_dirs = _iter_model_dirs(model_paths, recursive=True)
+        model_dirs = iter_model_dirs(model_paths, recursive=True)
 
     if not model_dirs:
         debug_lines = ["Nenhum model_dir encontrado.", "Paths inspecionados:"]
@@ -332,7 +196,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     for model_dir in model_dirs:
         print(f"\n[eval] Loading model: {model_dir}")
-        model, tokenizer = _load_model_and_tokenizer(model_dir, device=device, load_dtype=str(args.load_dtype))
+        model, tokenizer = load_model_and_tokenizer(model_dir, device=device, load_dtype=str(args.load_dtype))
 
         print(
             f"[eval] Running evaluator flags: gsm8k={eval_gsm8k}, bbh={eval_bbh}, efficiency={eval_eff}, cot_prompt={use_cot}, cascod_two_stage={cascod_two_stage}"
@@ -354,7 +218,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "model_dir": str(model_dir),
             "device": str(device),
             "seed": int(args.seed),
-            "environment": _collect_environment_metadata(),
+            "environment": collect_environment_metadata(),
             "reproducibility": {"deterministic": bool(deterministic)},
             "eval_flags": {
                 "eval_gsm8k": eval_gsm8k,
@@ -372,10 +236,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "results": results,
         }
 
-        stamp = _now_stamp()
+        stamp = now_stamp()
         out_dir = out_root if out_root else model_dir
         out_path = out_dir / f"eval_{stamp}.json"
-        _write_json(out_path, artifact)
+        write_json(out_path, artifact)
         print(f"[eval] Saved: {out_path}")
 
         # Small one-line summary
@@ -402,8 +266,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Global summary
     if out_root:
-        summary_path = out_root / f"eval_summary_{_now_stamp()}.json"
-        _write_json(summary_path, {"rows": summary_rows})
+        summary_path = out_root / f"eval_summary_{now_stamp()}.json"
+        write_json(summary_path, {"rows": summary_rows})
         print(f"\n[eval] Wrote summary: {summary_path}")
 
     return 0
