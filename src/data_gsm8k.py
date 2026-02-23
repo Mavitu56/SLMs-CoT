@@ -41,15 +41,17 @@ def tokenise_example(
         {"role": "assistant", "content": example["answer"]},
     ]
 
-    # apply_chat_template returns a list of token ids
-    input_ids = tokenizer.apply_chat_template(
+    # apply_chat_template returns a list of token ids.
+    # Force conversion to plain Python ints so Arrow / datasets
+    # never sees a tokenizers.Encoding object.
+    raw_ids = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=False,
     )
 
-    # Truncate to max_length
-    input_ids = input_ids[:max_length]
+    # Truncate to max_length and ensure plain list[int]
+    input_ids = [int(x) for x in raw_ids[:max_length]]
     attention_mask = [1] * len(input_ids)
     labels = list(input_ids)  # copy – prompt + answer in loss
 
