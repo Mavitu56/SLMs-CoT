@@ -20,6 +20,20 @@ from src.losses_kd import compute_total_loss
 # Helpers
 # ==================================================================
 
+def _align_vocab(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Truncate the teacher vocab dim if it is larger than the student's."""
+    if teacher_logits.size(-1) > student_logits.size(-1):
+        teacher_logits = teacher_logits[..., :student_logits.size(-1)]
+    assert teacher_logits.shape[-1] == student_logits.shape[-1], (
+        f"Vocab size mismatch: teacher {teacher_logits.shape[-1]} "
+        f"!= student {student_logits.shape[-1]}"
+    )
+    return teacher_logits, student_logits
+
+
 def _get_one_batch(
     tokenizer,
     max_length: int,
@@ -83,9 +97,10 @@ def check_teacher_frozen(
         attention_mask=batch["attention_mask"],
     )
 
+    t_logits, s_logits = _align_vocab(t_out.logits, s_out.logits)
     loss_total, _, _, _ = compute_total_loss(
-        teacher_logits=t_out.logits,
-        student_logits=s_out.logits,
+        teacher_logits=t_logits,
+        student_logits=s_logits,
         labels=batch["labels"],
         attention_mask=batch["attention_mask"],
         T=T,
@@ -128,6 +143,8 @@ def check_lambda_edge_cases(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
         ).logits
+
+    t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
     # Case 1: lambda_kd = 0
     loss_total_1, loss_ce_1, _, _ = compute_total_loss(
@@ -246,6 +263,8 @@ def check_kl_non_negative(
             attention_mask=batch["attention_mask"],
         ).logits
 
+    t_logits, s_logits = _align_vocab(t_logits, s_logits)
+
     _, _, loss_kd, _ = compute_total_loss(
         t_logits, s_logits, batch["labels"], batch["attention_mask"],
         T=T, lambda_kd=1.0, lambda_ce=0.0,
@@ -286,6 +305,8 @@ def check_mask_all_ignored(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
         ).logits
+
+    t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
     loss_total, loss_ce, loss_kd, n_valid = compute_total_loss(
         t_logits, s_logits, batch["labels"], batch["attention_mask"],
@@ -382,6 +403,7 @@ def run_all_sanity_checks(
             input_ids=_batch_dev["input_ids"],
             attention_mask=_batch_dev["attention_mask"],
         ).logits
+    _t_logits, _s_logits = _align_vocab(_t_logits, _s_logits)
     _, _, _normal_kd, _ = compute_total_loss(
         _t_logits, _s_logits, _batch_dev["labels"], _batch_dev["attention_mask"],
         T=T, lambda_kd=1.0, lambda_ce=0.0,

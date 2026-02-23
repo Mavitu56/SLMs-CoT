@@ -122,6 +122,26 @@ def train(cfg: Dict[str, Any]) -> None:
 
     device = next(student.parameters()).device
 
+    # ---- Vocab-size check ----
+    V_teacher = teacher.config.vocab_size
+    V_student = student.config.vocab_size
+    if V_teacher != V_student:
+        print(
+            f"[vocab] teacher={V_teacher}, student={V_student} "
+            f"→ teacher logits will be truncated to {V_student}"
+        )
+    # Verify that shared token ids map to the same tokens
+    teacher_tok = AutoTokenizer.from_pretrained(cfg["teacher_name"])
+    for i in range(min(V_teacher, V_student)):
+        t_tok = teacher_tok.convert_ids_to_tokens(i)
+        s_tok = tokenizer.convert_ids_to_tokens(i)
+        assert t_tok == s_tok, (
+            f"Token id {i} mismatch: teacher='{t_tok}' vs student='{s_tok}'. "
+            f"Cannot safely truncate teacher logits."
+        )
+    print(f"[vocab] token id consistency verified for {min(V_teacher, V_student)} tokens ✓")
+    del teacher_tok
+
     # ---- Data ----
     micro_n = cfg.get("micro_overfit_n", None)
     loader = build_dataloader(
@@ -198,10 +218,13 @@ def train(cfg: Dict[str, Any]) -> None:
             )
             student_logits = student_out.logits
 
-            # ---- Logits shape / dtype guards ----
-            assert teacher_logits.shape == student_logits.shape, (
-                f"Logits shape mismatch: teacher {teacher_logits.shape} "
-                f"!= student {student_logits.shape}"
+            # ---- Truncate teacher vocab to match student ----
+            if teacher_logits.size(-1) > student_logits.size(-1):
+                teacher_logits = teacher_logits[..., :student_logits.size(-1)]
+
+            assert teacher_logits.shape[-1] == student_logits.shape[-1], (
+                f"Vocab size mismatch after alignment: "
+                f"teacher {teacher_logits.shape[-1]} != student {student_logits.shape[-1]}"
             )
             # Log dtypes once (first micro-step of first optimiser step)
             if step == 1 and micro_step == 0:
