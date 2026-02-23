@@ -1,7 +1,7 @@
 # Experiment A: CE-only baseline (λ_KD=0, λ_CE=1)
 seed: 42
-teacher_name: "Qwen/Qwen2.5-14B-Instruct"
-student_name: "Qwen/Qwen2.5-0.5B-Instruct"
+teacher_name: "Qwen/Qwen2.5-14B"
+student_name: "Qwen/Qwen2.5-0.5B"
 teacher_load_mode: "bf16"
 student_dtype: "bf16"
 max_length: 512
