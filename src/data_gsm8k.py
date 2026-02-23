@@ -41,27 +41,28 @@ def tokenise_example(
         {"role": "assistant", "content": example["answer"]},
     ]
 
-    # apply_chat_template returns a list of token ids.
-    # Some tokenizer versions return a tokenizers.Encoding object
-    # instead of a plain list — handle both cases.
+    # apply_chat_template return type varies across transformers versions:
+    #   - list[int]           (most common)
+    #   - dict with "input_ids" key
+    #   - tokenizers.Encoding object (has .ids attribute)
+    #   - list[tokenizers.Encoding]
     raw = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=False,
     )
 
-    # Extract plain list[int] regardless of return type
-    if isinstance(raw, list):
-        # Could be list[int] or list[Encoding]; flatten safely
+    # ---- Normalise to plain list[int] ----
+    if isinstance(raw, dict):
+        raw_ids = raw["input_ids"]
+    elif isinstance(raw, list):
         if raw and hasattr(raw[0], "ids"):
-            # list of Encoding objects → take ids from them all
             raw_ids: list[int] = []
             for enc in raw:
                 raw_ids.extend(enc.ids)
         else:
             raw_ids = raw
     elif hasattr(raw, "ids"):
-        # Single Encoding object
         raw_ids = raw.ids
     else:
         raw_ids = list(raw)
