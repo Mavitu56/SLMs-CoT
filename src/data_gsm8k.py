@@ -42,13 +42,29 @@ def tokenise_example(
     ]
 
     # apply_chat_template returns a list of token ids.
-    # Force conversion to plain Python ints so Arrow / datasets
-    # never sees a tokenizers.Encoding object.
-    raw_ids = tokenizer.apply_chat_template(
+    # Some tokenizer versions return a tokenizers.Encoding object
+    # instead of a plain list — handle both cases.
+    raw = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=False,
     )
+
+    # Extract plain list[int] regardless of return type
+    if isinstance(raw, list):
+        # Could be list[int] or list[Encoding]; flatten safely
+        if raw and hasattr(raw[0], "ids"):
+            # list of Encoding objects → take ids from them all
+            raw_ids: list[int] = []
+            for enc in raw:
+                raw_ids.extend(enc.ids)
+        else:
+            raw_ids = raw
+    elif hasattr(raw, "ids"):
+        # Single Encoding object
+        raw_ids = raw.ids
+    else:
+        raw_ids = list(raw)
 
     # Truncate to max_length and ensure plain list[int]
     input_ids = [int(x) for x in raw_ids[:max_length]]
