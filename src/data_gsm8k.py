@@ -144,6 +144,7 @@ def build_dataloader(
     ds = ds.map(
         lambda ex: tokenise_example(ex, tokenizer, max_length),
         remove_columns=ds.column_names,
+        writer_batch_size=500,
     )
 
     # ---- Truncation statistics ----
