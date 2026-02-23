@@ -41,34 +41,22 @@ def tokenise_example(
         {"role": "assistant", "content": example["answer"]},
     ]
 
-    # apply_chat_template return type varies across transformers versions:
-    #   - list[int]           (most common)
-    #   - dict with "input_ids" key
-    #   - tokenizers.Encoding object (has .ids attribute)
-    #   - list[tokenizers.Encoding]
-    raw = tokenizer.apply_chat_template(
+    # Step 1: build the chat-formatted string (always returns str)
+    text = tokenizer.apply_chat_template(
         messages,
-        tokenize=True,
+        tokenize=False,
         add_generation_prompt=False,
     )
 
-    # ---- Normalise to plain list[int] ----
-    if isinstance(raw, dict):
-        raw_ids = raw["input_ids"]
-    elif isinstance(raw, list):
-        if raw and hasattr(raw[0], "ids"):
-            raw_ids: list[int] = []
-            for enc in raw:
-                raw_ids.extend(enc.ids)
-        else:
-            raw_ids = raw
-    elif hasattr(raw, "ids"):
-        raw_ids = raw.ids
-    else:
-        raw_ids = list(raw)
+    # Step 2: tokenise explicitly (always returns a dict-like with "input_ids")
+    encoded = tokenizer(
+        text,
+        truncation=True,
+        max_length=max_length,
+        add_special_tokens=False,   # chat template already added them
+    )
 
-    # Truncate to max_length and ensure plain list[int]
-    input_ids = [int(x) for x in raw_ids[:max_length]]
+    input_ids = [int(x) for x in encoded["input_ids"]]
     attention_mask = [1] * len(input_ids)
     labels = list(input_ids)  # copy – prompt + answer in loss
 
