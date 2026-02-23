@@ -78,6 +78,7 @@ def load_student_from_checkpoint(
         checkpoint_path,
         torch_dtype=dtype,
         device_map="auto",
+        attn_implementation="flash_attention_2",
     )
     model.eval()
     for p in model.parameters():

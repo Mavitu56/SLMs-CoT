@@ -26,7 +26,10 @@ def load_teacher(name: str, load_mode: str) -> AutoModelForCausalLM:
     """Load the teacher model according to ``load_mode`` (4bit | 8bit | bf16).
 
     The teacher is always frozen and set to eval.
+    Uses Flash Attention 2 when available for faster inference.
     """
+    fa_kwargs = {"attn_implementation": "flash_attention_2"}
+
     if load_mode == "4bit":
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -38,6 +41,7 @@ def load_teacher(name: str, load_mode: str) -> AutoModelForCausalLM:
             name,
             quantization_config=bnb_cfg,
             device_map="auto",
+            **fa_kwargs,
         )
     elif load_mode == "8bit":
         bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
@@ -45,12 +49,14 @@ def load_teacher(name: str, load_mode: str) -> AutoModelForCausalLM:
             name,
             quantization_config=bnb_cfg,
             device_map="auto",
+            **fa_kwargs,
         )
     elif load_mode == "bf16":
         model = AutoModelForCausalLM.from_pretrained(
             name,
             torch_dtype=torch.bfloat16,
             device_map="auto",
+            **fa_kwargs,
         )
     else:
         raise ValueError(f"Unknown teacher_load_mode: {load_mode!r}")
@@ -64,7 +70,10 @@ def load_teacher(name: str, load_mode: str) -> AutoModelForCausalLM:
 
 
 def load_student(name: str, dtype_str: str) -> AutoModelForCausalLM:
-    """Load the student model in the requested dtype."""
+    """Load the student model in the requested dtype.
+
+    Uses Flash Attention 2 when available for faster training.
+    """
     dtype_map = {
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
@@ -76,6 +85,7 @@ def load_student(name: str, dtype_str: str) -> AutoModelForCausalLM:
         name,
         torch_dtype=dtype,
         device_map="auto",
+        attn_implementation="flash_attention_2",
     )
     model.train()
     return model
@@ -108,6 +118,10 @@ def train(cfg: Dict[str, Any]) -> None:
 
     # ---- Seed ----
     set_seed(cfg["seed"])
+
+    # ---- Performance: enable TF32 on Ampere+ GPUs ----
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     # ---- Tokenizer (shared) ----
     tokenizer = AutoTokenizer.from_pretrained(cfg["student_name"])
