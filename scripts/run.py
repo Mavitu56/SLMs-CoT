@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Entry point: load config → (optional) sanity checks → train.
+Entry point: load config → (optional) sanity checks → train → save plots.
 
 Usage
 -----
     python scripts/run.py                              # uses default config
     python scripts/run.py --config configs/kd_qwen_gsm8k.yaml
+    python scripts/run.py --config configs/kd_qwen_gsm8k.yaml --output-dir results/run_01
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import os
 
@@ -36,15 +38,87 @@ def load_config(path: str) -> dict:
     return cfg
 
 
+def _plot_losses(log_file: str, output_dir: str) -> None:
+    """Read the JSONL log and save loss-curve plots as PNG."""
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive backend
+    import matplotlib.pyplot as plt
+
+    if not os.path.isfile(log_file):
+        print(f"[plot] log file not found, skipping plots: {log_file}")
+        return
+
+    with open(log_file, "r", encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+
+    if not rows:
+        print("[plot] log file is empty, skipping plots.")
+        return
+
+    steps      = [r["step"]       for r in rows]
+    loss_total = [r["loss_total"] for r in rows]
+    loss_ce    = [r["loss_ce"]    for r in rows]
+    loss_kd    = [r["loss_kd"]    for r in rows]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=False)
+
+    # Panel 1 – CE
+    ax = axes[0]
+    ax.plot(steps, loss_ce, linewidth=1.5)
+    ax.set_title("loss_ce (hard-label cross-entropy)")
+    ax.set_xlabel("Optimizer step")
+    ax.set_ylabel("CE loss")
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2 – KD
+    ax = axes[1]
+    ax.plot(steps, loss_kd, linewidth=1.5)
+    ax.set_title("loss_kd (forward KL)")
+    ax.set_xlabel("Optimizer step")
+    ax.set_ylabel("KD loss")
+    ax.grid(True, alpha=0.3)
+
+    # Panel 3 – Total
+    ax = axes[2]
+    ax.plot(steps, loss_total, linewidth=1.5)
+    ax.set_title("loss_total (combined)")
+    ax.set_xlabel("Optimizer step")
+    ax.set_ylabel("Total loss")
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle("Training loss curves", fontsize=14, y=1.02)
+    plt.tight_layout()
+
+    plot_path = os.path.join(output_dir, "loss_curves.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] saved → {plot_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="KD training runner")
     parser.add_argument(
         "--config", type=str, default=DEFAULT_CONFIG,
         help="Path to YAML config file",
     )
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Directory to save logs, checkpoints and plots. "
+             "Overrides log_file and save_dir in the config.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # ---- Apply --output-dir overrides ----
+    if args.output_dir is not None:
+        out = args.output_dir
+        os.makedirs(out, exist_ok=True)
+        cfg["log_file"] = os.path.join(out, "train_log.jsonl")
+        cfg["save_dir"] = os.path.join(out, "checkpoints")
+        print(f"Output directory: {out}")
+        print(f"  log_file  → {cfg['log_file']}")
+        print(f"  save_dir  → {cfg['save_dir']}")
 
     # ---- Optional sanity checks ----
     if cfg.get("run_sanity", False):
@@ -68,6 +142,12 @@ def main() -> None:
 
     # ---- Train ----
     train(cfg)
+
+    # ---- Generate plots from JSONL log ----
+    log_file = cfg.get("log_file")
+    if log_file:
+        out_dir = os.path.dirname(log_file) or "."
+        _plot_losses(log_file, out_dir)
 
 
 if __name__ == "__main__":
