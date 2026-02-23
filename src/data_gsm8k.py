@@ -84,6 +84,12 @@ class KDCollator:
         self.max_length = max_length
 
     def __call__(self, features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+        # Ensure plain lists (set_format("torch") may yield tensors)
+        for f in features:
+            for k in ("input_ids", "attention_mask", "labels"):
+                if isinstance(f[k], torch.Tensor):
+                    f[k] = f[k].tolist()
+
         # Determine the max sequence length in this batch (capped)
         batch_max = min(
             max(len(f["input_ids"]) for f in features),
