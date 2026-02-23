@@ -1,0 +1,24 @@
+# Experiment A: CE-only on full GSM8K (λ_KD=0, λ_CE=1, T=2)
+# Pure supervised fine-tuning baseline — no knowledge distillation.
+# Expected: sharp distributions, low entropy, high maxprob, worse calibration.
+seed: 42
+teacher_name: "Qwen/Qwen2.5-14B"
+student_name: "Qwen/Qwen2.5-1.5B"
+teacher_load_mode: "bf16"
+student_dtype: "bf16"
+max_length: 512
+batch_size: 1
+grad_accum_steps: 16
+num_steps: 2000
+lr: 5.0e-5
+weight_decay: 0.0
+max_grad_norm: 1.0
+temperature: 2.0
+lambda_kd: 0.0
+lambda_ce: 1.0
+log_every: 20
+micro_overfit_n: null
+save_every: 500
+save_dir: "checkpoints/A_ce_only_full"
+log_file: "logs/A_ce_only_full.jsonl"
+run_sanity: false

@@ -1,0 +1,26 @@
+# Experiment C: KD + CE on full GSM8K (λ_KD=1, λ_CE=0.5, T=2)
+# Hybrid objective — the standard Hinton-style KD setup.
+# Loss = 1.0 * T² * KL + 0.5 * CE = 4.0 * KL + 0.5 * CE
+# Expected: best probabilistic balance — intermediate entropy,
+#           good calibration, lower KL(T||S) than CE-only.
+seed: 42
+teacher_name: "Qwen/Qwen2.5-14B"
+student_name: "Qwen/Qwen2.5-1.5B"
+teacher_load_mode: "bf16"
+student_dtype: "bf16"
+max_length: 512
+batch_size: 1
+grad_accum_steps: 16
+num_steps: 2000
+lr: 5.0e-5
+weight_decay: 0.0
+max_grad_norm: 1.0
+temperature: 2.0
+lambda_kd: 1.0
+lambda_ce: 0.5
+log_every: 20
+micro_overfit_n: null
+save_every: 500
+save_dir: "checkpoints/C_kd_ce_full"
+log_file: "logs/C_kd_ce_full.jsonl"
+run_sanity: false

@@ -1,0 +1,25 @@
+# Baseline: Student without any training (reference for Layer 2 analysis)
+# No training is performed (num_steps=0). Running `run.py` with this
+# config will just save the original student weights to disk.
+# Alternatively, use the HF hub name directly in run_analysis.py.
+seed: 42
+teacher_name: "Qwen/Qwen2.5-14B"
+student_name: "Qwen/Qwen2.5-1.5B"
+teacher_load_mode: "bf16"
+student_dtype: "bf16"
+max_length: 512
+batch_size: 1
+grad_accum_steps: 1
+num_steps: 0
+lr: 5.0e-5
+weight_decay: 0.0
+max_grad_norm: 1.0
+temperature: 2.0
+lambda_kd: 0.0
+lambda_ce: 0.0
+log_every: 1
+micro_overfit_n: null
+save_every: 0
+save_dir: "checkpoints/student_base"
+log_file: "logs/student_base.jsonl"
+run_sanity: false

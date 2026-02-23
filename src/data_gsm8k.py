@@ -1,4 +1,16 @@
-"""GSM8K data loading, chat-template tokenisation, and collation."""
+"""GSM8K data loading, chat-template tokenisation, and collation.
+
+Region Segmentation
+-------------------
+Each token receives a **region_id** that identifies its role:
+
+    0 = prompt   (system + user turns, including special tokens)
+    1 = reasoning (assistant content before ``####``)
+    2 = answer    (``####`` and final numeric answer)
+
+This allows analysis code to compute metrics per region without
+contaminating reasoning/answer statistics with prompt tokens.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +21,11 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 SYSTEM_PROMPT = "You are a helpful assistant that solves math word problems."
+
+# Region IDs (kept as module constants for external reference)
+REGION_PROMPT    = 0
+REGION_REASONING = 1
+REGION_ANSWER    = 2
 
 
 # ------------------------------------------------------------------
@@ -32,8 +49,11 @@ def tokenise_example(
 ) -> Dict[str, List[int]]:
     """Build chat messages and tokenise with the model's chat template.
 
-    Returns dict with keys ``input_ids``, ``attention_mask``, ``labels``.
-    Prompt + answer are both included in the loss (labels = input_ids).
+    Returns dict with keys:
+        ``input_ids``, ``attention_mask``, ``labels``, ``region_ids``.
+
+    ``region_ids`` encodes the role of each token:
+        0 = prompt, 1 = reasoning, 2 = answer (after ``####``).
     """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -41,14 +61,26 @@ def tokenise_example(
         {"role": "assistant", "content": example["answer"]},
     ]
 
-    # Step 1: build the chat-formatted string (always returns str)
+    # Step 1: build the full chat-formatted string
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=False,
     )
 
-    # Step 2: tokenise explicitly (always returns a dict-like with "input_ids")
+    # Step 2: build the prompt-only text (system + user + generation prompt)
+    # so we can determine the boundary between prompt and assistant content.
+    prompt_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": example["question"]},
+    ]
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages,
+        tokenize=False,
+        add_generation_prompt=True,  # includes "<|im_start|>assistant\n"
+    )
+
+    # Step 3: tokenise full text
     encoded = tokenizer(
         text,
         truncation=True,
@@ -60,10 +92,47 @@ def tokenise_example(
     attention_mask = [1] * len(input_ids)
     labels = list(input_ids)  # copy – prompt + answer in loss
 
+    # Step 4: determine prompt boundary (number of prompt tokens)
+    prompt_encoded = tokenizer(
+        prompt_text,
+        truncation=True,
+        max_length=max_length,
+        add_special_tokens=False,
+    )
+    prompt_len = len(prompt_encoded["input_ids"])
+
+    # Step 5: determine #### boundary within the full text
+    hash_marker = "####"
+    hash_pos_in_text = text.find(hash_marker)
+    if hash_pos_in_text >= 0:
+        pre_hash_text = text[:hash_pos_in_text]
+        pre_hash_encoded = tokenizer(
+            pre_hash_text,
+            truncation=True,
+            max_length=max_length,
+            add_special_tokens=False,
+        )
+        answer_start = len(pre_hash_encoded["input_ids"])
+    else:
+        # No #### found (shouldn't happen in GSM8K, but be safe)
+        answer_start = len(input_ids)
+
+    # Step 6: build region_ids
+    seq_len = len(input_ids)
+    region_ids: List[int] = []
+    for i in range(seq_len):
+        if i < prompt_len:
+            region_ids.append(REGION_PROMPT)
+        elif i < answer_start:
+            region_ids.append(REGION_REASONING)
+        else:
+            region_ids.append(REGION_ANSWER)
+
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
+        "region_ids": region_ids,
     }
 
 
@@ -72,8 +141,8 @@ def tokenise_example(
 # ------------------------------------------------------------------
 
 class KDCollator:
-    """Pad ``input_ids``, ``attention_mask`` (with pad_token_id / 0)
-    and ``labels`` (with -100)."""
+    """Pad ``input_ids``, ``attention_mask`` (with pad_token_id / 0),
+    ``labels`` (with -100), and ``region_ids`` (with -1)."""
 
     def __init__(self, pad_token_id: int, max_length: int):
         assert pad_token_id is not None, (
@@ -85,10 +154,15 @@ class KDCollator:
 
     def __call__(self, features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
         # Ensure plain lists (set_format("torch") may yield tensors)
+        _keys = ["input_ids", "attention_mask", "labels"]
+        if "region_ids" in features[0]:
+            _keys.append("region_ids")
         for f in features:
-            for k in ("input_ids", "attention_mask", "labels"):
+            for k in _keys:
                 if isinstance(f[k], torch.Tensor):
                     f[k] = f[k].tolist()
+
+        has_regions = "region_ids" in features[0]
 
         # Determine the max sequence length in this batch (capped)
         batch_max = min(
@@ -99,6 +173,7 @@ class KDCollator:
         input_ids_batch: List[List[int]] = []
         attention_mask_batch: List[List[int]] = []
         labels_batch: List[List[int]] = []
+        region_ids_batch: List[List[int]] = []
 
         for f in features:
             seq_len = min(len(f["input_ids"]), batch_max)
@@ -107,12 +182,16 @@ class KDCollator:
             input_ids_batch.append(f["input_ids"][:seq_len] + [self.pad_token_id] * pad_len)
             attention_mask_batch.append(f["attention_mask"][:seq_len] + [0] * pad_len)
             labels_batch.append(f["labels"][:seq_len] + [-100] * pad_len)
+            if has_regions:
+                region_ids_batch.append(f["region_ids"][:seq_len] + [-1] * pad_len)
 
         batch = {
             "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.long),
             "labels": torch.tensor(labels_batch, dtype=torch.long),
         }
+        if has_regions:
+            batch["region_ids"] = torch.tensor(region_ids_batch, dtype=torch.long)
 
         # Shape asserts
         B = len(features)
@@ -121,6 +200,8 @@ class KDCollator:
         )
         assert batch["labels"].shape == batch["input_ids"].shape
         assert batch["attention_mask"].shape == batch["input_ids"].shape
+        if has_regions:
+            assert batch["region_ids"].shape == batch["input_ids"].shape
 
         # Padding-consistency assert: where attention_mask==0, labels must be -100
         pad_positions = batch["attention_mask"] == 0
