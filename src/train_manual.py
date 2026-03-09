@@ -2,6 +2,7 @@
 Manual training loop for Knowledge Distillation on a Causal LM.
 
 No HF Trainer – pure PyTorch for full auditability.
+Supports three KD modes: ce_only, fkl (Forward KL), rkl (Reverse KL).
 """
 
 from __future__ import annotations
@@ -11,9 +12,13 @@ import os
 from typing import Any, Dict
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    get_cosine_schedule_with_warmup,
+)
 
-from src.data_gsm8k import build_dataloader
 from src.losses_kd import compute_total_loss
 from src.utils_seed import set_seed
 
@@ -100,11 +105,53 @@ def _save_checkpoint(
 
 
 # ------------------------------------------------------------------
+# Dataset dispatch
+# ------------------------------------------------------------------
+
+def _build_dataloader(cfg: Dict[str, Any], tokenizer):
+    """Build the training DataLoader based on config['dataset']."""
+    dataset_name = cfg.get("dataset", "gsm8k")
+
+    if dataset_name == "dolly":
+        from src.data_dolly import build_dataloader
+    elif dataset_name == "gsm8k":
+        from src.data_gsm8k import build_dataloader
+    else:
+        raise ValueError(
+            f"Unknown dataset: {dataset_name!r}. "
+            f"Supported: 'dolly', 'gsm8k'."
+        )
+
+    micro_n = cfg.get("micro_overfit_n", None)
+    return build_dataloader(
+        tokenizer=tokenizer,
+        max_length=cfg["max_length"],
+        batch_size=cfg["batch_size"],
+        split="train",
+        micro_overfit_n=micro_n,
+        shuffle=True,
+    )
+
+
+# ------------------------------------------------------------------
 # Training loop
 # ------------------------------------------------------------------
 
 def train(cfg: Dict[str, Any]) -> None:
     """Run the full KD training loop."""
+
+    # ---- Validate config (catch old-style params) ----
+    if "lambda_kd" in cfg or "lambda_ce" in cfg:
+        raise ValueError(
+            "Deprecated config detected: 'lambda_kd' and 'lambda_ce' have been "
+            "replaced by 'alpha' and 'kd_mode'. "
+            "See configs/dolly_fkl_T2_seed42.yaml for the new format."
+        )
+    if "num_steps" in cfg and "num_epochs" not in cfg:
+        raise ValueError(
+            "Deprecated config detected: 'num_steps' has been replaced by "
+            "'num_epochs'. Please update your config file."
+        )
 
     # ---- Seed ----
     set_seed(cfg["seed"])
@@ -147,16 +194,20 @@ def train(cfg: Dict[str, Any]) -> None:
     del teacher_tok
 
     # ---- Data ----
-    micro_n = cfg.get("micro_overfit_n", None)
-    loader = build_dataloader(
-        tokenizer=tokenizer,
-        max_length=cfg["max_length"],
-        batch_size=cfg["batch_size"],
-        split="train",
-        micro_overfit_n=micro_n,
-        shuffle=True,
-    )
-    data_iter = iter(loader)
+    loader = _build_dataloader(cfg, tokenizer)
+
+    # ---- Hyper-parameters ----
+    T = cfg["temperature"]
+    alpha = cfg["alpha"]
+    kd_mode = cfg["kd_mode"]
+    grad_accum_steps = cfg["grad_accum_steps"]
+    max_grad_norm = cfg["max_grad_norm"]
+    num_epochs = cfg["num_epochs"]
+    log_every = cfg["log_every"]
+    save_every = cfg.get("save_every", 0)      # 0 = save only at end
+    save_dir = cfg.get("save_dir", "checkpoints")
+    log_file = cfg.get("log_file", None)
+    warmup_ratio = cfg.get("warmup_ratio", 0.1)
 
     # ---- Optimiser ----
     optimizer = torch.optim.AdamW(
@@ -165,17 +216,16 @@ def train(cfg: Dict[str, Any]) -> None:
         weight_decay=cfg["weight_decay"],
     )
 
-    # ---- Hyper-parameters ----
-    T = cfg["temperature"]
-    lambda_kd = cfg["lambda_kd"]
-    lambda_ce = cfg["lambda_ce"]
-    grad_accum_steps = cfg["grad_accum_steps"]
-    max_grad_norm = cfg["max_grad_norm"]
-    num_steps = cfg["num_steps"]
-    log_every = cfg["log_every"]
-    save_every = cfg.get("save_every", 0)      # 0 = save only at end
-    save_dir = cfg.get("save_dir", "checkpoints")
-    log_file = cfg.get("log_file", None)          # optional JSONL log path
+    # ---- Cosine scheduler with warmup ----
+    total_batches = num_epochs * len(loader)
+    total_optimizer_steps = total_batches // grad_accum_steps
+    warmup_steps = int(warmup_ratio * total_optimizer_steps)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_optimizer_steps,
+    )
 
     # Prepare JSONL log
     if log_file:
@@ -185,26 +235,26 @@ def train(cfg: Dict[str, Any]) -> None:
         log_fh = None
 
     # ---- Training loop ----
-    print(f"\nStarting training  –  {num_steps} optimiser steps, "
+    print(f"\nStarting training  –  {num_epochs} epochs, "
+          f"{total_optimizer_steps} optimizer steps, "
           f"grad_accum={grad_accum_steps}, batch_size={cfg['batch_size']}")
     print(f"Effective batch = {cfg['batch_size'] * grad_accum_steps}")
-    print(f"T={T}, λ_KD={lambda_kd}, λ_CE={lambda_ce}\n")
+    print(f"T={T}, alpha={alpha}, kd_mode={kd_mode}")
+    print(f"Scheduler: cosine, warmup={warmup_steps}/{total_optimizer_steps}\n")
 
     optimizer.zero_grad()
     accum_loss_total = 0.0
     accum_loss_ce = 0.0
     accum_loss_kd = 0.0
     accum_n_tokens = 0
+    micro_count = 0
+    global_step = 0
+    dtype_logged = False
 
-    for step in range(1, num_steps + 1):
-        for micro_step in range(grad_accum_steps):
-            # Fetch batch (cycle if dataset is small)
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(loader)
-                batch = next(data_iter)
+    for epoch in range(1, num_epochs + 1):
+        print(f"--- Epoch {epoch}/{num_epochs} ---")
 
+        for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
 
             # ---- Teacher forward (frozen, no_grad) ----
@@ -230,12 +280,14 @@ def train(cfg: Dict[str, Any]) -> None:
                 f"Vocab size mismatch after alignment: "
                 f"teacher {teacher_logits.shape[-1]} != student {student_logits.shape[-1]}"
             )
-            # Log dtypes once (first micro-step of first optimiser step)
-            if step == 1 and micro_step == 0:
+
+            # Log dtypes once
+            if not dtype_logged:
                 print(
                     f"[dtype] teacher_logits={teacher_logits.dtype}, "
                     f"student_logits={student_logits.dtype}"
                 )
+                dtype_logged = True
 
             # ---- Loss ----
             loss_total, loss_ce, loss_kd, n_valid = compute_total_loss(
@@ -244,8 +296,8 @@ def train(cfg: Dict[str, Any]) -> None:
                 labels=batch["labels"],
                 attention_mask=batch["attention_mask"],
                 T=T,
-                lambda_kd=lambda_kd,
-                lambda_ce=lambda_ce,
+                alpha=alpha,
+                kd_mode=kd_mode,
             )
 
             # Scale by grad_accum before backward
@@ -257,45 +309,60 @@ def train(cfg: Dict[str, Any]) -> None:
             accum_loss_ce += loss_ce.item()
             accum_loss_kd += loss_kd.item()
             accum_n_tokens += n_valid
+            micro_count += 1
 
-        # ---- Gradient clipping ----
-        torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
+            # ---- Optimizer step (when grad_accum micro-steps complete) ----
+            if micro_count % grad_accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
 
-        # ---- Optimiser step ----
-        optimizer.step()
-        optimizer.zero_grad()
+                # ---- Logging ----
+                if global_step % log_every == 0:
+                    avg_total = accum_loss_total / grad_accum_steps
+                    avg_ce = accum_loss_ce / grad_accum_steps
+                    avg_kd = accum_loss_kd / grad_accum_steps
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(
+                        f"[step {global_step:>5d}/{total_optimizer_steps}]  "
+                        f"loss={avg_total:.4f}  ce={avg_ce:.4f}  kd={avg_kd:.4f}  "
+                        f"tokens={accum_n_tokens}  lr={current_lr:.2e}"
+                    )
+                    if log_fh is not None:
+                        log_fh.write(json.dumps({
+                            "step": global_step,
+                            "epoch": epoch,
+                            "loss_total": round(avg_total, 6),
+                            "loss_ce": round(avg_ce, 6),
+                            "loss_kd": round(avg_kd, 6),
+                            "n_tokens": accum_n_tokens,
+                            "lr": round(current_lr, 8),
+                        }) + "\n")
+                        log_fh.flush()
+                    accum_loss_total = 0.0
+                    accum_loss_ce = 0.0
+                    accum_loss_kd = 0.0
+                    accum_n_tokens = 0
 
-        # ---- Logging ----
-        if step % log_every == 0:
-            avg_total = accum_loss_total / grad_accum_steps
-            avg_ce = accum_loss_ce / grad_accum_steps
-            avg_kd = accum_loss_kd / grad_accum_steps
-            print(
-                f"[step {step:>5d}/{num_steps}]  "
-                f"loss={avg_total:.4f}  ce={avg_ce:.4f}  kd={avg_kd:.4f}  "
-                f"tokens={accum_n_tokens}"
-            )
-            if log_fh is not None:
-                log_fh.write(json.dumps({
-                    "step": step,
-                    "loss_total": round(avg_total, 6),
-                    "loss_ce": round(avg_ce, 6),
-                    "loss_kd": round(avg_kd, 6),
-                    "n_tokens": accum_n_tokens,
-                }) + "\n")
-                log_fh.flush()
-            accum_loss_total = 0.0
-            accum_loss_ce = 0.0
-            accum_loss_kd = 0.0
-            accum_n_tokens = 0
+                # ---- Checkpoint ----
+                if save_every > 0 and global_step % save_every == 0:
+                    _save_checkpoint(student, tokenizer, save_dir, tag=f"step_{global_step}")
 
-        # ---- Checkpoint ----
-        if save_every > 0 and step % save_every == 0:
-            _save_checkpoint(student, tokenizer, save_dir, tag=f"step_{step}")
+        # ---- Handle trailing micro-steps at end of epoch ----
+        remaining = micro_count % grad_accum_steps
+        if remaining > 0:
+            torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
+            micro_count = 0  # reset for next epoch
 
     # ---- Final checkpoint ----
     _save_checkpoint(student, tokenizer, save_dir, tag="final")
     if log_fh is not None:
         log_fh.close()
         print(f"[log] saved → {log_file}")
-    print("\nTraining complete.")
+    print(f"\nTraining complete. Total optimizer steps: {global_step}")

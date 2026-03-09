@@ -273,7 +273,7 @@ def compute_ece(
     logits: torch.Tensor,
     labels: torch.Tensor,
     valid_mask: torch.Tensor,
-    n_bins: int = 15,
+    n_bins: int = 10,
 ) -> torch.Tensor:
     """Expected Calibration Error (ECE) over valid tokens.
 
