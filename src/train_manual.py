@@ -247,6 +247,7 @@ def train(cfg: Dict[str, Any]) -> None:
     accum_loss_ce = 0.0
     accum_loss_kd = 0.0
     accum_n_tokens = 0
+    accum_micro_steps = 0
     micro_count = 0
     global_step = 0
     dtype_logged = False
@@ -302,13 +303,15 @@ def train(cfg: Dict[str, Any]) -> None:
 
             # Scale by grad_accum before backward
             scaled_loss = loss_total / grad_accum_steps
-            scaled_loss.backward()
+            if scaled_loss.requires_grad:
+                scaled_loss.backward()
 
             # Accumulate for logging
             accum_loss_total += loss_total.item()
             accum_loss_ce += loss_ce.item()
             accum_loss_kd += loss_kd.item()
             accum_n_tokens += n_valid
+            accum_micro_steps += 1
             micro_count += 1
 
             # ---- Optimizer step (when grad_accum micro-steps complete) ----
@@ -321,9 +324,9 @@ def train(cfg: Dict[str, Any]) -> None:
 
                 # ---- Logging ----
                 if global_step % log_every == 0:
-                    avg_total = accum_loss_total / grad_accum_steps
-                    avg_ce = accum_loss_ce / grad_accum_steps
-                    avg_kd = accum_loss_kd / grad_accum_steps
+                    avg_total = accum_loss_total / max(accum_micro_steps, 1)
+                    avg_ce = accum_loss_ce / max(accum_micro_steps, 1)
+                    avg_kd = accum_loss_kd / max(accum_micro_steps, 1)
                     current_lr = scheduler.get_last_lr()[0]
                     print(
                         f"[step {global_step:>5d}/{total_optimizer_steps}]  "
@@ -345,6 +348,7 @@ def train(cfg: Dict[str, Any]) -> None:
                     accum_loss_ce = 0.0
                     accum_loss_kd = 0.0
                     accum_n_tokens = 0
+                    accum_micro_steps = 0
 
                 # ---- Checkpoint ----
                 if save_every > 0 and global_step % save_every == 0:
