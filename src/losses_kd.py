@@ -216,10 +216,7 @@ def compute_total_loss(
     fkl     : L = α·L_CE + (1−α)·T²·L_FKL
     rkl     : L = α·L_CE + (1−α)·L_RKL   (no T²)
     """
-    shift_t, shift_labels, valid_mask = shift_for_causal_lm(
-        teacher_logits, labels, attention_mask,
-    )
-    shift_s, _, _ = shift_for_causal_lm(
+    shift_s, shift_labels, valid_mask = shift_for_causal_lm(
         student_logits, labels, attention_mask,
     )
 
@@ -230,10 +227,16 @@ def compute_total_loss(
         loss_total = loss_ce
 
     elif kd_mode == 'fkl':
+        shift_t, _, _ = shift_for_causal_lm(
+            teacher_logits, labels, attention_mask,
+        )
         loss_kd = compute_kd_forward_kl(shift_t, shift_s, valid_mask, T)
         loss_total = alpha * loss_ce + (1 - alpha) * (T ** 2) * loss_kd
 
     elif kd_mode == 'rkl':
+        shift_t, _, _ = shift_for_causal_lm(
+            teacher_logits, labels, attention_mask,
+        )
         # NOTE: argument order is (student, teacher) for reverse KL
         loss_kd = compute_kd_reverse_kl(shift_s, shift_t, valid_mask)
         loss_total = alpha * loss_ce + (1 - alpha) * loss_kd  # NO T²

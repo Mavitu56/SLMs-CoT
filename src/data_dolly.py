@@ -190,5 +190,8 @@ def build_dataloader(
         shuffle=shuffle,
         collate_fn=collator,
         drop_last=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
     )
     return loader

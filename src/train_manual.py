@@ -256,15 +256,20 @@ def train(cfg: Dict[str, Any]) -> None:
         print(f"--- Epoch {epoch}/{num_epochs} ---")
 
         for batch in loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
             # ---- Teacher forward (frozen, no_grad) ----
-            with torch.no_grad():
-                teacher_out = teacher(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                )
-            teacher_logits = teacher_out.logits.detach()
+            # Skip teacher entirely for ce_only (no KD component)
+            if kd_mode != 'ce_only':
+                with torch.no_grad():
+                    teacher_out = teacher(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                    )
+                teacher_logits = teacher_out.logits.detach()
+            else:
+                # Dummy logits — compute_total_loss won't use them in ce_only
+                teacher_logits = torch.empty(0, device=device)
 
             # ---- Student forward ----
             student_out = student(
@@ -274,13 +279,14 @@ def train(cfg: Dict[str, Any]) -> None:
             student_logits = student_out.logits
 
             # ---- Truncate teacher vocab to match student ----
-            if teacher_logits.size(-1) > student_logits.size(-1):
-                teacher_logits = teacher_logits[..., :student_logits.size(-1)]
+            if kd_mode != 'ce_only':
+                if teacher_logits.size(-1) > student_logits.size(-1):
+                    teacher_logits = teacher_logits[..., :student_logits.size(-1)]
 
-            assert teacher_logits.shape[-1] == student_logits.shape[-1], (
-                f"Vocab size mismatch after alignment: "
-                f"teacher {teacher_logits.shape[-1]} != student {student_logits.shape[-1]}"
-            )
+                assert teacher_logits.shape[-1] == student_logits.shape[-1], (
+                    f"Vocab size mismatch after alignment: "
+                    f"teacher {teacher_logits.shape[-1]} != student {student_logits.shape[-1]}"
+                )
 
             # Log dtypes once
             if not dtype_logged:
