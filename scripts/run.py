@@ -7,6 +7,8 @@ Usage
     python scripts/run.py                              # uses default config
     python scripts/run.py --config configs/kd_qwen_gsm8k.yaml
     python scripts/run.py --config configs/kd_qwen_gsm8k.yaml --output-dir results/run_01
+    python scripts/run.py --config configs/dolly_fkl_T2_seed42.yaml \
+        --drive-root /content/drive/MyDrive/SLM_results
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ def load_config(path: str) -> dict:
     return cfg
 
 
-def _plot_losses(log_file: str, output_dir: str) -> None:
+def _plot_losses(log_file: str, output_dir: str, kd_mode: str = "fkl") -> None:
     """Read the JSONL log and save loss-curve plots as PNG."""
     import matplotlib
     matplotlib.use("Agg")  # non-interactive backend
@@ -73,7 +75,8 @@ def _plot_losses(log_file: str, output_dir: str) -> None:
     # Panel 2 – KD
     ax = axes[1]
     ax.plot(steps, loss_kd, linewidth=1.5)
-    ax.set_title("loss_kd (forward KL)")
+    kd_label = {"fkl": "forward KL", "rkl": "reverse KL", "ce_only": "N/A"}.get(kd_mode, kd_mode)
+    ax.set_title(f"loss_kd ({kd_label})")
     ax.set_xlabel("Optimizer step")
     ax.set_ylabel("KD loss")
     ax.grid(True, alpha=0.3)
@@ -106,9 +109,26 @@ def main() -> None:
         help="Directory to save logs, checkpoints and plots. "
              "Overrides log_file and save_dir in the config.",
     )
+    parser.add_argument(
+        "--drive-root", type=str, default=None,
+        help="Google Drive root directory (e.g. /content/drive/MyDrive/SLM_results). "
+             "Auto-derives run name from config as {kd_mode}_T{temperature}_seed{seed}.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # ---- Apply --drive-root (auto-derives --output-dir from config) ----
+    if args.drive_root is not None:
+        if args.output_dir is not None:
+            print("WARNING: --drive-root overrides --output-dir")
+        kd_mode = cfg["kd_mode"]
+        temperature = int(cfg["temperature"])
+        seed = cfg["seed"]
+        run_name = f"{kd_mode}_T{temperature}_seed{seed}"
+        args.output_dir = os.path.join(args.drive_root, run_name)
+        print(f"Drive root: {args.drive_root}")
+        print(f"Run name:   {run_name}")
 
     # ---- Apply --output-dir overrides ----
     if args.output_dir is not None:
@@ -147,7 +167,7 @@ def main() -> None:
     log_file = cfg.get("log_file")
     if log_file:
         out_dir = os.path.dirname(log_file) or "."
-        _plot_losses(log_file, out_dir)
+        _plot_losses(log_file, out_dir, kd_mode=cfg.get("kd_mode", "fkl"))
 
 
 if __name__ == "__main__":
