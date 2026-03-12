@@ -11,14 +11,14 @@ seed: 7
 
 max_length: 512
 num_epochs: 3
-batch_size: 32
-grad_accum_steps: 1
+batch_size: 16
+grad_accum_steps: 4
 lr: 4.0e-5  # era 2e-5 - escala linear com o dobro do batch efetivo
 weight_decay: 0.05
 warmup_ratio: 0.1
 scheduler: cosine
 max_grad_norm: 1.0
-rouge_batch_size: 32  # geracao - testar com 32 primeiro
+rouge_batch_size: 16  # geracao - testar com 32 primeiro
 rouge_max_new_tokens: 256
 rouge_max_prompt_length: 256
 mmlu_subject: null
