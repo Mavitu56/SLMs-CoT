@@ -1,6 +1,7 @@
 """Dolly-15k data loading, chat-template tokenisation, and collation.
 
 Dataset: databricks/databricks-dolly-15k
+Split:   deterministic train/test partition (seed=42, test_size=1011).
 Masking: generic prompt_len approach — labels[:prompt_len] = -100
          so that only the response tokens contribute to the loss.
 
@@ -19,17 +20,44 @@ from src.data_gsm8k import KDCollator
 
 
 # ------------------------------------------------------------------
+# Train / test split constants
+# ------------------------------------------------------------------
+
+_DOLLY_SPLIT_SEED = 42     # deterministic split — never change
+_DOLLY_TEST_SIZE  = 1011   # held-out evaluation examples
+
+
+# ------------------------------------------------------------------
 # Load raw dataset
 # ------------------------------------------------------------------
 
 def load_dolly(split: str = "train") -> datasets.Dataset:
-    """Load Dolly-15k from Hugging Face.
+    """Load Dolly-15k with a deterministic train/test partition.
 
-    The dataset only has a 'train' split. For evaluation, use a
-    held-out portion via ``datasets.Dataset.train_test_split()``.
+    The upstream dataset only has a single ``train`` split.
+    We apply ``train_test_split(test_size=1011, seed=42)`` to produce
+    reproducible **train** (≈14 000) and **test** (1 011) subsets.
+
+    Parameters
+    ----------
+    split : str
+        ``'train'`` or ``'test'``.
     """
-    ds = datasets.load_dataset("databricks/databricks-dolly-15k", split=split)
-    return ds
+    full = datasets.load_dataset(
+        "databricks/databricks-dolly-15k", split="train",
+    )
+    parts = full.train_test_split(
+        test_size=_DOLLY_TEST_SIZE, seed=_DOLLY_SPLIT_SEED,
+    )
+    if split not in parts:
+        raise ValueError(
+            f"Invalid Dolly split: {split!r}. Use 'train' or 'test'."
+        )
+    print(
+        f"[data] Dolly split={split}: {len(parts[split])} examples "
+        f"(total={len(full)}, test_size={_DOLLY_TEST_SIZE}, seed={_DOLLY_SPLIT_SEED})"
+    )
+    return parts[split]
 
 
 # ------------------------------------------------------------------
@@ -109,10 +137,16 @@ def tokenise_example(
     prompt_len = min(prompt_len, len(labels))
     labels[:prompt_len] = [-100] * prompt_len
 
+    # Step 6: build region_ids — prompt (0) and answer (2), no reasoning
+    REGION_PROMPT = 0
+    REGION_ANSWER = 2
+    region_ids = [REGION_PROMPT] * prompt_len + [REGION_ANSWER] * (len(input_ids) - prompt_len)
+
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
+        "region_ids": region_ids,
     }
 
 
@@ -130,6 +164,9 @@ def build_dataloader(
 ) -> torch.utils.data.DataLoader:
     """End-to-end: load Dolly → tokenise → DataLoader.
 
+    Uses a deterministic train/test partition (seed=42, test_size=1011).
+    Pass ``split='train'`` for training, ``split='test'`` for evaluation.
+
     Logs truncation statistics and empty-response discard rate.
     """
     ds = load_dolly(split)
@@ -143,7 +180,7 @@ def build_dataloader(
         result = tokenise_example(example, tokenizer, max_length)
         if result is None:
             # Return empty lists — will be filtered out
-            return {"input_ids": [], "attention_mask": [], "labels": []}
+            return {"input_ids": [], "attention_mask": [], "labels": [], "region_ids": []}
         return result
 
     ds = ds.map(

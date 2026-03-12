@@ -26,7 +26,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.losses_kd import shift_for_causal_lm
-from src.data_gsm8k import REGION_PROMPT, REGION_REASONING, REGION_ANSWER
 from src.analysis_metrics import (
     mean_entropy,
     mean_max_probability,
@@ -39,6 +38,13 @@ from src.analysis_metrics import (
     maxprob_per_position,
 )
 
+
+# ------------------------------------------------------------------
+# Region constants (dataset-agnostic, local definitions)
+# ------------------------------------------------------------------
+REGION_PROMPT    = 0
+REGION_REASONING = 1
+REGION_ANSWER    = 2
 
 # Human-readable region names (for JSON keys)
 _REGION_NAMES = {

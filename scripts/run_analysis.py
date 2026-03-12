@@ -2,26 +2,28 @@
 """
 Layer 2 – Probabilistic analysis of trained student checkpoints.
 
-Evaluates one or more student checkpoints against the teacher on GSM8K
-and saves scalar metrics + per-position curves to a JSON file, plus
-comparison plots.
+Evaluates one or more student checkpoints against the teacher and saves
+scalar metrics + per-position curves to a JSON file, plus comparison plots.
+
+The evaluation dataset is determined by the ``dataset`` field in the YAML
+config (gsm8k | dolly | mmlu).  Default eval splits: gsm8k→test,
+dolly→test, mmlu→test (overridable with ``--eval-split``).
 
 Usage
 -----
-Single checkpoint:
-    python scripts/run_analysis.py \
-        --config configs/kd_qwen_gsm8k.yaml \
-        --checkpoint checkpoints/A_ce_only/final \
-        --label CE
+Single checkpoint (Dolly):
+    python scripts/run_analysis.py \\
+        --config configs/dolly_fkl_T2_seed42.yaml \\
+        --checkpoint checkpoints/fkl_T2_seed42/final \\
+        --label FKL
 
 Multiple checkpoints (full comparison):
-    python scripts/run_analysis.py \
-        --config configs/kd_qwen_gsm8k.yaml \
-        --checkpoints \
-            student_base=Qwen/Qwen2.5-1.5B \
-            CE=checkpoints/A_ce_only/final \
-            KD=checkpoints/B_kd_only/final \
-            KD+CE=checkpoints/C_kd_ce/final \
+    python scripts/run_analysis.py \\
+        --config configs/dolly_fkl_T2_seed42.yaml \\
+        --checkpoints \\
+            CE=checkpoints/ce_only_T1_seed42/final \\
+            FKL=checkpoints/fkl_T2_seed42/final \\
+            RKL=checkpoints/rkl_T2_seed42/final \\
         --output-dir analysis_output
 
 The config provides teacher name, teacher_load_mode, max_length, etc.
@@ -43,13 +45,47 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.data_gsm8k import build_dataloader
 from src.evaluate_probabilistic import evaluate_model, verify_same_tokenizer
 from src.plotting_utils import plot_all
 from src.train_manual import load_teacher, load_student
 
 
 DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "kd_qwen_gsm8k.yaml")
+
+
+def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
+    """Dispatch to the correct data module based on cfg['dataset']."""
+    dataset_name = cfg.get("dataset", "gsm8k")
+
+    if dataset_name == "dolly":
+        from src.data_dolly import build_dataloader
+    elif dataset_name == "gsm8k":
+        from src.data_gsm8k import build_dataloader
+    elif dataset_name == "mmlu":
+        from src.data_mmlu import build_dataloader
+        return build_dataloader(
+            tokenizer=tokenizer,
+            max_length=cfg["max_length"],
+            batch_size=cfg.get("batch_size", 1),
+            split=split,
+            subject=cfg.get("mmlu_subject", None),
+            micro_overfit_n=micro_n,
+            shuffle=False,
+        )
+    else:
+        raise ValueError(
+            f"Unknown dataset: {dataset_name!r}. "
+            f"Supported: 'dolly', 'gsm8k', 'mmlu'."
+        )
+
+    return build_dataloader(
+        tokenizer=tokenizer,
+        max_length=cfg["max_length"],
+        batch_size=cfg.get("batch_size", 1),
+        split=split,
+        micro_overfit_n=micro_n,
+        shuffle=False,
+    )
 
 
 def load_config(path: str) -> dict:
@@ -146,8 +182,8 @@ def main() -> None:
         help="Skip teacher loading (no KL metrics).",
     )
     parser.add_argument(
-        "--eval-split", type=str, default="test",
-        help="GSM8K split to evaluate on (default: test).",
+        "--eval-split", type=str, default=None,
+        help="Dataset split to evaluate on. Defaults: gsm8k→test, dolly→test, mmlu→test.",
     )
     parser.add_argument(
         "--max-batches", type=int, default=None,
@@ -184,17 +220,18 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # ---- Resolve eval split ----
+    dataset_name = cfg.get("dataset", "gsm8k")
+    if args.eval_split is not None:
+        eval_split = args.eval_split
+    else:
+        _default_splits = {"gsm8k": "test", "dolly": "test", "mmlu": "test"}
+        eval_split = _default_splits.get(dataset_name, "test")
+
     # ---- DataLoader ----
-    print(f"\n[data] Building eval dataloader (split={args.eval_split}) …")
+    print(f"\n[data] Building eval dataloader (dataset={dataset_name}, split={eval_split}) …")
     micro_n = cfg.get("micro_overfit_n", None)
-    dataloader = build_dataloader(
-        tokenizer=tokenizer,
-        max_length=cfg["max_length"],
-        batch_size=cfg.get("batch_size", 1),
-        split=args.eval_split,
-        micro_overfit_n=micro_n,
-        shuffle=False,
-    )
+    dataloader = _build_eval_dataloader(cfg, tokenizer, eval_split, micro_n)
 
     # Optionally limit batches
     if args.max_batches is not None and args.max_batches > 0:
