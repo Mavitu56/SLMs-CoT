@@ -46,6 +46,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.evaluate_probabilistic import evaluate_model, verify_same_tokenizer
+from src.evaluate_generation import evaluate_generation_metrics
 from src.plotting_utils import plot_all
 from src.train_manual import load_teacher, load_student
 
@@ -121,30 +122,7 @@ def load_student_from_checkpoint(
     return model
 
 
-def run_single(
-    label: str,
-    checkpoint: str,
-    teacher: AutoModelForCausalLM | None,
-    dataloader: torch.utils.data.DataLoader,
-    cfg: dict,
-) -> dict:
-    """Evaluate a single checkpoint and return the result dict."""
-    print(f"\n{'─'*55}")
-    print(f"  Evaluating: {label}  ({checkpoint})")
-    print(f"{'─'*55}")
-
-    student = load_student_from_checkpoint(
-        checkpoint, cfg.get("student_dtype", "bf16"),
-    )
-    result = evaluate_model(student, teacher, dataloader, cfg)
-    result["label"] = label
-    result["checkpoint"] = checkpoint
-
-    # Free student GPU memory
-    del student
-    torch.cuda.empty_cache()
-
-    return result
+# run_single function is now inlined in main() to avoid double student loading
 
 
 def main() -> None:
@@ -192,6 +170,16 @@ def main() -> None:
     parser.add_argument(
         "--smooth-window", type=int, default=5,
         help="Moving-average window for per-position plots (1=no smoothing).",
+    )
+
+    # ---- Generation metrics (expensive) ----
+    parser.add_argument(
+        "--run-rouge", action="store_true",
+        help="Run ROUGE-L evaluation on Dolly test set (~30 min/checkpoint).",
+    )
+    parser.add_argument(
+        "--run-mmlu", action="store_true",
+        help="Run MMLU exact-match evaluation (~5-10 min/checkpoint).",
     )
 
     args = parser.parse_args()
@@ -268,8 +256,38 @@ def main() -> None:
     # ---- Evaluate each checkpoint ----
     all_results: dict[str, dict] = {}
     for label, ckpt_path in ckpt_map.items():
-        result = run_single(label, ckpt_path, teacher, dataloader, cfg)
+        print(f"\n{'─'*55}")
+        print(f"  Evaluating: {label}  ({ckpt_path})")
+        print(f"{'─'*55}")
+
+        # Load student once for all evaluations
+        student = load_student_from_checkpoint(
+            ckpt_path, cfg.get("student_dtype", "bf16"),
+        )
+        
+        # Probabilistic evaluation
+        result = evaluate_model(student, teacher, dataloader, cfg)
+        result["label"] = label
+        result["checkpoint"] = ckpt_path
+        
+        # ---- Generation-based metrics (optional) ----
+        if args.run_rouge or args.run_mmlu:
+            print(f"\n[generation] Running generation metrics for {label}...")
+            gen_results = evaluate_generation_metrics(
+                model=student,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                run_rouge=args.run_rouge,
+                run_mmlu=args.run_mmlu,
+                show_progress=True,
+            )
+            result.update(gen_results)
+        
         all_results[label] = result
+        
+        # Free student GPU memory
+        del student
+        torch.cuda.empty_cache()
 
     # ---- Save JSON results ----
     os.makedirs(args.output_dir, exist_ok=True)
@@ -331,6 +349,27 @@ def main() -> None:
                 f"{rd['nll']:>8.4f} {rd['ppl']:>8.2f} "
                 f"{rkl:>8} {rd['ece']:>8.4f} {rn:>8}"
             )
+
+    # ---- Generation metrics summary (if run) ----
+    if args.run_rouge or args.run_mmlu:
+        print(f"\n  GENERATION METRICS")
+        gen_header_parts = [f"{'Model':<15}"]
+        if args.run_rouge:
+            gen_header_parts.append(f"{'ROUGE-L':>10}")
+        if args.run_mmlu:
+            gen_header_parts.append(f"{'MMLU Acc':>10}")
+        gen_header = " ".join(gen_header_parts)
+        print(gen_header)
+        print("-" * len(gen_header))
+        for lbl, res in all_results.items():
+            row_parts = [f"{lbl:<15}"]
+            if args.run_rouge:
+                rouge_val = res.get("rouge_l_fmeasure_mean", 0.0)
+                row_parts.append(f"{rouge_val:>10.4f}")
+            if args.run_mmlu:
+                mmlu_val = res.get("mmlu_accuracy", 0.0)
+                row_parts.append(f"{mmlu_val:>10.4f}")
+            print(" ".join(row_parts))
 
     print(f"\n{'='*85}\n")
     print("Done. ✓")
