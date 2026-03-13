@@ -171,6 +171,13 @@ def train(cfg: Dict[str, Any]) -> None:
     print(f"Loading student: {cfg['student_name']}  (dtype={cfg['student_dtype']})")
     student = load_student(cfg["student_name"], cfg["student_dtype"])
 
+    # Optional memory-saving toggles controlled by YAML
+    enable_gradient_checkpointing = cfg.get("enable_gradient_checkpointing", False)
+    free_logits_after_loss = cfg.get("free_logits_after_loss", False)
+
+    if enable_gradient_checkpointing:
+        student.gradient_checkpointing_enable()
+
     device = next(student.parameters()).device
 
     # ---- Vocab-size check ----
@@ -306,6 +313,11 @@ def train(cfg: Dict[str, Any]) -> None:
                 alpha=alpha,
                 kd_mode=kd_mode,
             )
+
+            if free_logits_after_loss:
+                # Free logits early to reduce VRAM pressure.
+                del teacher_logits, student_logits
+                torch.cuda.empty_cache()
 
             # Scale by grad_accum before backward
             scaled_loss = loss_total / grad_accum_steps

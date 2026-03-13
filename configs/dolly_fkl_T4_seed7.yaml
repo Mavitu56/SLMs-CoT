@@ -3,6 +3,8 @@ student_name: Qwen/Qwen2.5-1.5B-Instruct
 teacher_load_mode: 4bit
 student_dtype: bf16
 
+enable_gradient_checkpointing: true
+free_logits_after_loss: true
 dataset: dolly
 kd_mode: fkl
 temperature: 4
