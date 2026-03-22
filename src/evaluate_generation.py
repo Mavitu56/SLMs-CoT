@@ -58,8 +58,8 @@ def _format_dolly_prompt(
 def evaluate_rouge_l_dolly(
     model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizerBase,
-    max_new_tokens: int = 256,
-    max_prompt_length: int = 256,
+    max_new_tokens: int = 512,
+    max_prompt_length: int = 384,
     batch_size: int = 32,
     show_progress: bool = True,
 ) -> Dict[str, Any]:
@@ -163,8 +163,7 @@ def evaluate_rouge_l_dolly(
             
             # Process each generated sequence
             for i, (reference, output_seq) in enumerate(zip(references, output_ids)):
-                # Extract generated tokens (exclude prompt)
-                prompt_len = inputs["attention_mask"][i].sum().item()  # Non-pad tokens
+                # Extract generated tokens (exclude the prompt portion)
                 generated_ids = output_seq[inputs["input_ids"].shape[1]:]
                 generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
                 
@@ -432,8 +431,8 @@ def evaluate_generation_metrics(
         rouge_results = evaluate_rouge_l_dolly(
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=cfg.get("rouge_max_new_tokens", 256),
-            max_prompt_length=cfg.get("rouge_max_prompt_length", 256),
+            max_new_tokens=cfg.get("rouge_max_new_tokens", 512),
+            max_prompt_length=cfg.get("rouge_max_prompt_length", 384),
             batch_size=cfg.get("rouge_batch_size", 32),
             show_progress=show_progress,
         )

@@ -161,6 +161,7 @@ def build_dataloader(
     split: str = "train",
     micro_overfit_n: int | None = None,
     shuffle: bool = True,
+    seed: int = 42,
 ) -> torch.utils.data.DataLoader:
     """End-to-end: load Dolly → tokenise → DataLoader.
 
@@ -221,6 +222,17 @@ def build_dataloader(
         max_length=max_length,
     )
 
+    # ---- Reproducible DataLoader ----
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    def _worker_init_fn(worker_id: int):
+        import numpy as np
+        import random
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
     loader = torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
@@ -230,5 +242,7 @@ def build_dataloader(
         num_workers=4,
         pin_memory=True,
         persistent_workers=True,
+        generator=g if shuffle else None,
+        worker_init_fn=_worker_init_fn,
     )
     return loader

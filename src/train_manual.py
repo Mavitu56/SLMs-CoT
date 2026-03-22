@@ -130,6 +130,7 @@ def _build_dataloader(cfg: Dict[str, Any], tokenizer):
         split="train",
         micro_overfit_n=micro_n,
         shuffle=True,
+        seed=cfg.get("seed", 42),
     )
 
 
@@ -315,9 +316,10 @@ def train(cfg: Dict[str, Any]) -> None:
             )
 
             if free_logits_after_loss:
-                # Free logits early to reduce VRAM pressure.
-                del teacher_logits, student_logits
-                torch.cuda.empty_cache()
+                # Free logits and model output containers to reduce VRAM pressure.
+                # del student_out is necessary — del student_logits alone does not
+                # free the tensor because student_out.logits holds the same reference.
+                del teacher_logits, student_logits, student_out
 
             # Scale by grad_accum before backward
             scaled_loss = loss_total / grad_accum_steps
@@ -338,6 +340,10 @@ def train(cfg: Dict[str, Any]) -> None:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                if free_logits_after_loss:
+                    # empty_cache here (optimizer step boundary) instead of per
+                    # micro-step to avoid GPU sync overhead on every forward pass.
+                    torch.cuda.empty_cache()
                 global_step += 1
 
                 # ---- Logging ----
