@@ -12,6 +12,22 @@ Gate criteria (Planejamento v2.2, Parte V, Fase 1.0):
     - percentile-95 total length     <= 768 tokens
     - teacher accuracy vs gold        >= 80 %
 
+v2.2 CHANGELOG addendum (2026-04-24, dry-run-driven):
+    - Fix 1: system prompt instructs plain prose + explicit ``#### N``
+      termination (no LaTeX / ``\\boxed`` / markdown). The 4-shot block
+      alone did not hold the format against Qwen2.5-7B-Instruct's RLHF
+      prior on math problems (consistent with Pré-0 ref [18]).
+    - Fix 2: secondary ``\\boxed{N}`` extractor produces an
+      informative-only ``latent_accuracy_vs_gold`` signal (Alerta A20).
+      It does NOT gate format — ``separator_found`` remains strictly
+      tied to ``####`` because downstream ``tokenise_example`` in
+      ``src/data_gsm8k.py`` depends on ``text.find("####")``.
+    - Fix 3: few-shot assistant turns have the GSM8K
+      ``<<expr=result>>`` calculator annotations stripped (regex
+      ``<<[^>]*>>``). Rationale prose and the ``\\n#### N`` tail are
+      preserved verbatim. CoT distribution over held-out questions
+      remains ``P_teacher``.
+
 References
 ----------
 Cobbe et al., 2021 — "Training Verifiers to Solve Math Word Problems"
@@ -59,12 +75,32 @@ from src.train_manual import load_teacher  # noqa: E402
 # Constants
 # ------------------------------------------------------------------
 
-SYSTEM_PROMPT = "You are a helpful assistant that solves math word problems."
+SYSTEM_PROMPT = (
+    "You are a helpful assistant that solves math word problems. "
+    "Show your reasoning step by step in plain prose. Do not use LaTeX, "
+    "do not use \\boxed, do not use markdown formatting. End your answer "
+    "with a line of the form '#### N' where N is the final numeric answer, "
+    "exactly matching the format of the examples."
+)
 
 # Few-shot exemplars: first 4 indices of GSM8K train (deterministic,
-# reproducible). The full native answer (including "#### N") is used as
-# the assistant content — this enforces the target output format.
+# reproducible). The assistant turns use the **native GSM8K answer with
+# the ``<<expr=result>>`` calculator annotations stripped** (Fix 3,
+# v2.2 CHANGELOG 2026-04-24). Rationale prose and ``#### N`` are preserved
+# verbatim. This leaves the teacher's CoT distribution intact while
+# removing a format artefact that empirically pushed Qwen2.5-7B-Instruct
+# toward LaTeX / ``\boxed{}`` output.
 FEW_SHOT_INDICES: Tuple[int, ...] = (0, 1, 2, 3)
+
+# Matches the GSM8K native calculator annotation <<48/2=24>>, <<100-50-30-15=5>>, …
+_GSM8K_CALC_ANNOTATION = re.compile(r"<<[^>]*>>")
+
+# Secondary extractor for the Fix 2 fallback: matches ``\boxed{<number>}``
+# produced by the teacher when it ignores the ``####`` target format.
+# NOTE: we need FOUR backslashes in the raw string so the compiled regex
+# has two, which in turn matches a single literal backslash — ``\b`` in
+# regex is a word boundary, not a literal backslash.
+_BOXED_REGEX = re.compile(r"\\\\boxed\{\s*(-?[\d,]+(?:\.\d+)?)\s*\}")
 
 # ``####  <signed number, optional commas, optional decimal part>``
 SEPARATOR_REGEX = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
@@ -93,11 +129,33 @@ def extract_teacher_answer(generated_text: str) -> Tuple[bool, Optional[str]]:
     Returns ``(separator_found, extracted_answer_or_None)``.
     The first ``####`` occurrence is used; if no separator is present,
     ``(False, None)`` is returned.
+
+    NOTE: ``separator_found`` is the ONLY signal used to gate the pilot
+    format criterion (>= 0.95). The downstream ``tokenise_example`` in
+    ``src/data_gsm8k.py`` depends on ``text.find("####")`` to segment
+    regions, so gating strictly on ``####`` is load-bearing.
     """
     m = SEPARATOR_REGEX.search(generated_text)
     if m is None:
         return False, None
     return True, _normalise_number(m.group(1))
+
+
+def extract_boxed_fallback(generated_text: str) -> Optional[str]:
+    """Extract ``\\boxed{N}`` as a secondary, informative-only signal (Fix 2).
+
+    When the teacher ignores the ``####`` target format and emits LaTeX
+    ``\\boxed{N}`` instead, this fallback lets us measure *latent* teacher
+    accuracy (Alerta A20) without softening the format gate.
+
+    The returned value is used ONLY for reporting ``latent_accuracy`` in
+    the stats block — it does NOT contribute to ``is_correct`` or to the
+    go/no-go gate decision, which remain strictly tied to ``####``.
+    """
+    m = _BOXED_REGEX.search(generated_text)
+    if m is None:
+        return None
+    return _normalise_number(m.group(1))
 
 
 def _normalise_number(s: str) -> str:
@@ -123,6 +181,20 @@ def is_answer_correct(gold: Optional[str], pred: Optional[str]) -> bool:
 # Few-shot prompt construction
 # ------------------------------------------------------------------
 
+def _clean_gsm8k_answer(answer: str) -> str:
+    """Strip GSM8K ``<<expr=result>>`` calculator annotations (Fix 3).
+
+    Removes only the bracketed annotations; rationale prose, line breaks,
+    numeric values, and the final ``\\n#### N`` are preserved verbatim.
+
+    Example::
+
+        in:  'Natalia sold 48/2 = <<48/2=24>>24 clips in May.\\n#### 72'
+        out: 'Natalia sold 48/2 = 24 clips in May.\\n#### 72'
+    """
+    return _GSM8K_CALC_ANNOTATION.sub("", answer)
+
+
 def build_messages(
     train_ds: datasets.Dataset,
     question: str,
@@ -130,18 +202,21 @@ def build_messages(
 ) -> List[Dict[str, str]]:
     """Build the chat-template messages for the teacher.
 
-    Structure:
+    Structure::
+
         [system]
-        [user: Q_0 ]  [assistant: A_0 (with ####) ]
-        [user: Q_1 ]  [assistant: A_1            ]
+        [user: Q_0 ]  [assistant: A_0'  (with ####, <<...>> stripped) ]
+        [user: Q_1 ]  [assistant: A_1'                                ]
         ...
-        [user: Q_k ]  [assistant: A_k            ]
+        [user: Q_k ]  [assistant: A_k'                                ]
         [user: <question under test> ]            ← generation target
 
-    The assistant turns in the few-shot block use the **native GSM8K
-    answer** (full rationale + ``#### N``), which enforces the desired
-    output format for the teacher. This is the "Distilling Step-by-Step"
-    prompting style adapted to GSM8K's native separator.
+    The assistant turns use the native GSM8K rationale with the
+    ``<<expr=result>>`` calculator annotations removed (Fix 3). The
+    teacher's output distribution over the held-out questions remains
+    ``P_teacher`` — this is still teacher-generated CoT, not human
+    rationale — we only adjusted the few-shot exemplar surface form to
+    discourage LaTeX / ``\\boxed{}`` outputs.
     """
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -149,7 +224,10 @@ def build_messages(
     for i in few_shot_indices:
         ex = train_ds[int(i)]
         messages.append({"role": "user", "content": ex["question"]})
-        messages.append({"role": "assistant", "content": ex["answer"]})
+        messages.append({
+            "role": "assistant",
+            "content": _clean_gsm8k_answer(ex["answer"]),
+        })
     messages.append({"role": "user", "content": question})
     return messages
 
@@ -270,9 +348,15 @@ def run_pilot(
             skip_special_tokens=True,
         )
 
-        # Separator + answer extraction
+        # Primary extraction (gates the format criterion)
         sep_found, pred = extract_teacher_answer(generated_text)
         correct = is_answer_correct(gold, pred)
+
+        # Secondary / fallback extraction (informative only — Fix 2)
+        boxed_pred = extract_boxed_fallback(generated_text)
+        # ``latent_pred`` = best-effort answer from any supported format
+        latent_pred = pred if pred is not None else boxed_pred
+        latent_correct = is_answer_correct(gold, latent_pred)
 
         sample_record = {
             "idx": int(idx),
@@ -283,6 +367,8 @@ def run_pilot(
             "separator_found": bool(sep_found),
             "extracted_answer": pred,
             "is_correct": bool(correct),
+            "fallback_boxed_answer": boxed_pred,
+            "latent_is_correct": bool(latent_correct),
             "total_len_tokens": full_len,
             "prompt_len_tokens": prompt_len,
             "generation_len_tokens": generation_len,
@@ -306,6 +392,11 @@ def run_pilot(
     n = len(samples)
     sep_rate = sum(s["separator_found"] for s in samples) / max(n, 1)
     acc = sum(s["is_correct"] for s in samples) / max(n, 1)
+    latent_acc = sum(s["latent_is_correct"] for s in samples) / max(n, 1)
+    n_boxed_fallback = sum(
+        1 for s in samples
+        if (not s["separator_found"]) and s["fallback_boxed_answer"] is not None
+    )
     total_lens = np.array([s["total_len_tokens"] for s in samples], dtype=np.int64)
     gen_lens = np.array([s["generation_len_tokens"] for s in samples], dtype=np.int64)
     n_truncated = int((gen_lens >= max_new_tokens).sum())
@@ -314,6 +405,10 @@ def run_pilot(
         "n_samples": n,
         "separator_rate": float(sep_rate),
         "teacher_accuracy_vs_gold": float(acc),
+        # Latent signal — answers recovered from '####' OR fallback '\boxed{N}'.
+        # Informative-only; does NOT gate go/no-go decisions.
+        "latent_accuracy_vs_gold": float(latent_acc),
+        "n_boxed_fallback_only": int(n_boxed_fallback),
         "mean_total_len_tokens": float(total_lens.mean()),
         "median_total_len_tokens": float(np.median(total_lens)),
         "p95_total_len_tokens": float(np.percentile(total_lens, 95)),
@@ -366,6 +461,8 @@ def run_pilot(
     print(f"  n_samples                 : {n}")
     print(f"  separator_rate            : {sep_rate:.3f}  (>= 0.95 ?)")
     print(f"  teacher_accuracy_vs_gold  : {acc:.3f}  (>= 0.80 ?)")
+    print(f"  latent_accuracy_vs_gold   : {latent_acc:.3f}  (informative — ####|boxed)")
+    print(f"  n_boxed_fallback_only     : {n_boxed_fallback}  (no ####, but \\boxed{{}} present)")
     print(f"  mean total_len (tokens)   : {total_lens.mean():.1f}  (<= 750 ?)")
     print(f"  p95  total_len (tokens)   : {np.percentile(total_lens, 95):.1f}  (<= 768 ?)")
     print(f"  max  total_len (tokens)   : {int(total_lens.max())}")
