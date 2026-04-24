@@ -55,6 +55,95 @@ few-shot permanecem inalterados.
 **Próximo passo:** novo dry-run de 5; se `separator_rate ≥ 0.80` e
 `latent_accuracy ≥ 0.80`, autorizar piloto de 100.
 
+## CHANGELOG v2.2 addendum (2026-04-24 · Fase 1.0 concluída · GO)
+
+Piloto n=100 executado na A100 bf16 (Qwen2.5-7B-Instruct, greedy, seed=42,
+indices fora de `{0,1,2,3}`, fixes F1+F2+F3 ativos). Resultados:
+
+| Métrica | Valor | Gate | Status |
+|---|---|---|---|
+| `separator_rate` | 1.000 | ≥ 0.95 | PASS |
+| `teacher_accuracy_vs_gold` | 0.920 | ≥ 0.80 | PASS |
+| `latent_accuracy_vs_gold` | 0.920 | — | (informativo — confirma A20) |
+| `mean_total_len_tokens` | 721.2 | ≤ 750 | PASS |
+| `p95_total_len_tokens` | 832.4 | ≤ 768 | **FAIL — aciona D1** |
+| `max_total_len_tokens` | 956 | — | — |
+| `n_truncated_by_max_new_tokens` | 0 / 100 | — | — |
+| `n_boxed_fallback_only` | 0 / 100 | — | F1+F3 consolidados |
+
+**Distribuição contra candidatos de `max_length`:** > 768 = 16 %, > 800
+= 11 %, > 900 = 2 %, ≥ 1024 = 0 %. O corte em 16 % ultrapassa o
+limiar Pré-0 §A12 ("upgrade para 1024 se truncamento > 15 %"); 1024
+absorve a distribuição inteira com 68 tokens de folga no pior caso.
+
+**Decisões resolvidas:**
+- **D1 → `max_length: 1024`** (§4.2, §4.5 atualizadas). Implica +33 %
+  VRAM vs 768; mitigações D2 (batch 16→8, grad_accum 4→8) e D6
+  (gradient checkpointing) permanecem disponíveis na Fase 4.
+- **D3 → `filter_teacher_wrong: false`**. Acurácia 0.92 supera em
+  12 pp o limiar A20 (0.80); remover 8 % de exemplos perderia
+  diversidade no `P_teacher` sem ganho compensatório.
+
+**Decisão GO**: formalmente `go_decision = false` no JSON (gate p95
+não atinge 768), mas substantivamente GO — o único gate fora é o
+mecanismo desenhado pelo v2.2 §4.5 e §6.3 para acionar D1, e D1 foi
+resolvido como previsto. Relatório detalhado em
+`outputs/pilot/pilot_report.md`.
+
+**Próximo passo:** Fase 1.1 — `scripts/generate_full_cot.py` (próxima
+sessão), gerando `data/gsm8k_cot_qwen25_7b.jsonl` com 8 792 linhas
+(7 473 train + 1 319 test) a `max_new_tokens = 512`.
+
+## CHANGELOG v2.2 — Adições de escopo (2026-04-24)
+
+Duas adições metodológicas autorizadas pelo usuário na mesma sessão em
+que a Fase 1.0 foi concluída. Entram em fases posteriores; nenhuma
+implementação prevista antes do término da fase-hospedeira.
+
+### Adição A1 — Tarefa 5.9 na Fase 5 (Análise multi-métrica)
+
+Correlação de Pearson entre `H_R` do student (média por exemplo sobre
+o test set) e `is_correct` (0/1 por exemplo), para cada uma das 7
+condições (CE + 3 FKL + 3 RKL), com 3 seeds por condição. Entregáveis:
+`figures/hr_vs_accuracy.pdf` (scatter facetado por condição, linha de
+regressão logística sobreposta) e `results/correlation_hr_accuracy.json`
+(coeficiente ± IC95 % por condição). **Justificativa teórica:** se H1
+for verdadeira e RKL colapsa `H_R` especificamente nos forking tokens
+[Wang et al. ACL 2025], esperamos correlação positiva entre `H_R` e
+acurácia — materializando a implicação prática "colapsar raciocínio
+destrói capacidade de resolver". Custo: zero adicional — ambas as
+métricas já serão computadas nas Fases 4 e 5. Responsável: 🤖 (cálculo
+e figura) + 🧑 (validação da interpretação).
+
+### Adição A2 — Subfase 4.0.bis (Sanity run antes dos 21 configs)
+
+Antes da execução paralela dos 21 runs da Fase 4, rodar exatamente 1
+run isolado: `configs/gsm8k_cot_ce_only_T1_seed42.yaml` (primeiro da
+ordem de execução). Validar 6 critérios de saúde do pipeline CoT
+completo **antes** de gerar os outros 20 configs:
+
+1. Treino completa 3 épocas sem erro.
+2. NLL do student decrescente nas últimas épocas.
+3. Acurácia GSM8K do student no test set ≥ 45 % (range plausível para
+   Qwen2.5-1.5B sem tuning math específico).
+4. Taxa de falha de formato (`####` ausente no output do student)
+   < 10 %.
+5. Métricas por fase (`H_R`, `H_A`, `ρ`, `ECE_response`) produzem
+   valores finitos e `ρ ∈ [0.1, 5.0]`.
+6. Wall-clock do run ≤ 70 min (margem sobre os 50 min estimados).
+
+**Critérios de branching:** se algum falha, parar e reportar —
+não gerar os outros 20 configs. Se todos passam, gerar os outros 20 e
+prosseguir; o run já executado **conta** como o CE seed 42 — não
+refazer. Entregável: `results/sanity_run_ce_seed42.json` com
+avaliação dos 6 critérios e decisão go/no-go documentada.
+**Justificativa operacional:** se o baseline colapsar por razões não
+relacionadas a FKL/RKL (max_length cortando resposta, separador
+malformado, acurácia irrealista, loss explodindo), descobrimos em
+50–70 min em vez de 17 h — proteção barata contra retrabalho caro.
+Responsável: 🧑 (executa na GPU) + 🤖 (validação automática dos 6
+critérios após o treino).
+
 ---
 
 # PARTE I — ARTIGO I: CONCLUÍDO (SEMISH 2026)
@@ -108,7 +197,7 @@ Idêntica a v2.1: como a direção da KL (FKL vs RKL) afeta H(t) e ECE em destil
 | Fonte de dados no treino | **JSONL externo**: `data/gsm8k_cot_qwen25_7b.jsonl` |
 | Dataset secundário | MMLU (`cais/mmlu`, `all`, split `test`) — código já existe em `src/data_mmlu.py` |
 | Tokenizer | Qwen2.5-1.5B-Instruct |
-| Max sequence length | **768 tokens** (validar no piloto; fallback 1024) |
+| Max sequence length | **1024 tokens** (resolvido na Fase 1.0 — ver CHANGELOG 2026-04-24 · piloto) |
 | Caching | JSONL gerado uma vez, reutilizado em todos os 21 runs |
 
 ## 4.3 — Modelos (CONGELADO)
@@ -141,7 +230,7 @@ Todos com docstrings referenciando Hinton 2015 e Gu et al. 2024 — **convençã
 | Weight decay | 0.05 | Artigo I |
 | Épocas | 3 | Artigo I |
 | Batch efetivo | 64 (batch 16 × grad_accum 4) | Artigo I |
-| Max sequence length | **768** | A12 — validar no piloto |
+| Max sequence length | **1024** | D1 resolvido na Fase 1.0 (piloto n=100: p95=832, max=956, nenhuma amostra ≥ 1024) |
 | α | 0.5 fixo | Hinton 2015 |
 | `max_grad_norm` | 1.0 | Artigo I |
 | `teacher_load_mode` | **bf16** | Decisão do usuário |
@@ -613,14 +702,14 @@ Idêntica a v2.1. Checklist de Limitações inclui L3, L5 (persistentes), A11–
 
 ## 6.3 — Pontos de decisão pendentes
 
-| # | Decisão | Quando | Responsável | Critério |
-|---|---|---|---|---|
-| D1 | Max length final (768 vs 1024) | Após Fase 1.0 | 🧑 + 💬 | Percentil 95 do piloto |
-| D2 | Reduzir batch para 8+grad_accum 8 | Início Fase 4 | 🧑 | OOM em FKL bf16 |
-| D3 | Filtrar teacher-wrong do JSONL | Após Fase 1.1 | 🧑 + 💬 | Se acurácia teacher < 80% |
-| D4 | Aprovar Fase 6 (micro-exploração) | Após Fase 5 | 🧑 | Tempo restante |
-| D5 | Reescrita parcial de H1 se rejeitada | Fase 7 | 🧑 + 💬 | Análise estatística |
-| D6 | Ativar `enable_gradient_checkpointing` | Início Fase 4 | 🧑 | OOM persistente |
+| # | Decisão | Quando | Responsável | Critério | Status |
+|---|---|---|---|---|---|
+| D1 | Max length final (768 vs 1024) | Após Fase 1.0 | 🧑 + 💬 | Percentil 95 do piloto | ✔ **Resolvida 2026-04-24 → 1024** |
+| D2 | Reduzir batch para 8+grad_accum 8 | Início Fase 4 | 🧑 | OOM em FKL bf16 | pendente |
+| D3 | Filtrar teacher-wrong do JSONL | Após Fase 1.1 | 🧑 + 💬 | Se acurácia teacher < 80% | ✔ **Resolvida 2026-04-24 → off** (teacher=0.92) |
+| D4 | Aprovar Fase 6 (micro-exploração) | Após Fase 5 | 🧑 | Tempo restante | pendente |
+| D5 | Reescrita parcial de H1 se rejeitada | Fase 7 | 🧑 + 💬 | Análise estatística | pendente |
+| D6 | Ativar `enable_gradient_checkpointing` | Início Fase 4 | 🧑 | OOM persistente | pendente |
 
 ---
 
