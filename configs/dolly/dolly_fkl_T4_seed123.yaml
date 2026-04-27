@@ -1,0 +1,31 @@
+teacher_name: Qwen/Qwen2.5-7B-Instruct
+student_name: Qwen/Qwen2.5-1.5B-Instruct
+teacher_load_mode: 4bit
+student_dtype: bf16
+
+enable_gradient_checkpointing: true
+free_logits_after_loss: true
+dataset: dolly
+kd_mode: fkl
+temperature: 4
+alpha: 0.5
+seed: 123
+
+max_length: 512
+num_epochs: 3
+batch_size: 2
+grad_accum_steps: 4   # batch efetivo = 8
+lr: 2.0e-5
+weight_decay: 0.05
+warmup_ratio: 0.1
+scheduler: cosine
+max_grad_norm: 1.0
+rouge_batch_size: 16  # geracao - testar com 32 primeiro
+rouge_max_new_tokens: 512
+rouge_max_prompt_length: 384
+mmlu_subject: null
+
+log_every: 50
+save_dir: checkpoints/fkl_T4_seed123
+log_file: logs/fkl_T4_seed123.jsonl
+run_sanity: true

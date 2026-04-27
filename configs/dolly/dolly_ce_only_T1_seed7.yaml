@@ -1,0 +1,29 @@
+teacher_name: Qwen/Qwen2.5-7B-Instruct
+student_name: Qwen/Qwen2.5-1.5B-Instruct
+teacher_load_mode: 4bit
+student_dtype: bf16
+
+dataset: dolly
+kd_mode: ce_only
+temperature: 1
+alpha: 0.5
+seed: 7
+
+max_length: 512
+num_epochs: 3
+batch_size: 2
+grad_accum_steps: 4   # batch efetivo = 8
+lr: 2.0e-5
+weight_decay: 0.05
+warmup_ratio: 0.1
+scheduler: cosine
+max_grad_norm: 1.0
+rouge_batch_size: 16  # geracao - testar com 32 primeiro
+rouge_max_new_tokens: 512
+rouge_max_prompt_length: 384
+mmlu_subject: null
+
+log_every: 50
+save_dir: checkpoints/ce_only_T1_seed7
+log_file: logs/ce_only_T1_seed7.jsonl
+run_sanity: true
