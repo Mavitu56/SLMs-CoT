@@ -12,9 +12,9 @@ from typing import Any, Dict
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from src.data_dolly import build_dataloader
-from src.losses_kd import compute_total_loss
-from src.analysis_metrics import compute_ece
+from src.data.data_dolly import build_dataloader
+from src.losses.losses_kd import compute_total_loss
+from src.evaluation.analysis_metrics import compute_ece
 
 
 # ==================================================================
@@ -556,7 +556,7 @@ def check_masking_prompt_len(tokenizer, max_length: int) -> None:
     """Verify that prompt tokens have labels=-100 in Dolly tokenisation."""
     print("[sanity] 11 – Masking (prompt_len) …", end=" ")
 
-    from src.data_dolly import tokenise_example
+    from src.data.data_dolly import tokenise_example
 
     example = {
         "instruction": "What is the capital of France?",

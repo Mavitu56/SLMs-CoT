@@ -68,7 +68,7 @@ if PROJECT_ROOT not in sys.path:
 
 import datasets  # noqa: E402
 
-from src.train_manual import load_teacher  # noqa: E402
+from src.training.train_manual import load_teacher  # noqa: E402
 
 
 # ------------------------------------------------------------------

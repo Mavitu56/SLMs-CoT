@@ -16,7 +16,7 @@ import datasets
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from src.data_gsm8k import KDCollator
+from src.data.data_gsm8k import KDCollator
 
 
 # ------------------------------------------------------------------

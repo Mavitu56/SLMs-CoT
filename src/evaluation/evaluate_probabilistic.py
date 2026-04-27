@@ -26,8 +26,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.losses_kd import shift_for_causal_lm
-from src.analysis_metrics import (
+from src.losses.losses_kd import shift_for_causal_lm
+from src.evaluation.analysis_metrics import (
     mean_entropy,
     mean_max_probability,
     mean_kl,

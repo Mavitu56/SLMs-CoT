@@ -1,1 +1,1 @@
-# src – Knowledge Distillation for Causal LM (GSM8K)
+# src – Knowledge Distillation for Causal LM

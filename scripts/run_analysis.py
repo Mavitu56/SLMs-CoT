@@ -45,10 +45,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.evaluate_probabilistic import evaluate_model, verify_same_tokenizer
-from src.evaluate_generation import evaluate_generation_metrics
-from src.plotting_utils import plot_all
-from src.train_manual import load_teacher, load_student
+from src.evaluation.evaluate_probabilistic import evaluate_model, verify_same_tokenizer
+from src.evaluation.evaluate_generation import evaluate_generation_metrics
+from src.visualization.plotting_utils import plot_all
+from src.training.train_manual import load_teacher, load_student
 
 
 DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "kd_qwen_gsm8k.yaml")
@@ -59,11 +59,11 @@ def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
     dataset_name = cfg.get("dataset", "gsm8k")
 
     if dataset_name == "dolly":
-        from src.data_dolly import build_dataloader
+        from src.data.data_dolly import build_dataloader
     elif dataset_name == "gsm8k":
-        from src.data_gsm8k import build_dataloader
+        from src.data.data_gsm8k import build_dataloader
     elif dataset_name == "mmlu":
-        from src.data_mmlu import build_dataloader
+        from src.data.data_mmlu import build_dataloader
         return build_dataloader(
             tokenizer=tokenizer,
             max_length=cfg["max_length"],

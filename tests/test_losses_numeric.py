@@ -6,7 +6,7 @@ All tests use small synthetic tensors on CPU — no model loading required.
 import torch
 import pytest
 
-from src.losses_kd import (
+from src.losses.losses_kd import (
     compute_kd_forward_kl,
     compute_kd_reverse_kl,
     compute_total_loss,

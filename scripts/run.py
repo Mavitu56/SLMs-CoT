@@ -25,8 +25,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.train_manual import load_teacher, load_student, train
-from src.sanity import run_all_sanity_checks
+from src.training.train_manual import load_teacher, load_student, train
+from src.training.sanity import run_all_sanity_checks
 from transformers import AutoTokenizer
 
 

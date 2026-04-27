@@ -92,7 +92,7 @@ def evaluate_rouge_l_dolly(
             "Install with: pip install rouge-score"
         )
     
-    from src.data_dolly import load_dolly
+    from src.data.data_dolly import load_dolly
     
     model.eval()
     device = next(model.parameters()).device
@@ -279,7 +279,7 @@ def evaluate_mmlu_accuracy(
     dict with keys:
         mmlu_accuracy, n_correct, n_total, per_subject_accuracy (if all subjects)
     """
-    from src.data_mmlu import load_mmlu, format_mmlu_prompt
+    from src.data.data_mmlu import load_mmlu, format_mmlu_prompt
 
     model.eval()
     device = next(model.parameters()).device

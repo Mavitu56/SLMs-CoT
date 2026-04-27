@@ -19,8 +19,8 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from src.losses_kd import compute_total_loss
-from src.utils_seed import set_seed
+from src.losses.losses_kd import compute_total_loss
+from src.training.utils_seed import set_seed
 
 
 # ------------------------------------------------------------------
@@ -113,9 +113,9 @@ def _build_dataloader(cfg: Dict[str, Any], tokenizer):
     dataset_name = cfg.get("dataset", "gsm8k")
 
     if dataset_name == "dolly":
-        from src.data_dolly import build_dataloader
+        from src.data.data_dolly import build_dataloader
     elif dataset_name == "gsm8k":
-        from src.data_gsm8k import build_dataloader
+        from src.data.data_gsm8k import build_dataloader
     else:
         raise ValueError(
             f"Unknown dataset: {dataset_name!r}. "

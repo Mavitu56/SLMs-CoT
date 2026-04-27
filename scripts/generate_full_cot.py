@@ -99,7 +99,7 @@ if PROJECT_ROOT not in sys.path:
 
 import datasets  # noqa: E402
 
-from src.train_manual import load_teacher  # noqa: E402
+from src.training.train_manual import load_teacher  # noqa: E402
 # Import validated helpers from the pilot — do NOT duplicate logic.
 from scripts.pilot_cot_generation import (  # noqa: E402
     FEW_SHOT_INDICES,
