@@ -235,9 +235,12 @@ def generate_one(
         {"role": "user", "content": question},
         {"role": "assistant", "content": teacher_full_text},
     ]
+    # return_tensors=None guarantees a plain Python list of ints regardless
+    # of transformers version — len() then gives the true token count.
     student_tokenised = student_tokenizer.apply_chat_template(
         student_messages,
         tokenize=True,
+        return_tensors=None,
         add_generation_prompt=False,
     )
     total_len_tokens = len(student_tokenised)
