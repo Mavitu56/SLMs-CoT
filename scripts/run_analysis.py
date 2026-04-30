@@ -58,6 +58,25 @@ def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
     """Dispatch to the correct data module based on cfg['dataset']."""
     dataset_name = cfg.get("dataset", "gsm8k")
 
+    if dataset_name == "gsm8k_cot":
+        from src.data.data_gsm8k import build_dataloader_cot
+        jsonl_path = cfg.get("cot_data_path")
+        if not jsonl_path:
+            raise ValueError(
+                "dataset='gsm8k_cot' requires cfg['cot_data_path']."
+            )
+        return build_dataloader_cot(
+            tokenizer=tokenizer,
+            max_length=cfg["max_length"],
+            batch_size=cfg.get("batch_size", 1),
+            jsonl_path=jsonl_path,
+            split=split,
+            filter_teacher_wrong=cfg.get("filter_teacher_wrong", False),
+            micro_overfit_n=micro_n,
+            shuffle=False,
+            seed=cfg.get("seed", 42),
+        )
+
     if dataset_name == "dolly":
         from src.data.data_dolly import build_dataloader
     elif dataset_name == "gsm8k":
@@ -76,7 +95,7 @@ def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
     else:
         raise ValueError(
             f"Unknown dataset: {dataset_name!r}. "
-            f"Supported: 'dolly', 'gsm8k', 'mmlu'."
+            f"Supported: 'dolly', 'gsm8k', 'gsm8k_cot', 'mmlu'."
         )
 
     return build_dataloader(
@@ -181,6 +200,10 @@ def main() -> None:
         "--run-mmlu", action="store_true",
         help="Run MMLU exact-match evaluation (~5-10 min/checkpoint).",
     )
+    parser.add_argument(
+        "--run-gsm8k", action="store_true",
+        help="Run GSM8K exact-match evaluation on the CoT JSONL test split.",
+    )
 
     args = parser.parse_args()
 
@@ -271,7 +294,7 @@ def main() -> None:
         result["checkpoint"] = ckpt_path
         
         # ---- Generation-based metrics (optional) ----
-        if args.run_rouge or args.run_mmlu:
+        if args.run_rouge or args.run_mmlu or args.run_gsm8k:
             print(f"\n[generation] Running generation metrics for {label}...")
             gen_results = evaluate_generation_metrics(
                 model=student,
@@ -279,6 +302,7 @@ def main() -> None:
                 cfg=cfg,
                 run_rouge=args.run_rouge,
                 run_mmlu=args.run_mmlu,
+                run_gsm8k=args.run_gsm8k,
                 show_progress=True,
             )
             result.update(gen_results)
@@ -302,25 +326,29 @@ def main() -> None:
         plot_all(all_results, args.output_dir, smooth_window=args.smooth_window)
 
     # ---- Summary table (global) ----
-    print(f"\n{'='*85}")
+    print(f"\n{'='*95}")
     print("  GLOBAL SUMMARY")
-    print(f"{'='*85}")
+    print(f"{'='*95}")
     header = (
         f"{'Model':<15} {'Entropy':>8} {'MaxProb':>8} "
         f"{'NLL':>8} {'PPL':>8} {'KL(T||S)':>9} {'ECE':>8} "
-        f"{'Tokens':>8} {'AvgLen':>7}"
+        f"{'rho':>8} {'Tokens':>8} {'AvgLen':>7}"
     )
     print(header)
     print("-" * len(header))
     for lbl, res in all_results.items():
         kl_str = f"{res['mean_kl']:.4f}" if res.get("mean_kl") is not None else "  n/a"
+        rho_str = (
+            f"{res['rho_HR_HA']:.4f}"
+            if res.get("rho_HR_HA") is not None else "  n/a"
+        )
         print(
             f"{lbl:<15} {res['mean_entropy']:>8.4f} {res['mean_maxprob']:>8.4f} "
             f"{res['mean_nll']:>8.4f} {res['ppl']:>8.2f} "
             f"{kl_str:>9} {res['ece']:>8.4f} "
-            f"{res['n_tokens_eval']:>8} {res['avg_seq_length']:>7.1f}"
+            f"{rho_str:>8} {res['n_tokens_eval']:>8} {res['avg_seq_length']:>7.1f}"
         )
-    print(f"{'='*85}")
+    print(f"{'='*95}")
 
     # ---- Summary table (per region) ----
     region_keys = [("Prompt", "region_prompt"),
@@ -351,13 +379,16 @@ def main() -> None:
             )
 
     # ---- Generation metrics summary (if run) ----
-    if args.run_rouge or args.run_mmlu:
+    if args.run_rouge or args.run_mmlu or args.run_gsm8k:
         print(f"\n  GENERATION METRICS")
         gen_header_parts = [f"{'Model':<15}"]
         if args.run_rouge:
             gen_header_parts.append(f"{'ROUGE-L':>10}")
         if args.run_mmlu:
             gen_header_parts.append(f"{'MMLU Acc':>10}")
+        if args.run_gsm8k:
+            gen_header_parts.append(f"{'GSM8K Acc':>10}")
+            gen_header_parts.append(f"{'FmtFail%':>9}")
         gen_header = " ".join(gen_header_parts)
         print(gen_header)
         print("-" * len(gen_header))
@@ -369,6 +400,11 @@ def main() -> None:
             if args.run_mmlu:
                 mmlu_val = res.get("mmlu_accuracy", 0.0)
                 row_parts.append(f"{mmlu_val:>10.4f}")
+            if args.run_gsm8k:
+                gsm_val = res.get("gsm8k_accuracy", 0.0)
+                fmt_fail = res.get("format_failure_rate", 0.0)
+                row_parts.append(f"{gsm_val:>10.4f}")
+                row_parts.append(f"{fmt_fail:>9.2%}")
             print(" ".join(row_parts))
 
     print(f"\n{'='*85}\n")
