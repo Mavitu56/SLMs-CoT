@@ -1,15 +1,20 @@
-"""Generation-based evaluation: ROUGE-L for Dolly, Exact Match for MMLU.
+"""Generation-based evaluation: ROUGE-L for Dolly, Exact Match for MMLU,
+GSM8K exact-match accuracy on the teacher-generated CoT test set.
 
 ROUGE-L evaluates open-ended generation quality on the Dolly test set.
 MMLU Exact Match evaluates multiple-choice accuracy via logit comparison.
+GSM8K accuracy compares the student's ``#### N`` extracted answer with
+the gold answer from the GSM8K test split (off-policy CoT JSONL).
 
 These metrics are more expensive than probabilistic metrics:
 - ROUGE-L: ~30 min per checkpoint (generation-based)
 - MMLU accuracy: ~5-10 min per checkpoint (forward pass only)
+- GSM8K accuracy: ~10-20 min per checkpoint (generation-based)
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -398,6 +403,179 @@ def evaluate_mmlu_accuracy(
 
 
 # ------------------------------------------------------------------
+# GSM8K exact-match accuracy (CoT pathway)
+# ------------------------------------------------------------------
+
+# Same system prompt used by ``data_gsm8k.tokenise_example_cot``
+_GSM8K_SYSTEM_PROMPT = "You are a helpful assistant that solves math word problems."
+
+# Regex that captures the numeric content following '####'
+# Tolerates leading whitespace, comma thousand-separators and optional sign.
+_GSM8K_ANSWER_PATTERN = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+
+
+def _normalise_answer(text: Optional[str]) -> Optional[str]:
+    """Strip commas and surrounding whitespace from a numeric answer string."""
+    if text is None:
+        return None
+    cleaned = text.strip().replace(",", "")
+    return cleaned if cleaned else None
+
+
+def _extract_gsm8k_answer(generated_text: str) -> Optional[str]:
+    """Pull the number after the first ``####`` marker; ``None`` if absent."""
+    m = _GSM8K_ANSWER_PATTERN.search(generated_text)
+    if m is None:
+        return None
+    return _normalise_answer(m.group(1))
+
+
+@torch.no_grad()
+def evaluate_gsm8k_accuracy(
+    model: AutoModelForCausalLM,
+    tokenizer: PreTrainedTokenizerBase,
+    jsonl_path: str,
+    split: str = "test",
+    max_new_tokens: int = 512,
+    max_prompt_length: int = 384,
+    batch_size: int = 8,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
+    """Greedy GSM8K accuracy: generate from the student, extract ``#### N``,
+    compare with the gold answer from the JSONL records.
+
+    Reference
+    ---------
+    Cobbe et al. 2021 — GSM8K, native ``#### N`` answer format.
+
+    Parameters
+    ----------
+    model : AutoModelForCausalLM
+        Student model in eval mode.
+    tokenizer : PreTrainedTokenizerBase
+    jsonl_path : str
+        Path to ``data/gsm8k_cot_qwen25_7b.jsonl`` (Phase 1.1 output).
+    split : str
+        ``'test'`` (default) or ``'train'``.
+    max_new_tokens : int
+        Hard cap on generation length per question.
+    max_prompt_length : int
+        Truncate the chat-templated prompt to this length.
+    batch_size : int
+        Generation batch size (uses left padding).
+
+    Returns
+    -------
+    dict with keys:
+        ``gsm8k_accuracy``        : float — exact-match accuracy
+        ``n_correct``             : int
+        ``n_total``               : int
+        ``n_format_failures``     : int — generations missing ``####``
+        ``format_failure_rate``   : float — n_format_failures / n_total
+        ``avg_generation_length`` : float — mean #tokens generated
+    """
+    from src.data.data_gsm8k import load_gsm8k_cot_jsonl
+
+    # Load gold records (no separator/teacher filtering — we evaluate the
+    # student against every gold answer in the requested split).
+    records = load_gsm8k_cot_jsonl(
+        jsonl_path=jsonl_path,
+        split=split,
+        filter_no_separator=False,
+        filter_teacher_wrong=False,
+    )
+    n_total = len(records)
+    if n_total == 0:
+        raise RuntimeError(f"No records loaded for split={split!r} from {jsonl_path}")
+
+    model.eval()
+    device = next(model.parameters()).device
+
+    n_correct = 0
+    n_format_failures = 0
+    total_generated_tokens = 0
+    n_evaluated = 0
+
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    try:
+        iterator = tqdm(
+            range(0, n_total, batch_size),
+            desc=f"GSM8K eval ({split})",
+            disable=not show_progress,
+        )
+
+        for start_idx in iterator:
+            end_idx = min(start_idx + batch_size, n_total)
+            batch = records[start_idx:end_idx]
+
+            prompts: List[str] = []
+            golds: List[Optional[str]] = []
+            for r in batch:
+                messages = [
+                    {"role": "system", "content": _GSM8K_SYSTEM_PROMPT},
+                    {"role": "user", "content": r["question"]},
+                ]
+                prompt_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                prompts.append(prompt_text)
+                golds.append(_normalise_answer(r.get("answer_gold")))
+
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_prompt_length,
+                add_special_tokens=False,
+            ).to(device)
+
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+            prompt_len = inputs["input_ids"].shape[1]
+            for i, gold in enumerate(golds):
+                generated_ids = output_ids[i, prompt_len:]
+                total_generated_tokens += int(generated_ids.numel())
+                generated_text = tokenizer.decode(
+                    generated_ids, skip_special_tokens=True
+                )
+
+                predicted = _extract_gsm8k_answer(generated_text)
+                if predicted is None:
+                    n_format_failures += 1
+
+                n_evaluated += 1
+                if predicted is not None and gold is not None and predicted == gold:
+                    n_correct += 1
+
+    finally:
+        tokenizer.padding_side = original_padding_side
+
+    accuracy = n_correct / n_evaluated if n_evaluated > 0 else 0.0
+    fmt_fail_rate = n_format_failures / n_evaluated if n_evaluated > 0 else 0.0
+    avg_gen_len = total_generated_tokens / n_evaluated if n_evaluated > 0 else 0.0
+
+    return {
+        "gsm8k_accuracy": accuracy,
+        "n_correct": n_correct,
+        "n_total": n_evaluated,
+        "n_format_failures": n_format_failures,
+        "format_failure_rate": fmt_fail_rate,
+        "avg_generation_length": avg_gen_len,
+    }
+
+
+# ------------------------------------------------------------------
 # Unified evaluation function
 # ------------------------------------------------------------------
 
@@ -407,25 +585,27 @@ def evaluate_generation_metrics(
     cfg: Dict[str, Any],
     run_rouge: bool = True,
     run_mmlu: bool = True,
+    run_gsm8k: bool = False,
     show_progress: bool = True,
 ) -> Dict[str, Any]:
     """Run all generation-based metrics.
-    
+
     Parameters
     ----------
     model : The model to evaluate.
     tokenizer : Tokenizer matching the model.
-    cfg : Config dict.
+    cfg : Config dict. For GSM8K, requires ``cot_data_path``.
     run_rouge : Whether to run ROUGE-L evaluation on Dolly.
     run_mmlu : Whether to run MMLU exact match evaluation.
+    run_gsm8k : Whether to run GSM8K exact-match evaluation (CoT JSONL).
     show_progress : Whether to show progress bars.
-    
+
     Returns
     -------
     dict with all computed metrics
     """
     results: Dict[str, Any] = {}
-    
+
     if run_rouge:
         print("\n[generation] Running ROUGE-L evaluation on Dolly test set...")
         rouge_results = evaluate_rouge_l_dolly(
@@ -438,7 +618,7 @@ def evaluate_generation_metrics(
         )
         results.update(rouge_results)
         print(f"[generation] ROUGE-L F1: {rouge_results['rouge_l_fmeasure_mean']:.4f}")
-    
+
     if run_mmlu:
         print("\n[generation] Running MMLU exact-match evaluation...")
         mmlu_results = evaluate_mmlu_accuracy(
@@ -451,5 +631,29 @@ def evaluate_generation_metrics(
         )
         results.update(mmlu_results)
         print(f"[generation] MMLU Accuracy: {mmlu_results['mmlu_accuracy']:.4f}")
-    
+
+    if run_gsm8k:
+        jsonl_path = cfg.get("cot_data_path")
+        if not jsonl_path:
+            raise ValueError(
+                "run_gsm8k=True requires cfg['cot_data_path'] "
+                "(e.g. 'data/gsm8k_cot_qwen25_7b.jsonl')."
+            )
+        print("\n[generation] Running GSM8K exact-match evaluation...")
+        gsm_results = evaluate_gsm8k_accuracy(
+            model=model,
+            tokenizer=tokenizer,
+            jsonl_path=jsonl_path,
+            split=cfg.get("gsm8k_eval_split", "test"),
+            max_new_tokens=cfg.get("gsm8k_max_new_tokens", 512),
+            max_prompt_length=cfg.get("gsm8k_max_prompt_length", 384),
+            batch_size=cfg.get("gsm8k_batch_size", 8),
+            show_progress=show_progress,
+        )
+        results.update(gsm_results)
+        print(
+            f"[generation] GSM8K Accuracy: {gsm_results['gsm8k_accuracy']:.4f}  "
+            f"format_failures={gsm_results['format_failure_rate']:.3%}"
+        )
+
     return results

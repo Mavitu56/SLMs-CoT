@@ -111,6 +111,29 @@ def _save_checkpoint(
 def _build_dataloader(cfg: Dict[str, Any], tokenizer):
     """Build the training DataLoader based on config['dataset']."""
     dataset_name = cfg.get("dataset", "gsm8k")
+    micro_n = cfg.get("micro_overfit_n", None)
+
+    if dataset_name == "gsm8k_cot":
+        # CoT pathway: teacher-generated rationale from Phase 1.1 JSONL
+        from src.data.data_gsm8k import build_dataloader_cot
+
+        jsonl_path = cfg.get("cot_data_path")
+        if not jsonl_path:
+            raise ValueError(
+                "dataset='gsm8k_cot' requires cfg['cot_data_path'] "
+                "(e.g. 'data/gsm8k_cot_qwen25_7b.jsonl')."
+            )
+        return build_dataloader_cot(
+            tokenizer=tokenizer,
+            max_length=cfg["max_length"],
+            batch_size=cfg["batch_size"],
+            jsonl_path=jsonl_path,
+            split="train",
+            filter_teacher_wrong=cfg.get("filter_teacher_wrong", False),
+            micro_overfit_n=micro_n,
+            shuffle=True,
+            seed=cfg.get("seed", 42),
+        )
 
     if dataset_name == "dolly":
         from src.data.data_dolly import build_dataloader
@@ -119,10 +142,9 @@ def _build_dataloader(cfg: Dict[str, Any], tokenizer):
     else:
         raise ValueError(
             f"Unknown dataset: {dataset_name!r}. "
-            f"Supported: 'dolly', 'gsm8k'."
+            f"Supported: 'dolly', 'gsm8k', 'gsm8k_cot'."
         )
 
-    micro_n = cfg.get("micro_overfit_n", None)
     return build_dataloader(
         tokenizer=tokenizer,
         max_length=cfg["max_length"],

@@ -62,6 +62,8 @@ Implementation Notes
 
 from __future__ import annotations
 
+from typing import Dict
+
 import torch
 import torch.nn.functional as F
 
@@ -462,3 +464,215 @@ def perplexity(
     Scalar tensor (float32).
     """
     return torch.exp(mean_nll(logits, labels, valid_mask))
+
+
+# ==================================================================
+# 8.  Per-phase metrics (CoT-specific, Article II)
+# ==================================================================
+#
+# These three functions are the canonical API for the per-phase
+# analysis required by Hypothesis H1 of Article II. They consume
+# ``region_ids`` (already shifted to align with the causal-LM output)
+# and split the metrics by region, returning a dict with keys
+# ``reasoning``, ``answer``, ``total`` (and ``rho`` for entropy).
+#
+# Region IDs convention (from src/data/data_gsm8k.py):
+#     0 = prompt, 1 = reasoning, 2 = answer, -1 = padding.
+#
+# These functions assume the caller has already applied
+# ``shift_for_causal_lm`` to logits, labels, attention_mask and
+# region_ids (pattern matching ``compute_total_loss``). The valid
+# mask must be ``attention_mask & (labels != -100)``.
+#
+# References
+# ----------
+# * Wang et al. 2025 — *Beyond 80/20 Rule* (ACL) — high-entropy
+#   "forking tokens" concentrate early in the reasoning phase.
+# * Zhao 2603.18940 — *Entropy Trajectory Shape* — ECE per CoT step.
+# * Plano §4.6 — definitions of H_R, H_A, ρ, ECE_response, KL_R, KL_A.
+# ==================================================================
+
+REGION_PROMPT_ID    = 0
+REGION_REASONING_ID = 1
+REGION_ANSWER_ID    = 2
+
+
+def _phase_mask(
+    shifted_region_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    region_id: int,
+) -> torch.Tensor:
+    """Bool mask: True where token is valid AND belongs to ``region_id``."""
+    return valid_mask & (shifted_region_ids == region_id)
+
+
+def compute_entropy_by_phase(
+    student_logits: torch.Tensor,
+    region_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> Dict[str, float]:
+    """Mean student entropy per phase, plus ρ = H_R / H_A.
+
+    Parameters
+    ----------
+    student_logits : Tensor [B, L, V]  (already shifted for causal LM)
+    region_ids     : Tensor [B, L]     (already shifted; padding = -1)
+    valid_mask     : Tensor [B, L]     (bool, already shifted)
+    eps : float
+        Floor used when ``H_A == 0`` to avoid division by zero in ``rho``.
+
+    Returns
+    -------
+    Dict with keys:
+        ``H_R``   : float — mean entropy over REASONING tokens
+        ``H_A``   : float — mean entropy over ANSWER tokens
+        ``H_total`` : float — mean entropy over (REASONING ∪ ANSWER)
+        ``rho``   : float — H_R / H_A (NaN if both phases empty)
+        ``n_R``   : int   — number of reasoning tokens
+        ``n_A``   : int   — number of answer tokens
+
+    Notes
+    -----
+    Logits are softmaxed at T=1 (raw). Float32 promotion happens inside
+    ``mean_entropy`` via ``token_entropy``.
+    """
+    assert student_logits.shape[:2] == region_ids.shape == valid_mask.shape, (
+        f"Shape mismatch: logits {student_logits.shape[:2]}, "
+        f"regions {region_ids.shape}, mask {valid_mask.shape}"
+    )
+
+    mask_R = _phase_mask(region_ids, valid_mask, REGION_REASONING_ID)
+    mask_A = _phase_mask(region_ids, valid_mask, REGION_ANSWER_ID)
+    mask_total = mask_R | mask_A
+
+    n_R = int(mask_R.sum().item())
+    n_A = int(mask_A.sum().item())
+
+    H_R = float(mean_entropy(student_logits, mask_R).item()) if n_R > 0 else 0.0
+    H_A = float(mean_entropy(student_logits, mask_A).item()) if n_A > 0 else 0.0
+    H_total = (
+        float(mean_entropy(student_logits, mask_total).item())
+        if (n_R + n_A) > 0 else 0.0
+    )
+
+    if n_R > 0 and n_A > 0 and H_A > eps:
+        rho = H_R / H_A
+    else:
+        rho = float("nan")
+
+    return {
+        "H_R": H_R,
+        "H_A": H_A,
+        "H_total": H_total,
+        "rho": rho,
+        "n_R": n_R,
+        "n_A": n_A,
+    }
+
+
+def compute_kl_by_phase(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    region_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> Dict[str, float]:
+    """Mean KL(P^T ‖ P^S) per phase at T=1.
+
+    Parameters
+    ----------
+    teacher_logits : Tensor [B, L, V]  (shifted)
+    student_logits : Tensor [B, L, V]  (shifted, vocab aligned with teacher)
+    region_ids     : Tensor [B, L]     (shifted)
+    valid_mask     : Tensor [B, L]     (bool, shifted)
+    eps : float
+        Floor for teacher probs before log (numerical stability).
+
+    Returns
+    -------
+    Dict with keys:
+        ``KL_R``    : float — mean KL over REASONING tokens
+        ``KL_A``    : float — mean KL over ANSWER tokens
+        ``KL_total``: float — mean KL over (REASONING ∪ ANSWER)
+        ``n_R``, ``n_A``: int
+
+    Notes
+    -----
+    This is the *evaluation-time* KL — always at T=1 — separate from the
+    training loss. Identical formula to ``mean_kl`` but split by region.
+    """
+    assert teacher_logits.shape == student_logits.shape, (
+        f"Shape mismatch: teacher {teacher_logits.shape} "
+        f"vs student {student_logits.shape}"
+    )
+    assert student_logits.shape[:2] == region_ids.shape == valid_mask.shape
+
+    mask_R = _phase_mask(region_ids, valid_mask, REGION_REASONING_ID)
+    mask_A = _phase_mask(region_ids, valid_mask, REGION_ANSWER_ID)
+    mask_total = mask_R | mask_A
+
+    n_R = int(mask_R.sum().item())
+    n_A = int(mask_A.sum().item())
+
+    KL_R = (
+        float(mean_kl(teacher_logits, student_logits, mask_R, eps=eps).item())
+        if n_R > 0 else 0.0
+    )
+    KL_A = (
+        float(mean_kl(teacher_logits, student_logits, mask_A, eps=eps).item())
+        if n_A > 0 else 0.0
+    )
+    KL_total = (
+        float(mean_kl(teacher_logits, student_logits, mask_total, eps=eps).item())
+        if (n_R + n_A) > 0 else 0.0
+    )
+
+    return {
+        "KL_R": KL_R,
+        "KL_A": KL_A,
+        "KL_total": KL_total,
+        "n_R": n_R,
+        "n_A": n_A,
+    }
+
+
+def compute_ece_response_only(
+    student_logits: torch.Tensor,
+    labels: torch.Tensor,
+    region_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    n_bins: int = 10,
+) -> Dict[str, float]:
+    """Expected Calibration Error restricted to the ANSWER region.
+
+    Parameters
+    ----------
+    student_logits : Tensor [B, L, V]  (shifted)
+    labels         : Tensor [B, L]     (shifted, ground-truth ids)
+    region_ids     : Tensor [B, L]     (shifted)
+    valid_mask     : Tensor [B, L]     (bool, shifted)
+    n_bins : int
+        Equal-width bins in [0, 1] (default 10, plano §4.6).
+
+    Returns
+    -------
+    Dict with keys:
+        ``ECE_response`` : float in [0, 1]
+        ``n_A``          : int — number of answer tokens used
+
+    Notes
+    -----
+    Reasoning-region tokens are excluded by construction. Use
+    ``compute_ece`` (full vocab, all valid tokens) for the global metric.
+    """
+    assert student_logits.shape[:2] == labels.shape == region_ids.shape == valid_mask.shape
+
+    mask_A = _phase_mask(region_ids, valid_mask, REGION_ANSWER_ID)
+    n_A = int(mask_A.sum().item())
+
+    if n_A == 0:
+        return {"ECE_response": 0.0, "n_A": 0}
+
+    ece = compute_ece(student_logits, labels, mask_A, n_bins=n_bins)
+    return {"ECE_response": float(ece.item()), "n_A": n_A}

@@ -392,6 +392,18 @@ def evaluate_model(
             "n_tokens": rn,
         }
 
+    # ---- ρ = H_R / H_A (Hypothesis H1, Article II) ----
+    region_R = _aggregate_region(REGION_REASONING)
+    region_A = _aggregate_region(REGION_ANSWER)
+    if (
+        region_R["entropy"] is not None
+        and region_A["entropy"] is not None
+        and region_A["entropy"] > 1e-8
+    ):
+        rho = region_R["entropy"] / region_A["entropy"]
+    else:
+        rho = None
+
     results = {
         # Global scalars
         "mean_entropy": round(agg_entropy, 6),
@@ -402,8 +414,10 @@ def evaluate_model(
         "ece":          round(agg_ece, 6),
         # Per-region
         "region_prompt":    _aggregate_region(REGION_PROMPT),
-        "region_reasoning": _aggregate_region(REGION_REASONING),
-        "region_answer":    _aggregate_region(REGION_ANSWER),
+        "region_reasoning": region_R,
+        "region_answer":    region_A,
+        # Hypothesis H1 ratio
+        "rho_HR_HA": round(rho, 6) if rho is not None else None,
         # Per-position curves
         "kl_per_position": (
             _curve_to_list(kl_pos_sum, kl_pos_cnt)
@@ -429,6 +443,8 @@ def evaluate_model(
     if results["mean_kl"] is not None:
         print(f"  Mean KL(T||S)    : {results['mean_kl']:.6f}")
     print(f"  ECE              : {results['ece']:.6f}")
+    if results["rho_HR_HA"] is not None:
+        print(f"  ρ = H_R / H_A    : {results['rho_HR_HA']:.6f}")
 
     # Region breakdown
     for rname, rkey in [("Prompt",    "region_prompt"),

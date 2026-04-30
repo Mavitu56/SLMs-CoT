@@ -610,6 +610,160 @@ def check_masking_prompt_len(tokenizer, max_length: int) -> None:
 
 
 # ==================================================================
+# 12 – 15  CoT-specific sanity checks (Article II)
+# ==================================================================
+#
+# These checks only run when ``cfg['dataset'] == 'gsm8k_cot'`` and a
+# valid ``cot_data_path`` is provided. They guard the contracts of the
+# Phase 1.1 JSONL pipeline.
+#
+# Reference: Plano §2.7.
+# ==================================================================
+
+def check_12_jsonl_exists_and_valid(cfg: Dict[str, Any]) -> None:
+    """JSONL exists, has expected fields, and reports per-split counts."""
+    print("[sanity] 12 – JSONL exists & valid …", end=" ")
+
+    from src.data.data_gsm8k import load_gsm8k_cot_jsonl
+
+    jsonl_path = cfg.get("cot_data_path")
+    assert jsonl_path, "cfg['cot_data_path'] is required for check 12"
+
+    train_records = load_gsm8k_cot_jsonl(
+        jsonl_path, split="train",
+        filter_no_separator=False,
+        filter_teacher_wrong=False,
+    )
+    test_records = load_gsm8k_cot_jsonl(
+        jsonl_path, split="test",
+        filter_no_separator=False,
+        filter_teacher_wrong=False,
+    )
+
+    required_keys = {
+        "split", "idx", "question", "answer_gold", "teacher_full_text",
+        "extracted_answer", "is_teacher_correct", "separator_found",
+        "total_len_tokens",
+    }
+    for sample in (train_records[:3] + test_records[:3]):
+        missing = required_keys - set(sample.keys())
+        assert not missing, f"JSONL record missing fields: {missing}"
+
+    assert len(train_records) > 0, "no train records found"
+    assert len(test_records) > 0, "no test records found"
+    print(
+        f"PASSED  (train={len(train_records)}, test={len(test_records)})"
+    )
+
+
+def check_13_region_ids_in_batch(
+    tokenizer,
+    cfg: Dict[str, Any],
+) -> None:
+    """One CoT batch must expose region_ids in {-1, 0, 1, 2}."""
+    print("[sanity] 13 – region_ids in batch …", end=" ")
+
+    from src.data.data_gsm8k import build_dataloader_cot
+
+    loader = build_dataloader_cot(
+        tokenizer=tokenizer,
+        max_length=cfg["max_length"],
+        batch_size=2,
+        jsonl_path=cfg["cot_data_path"],
+        split="train",
+        filter_teacher_wrong=cfg.get("filter_teacher_wrong", False),
+        micro_overfit_n=4,
+        shuffle=False,
+        seed=cfg.get("seed", 42),
+    )
+    batch = next(iter(loader))
+
+    assert "region_ids" in batch, "batch must include region_ids"
+    rids = batch["region_ids"]
+    unique_vals = set(rids.unique().tolist())
+    allowed = {-1, 0, 1, 2}
+    assert unique_vals.issubset(allowed), (
+        f"region_ids contain invalid values: {unique_vals - allowed}"
+    )
+
+    # Each example should contain all three regions (prompt + reasoning + answer)
+    B = rids.shape[0]
+    for b in range(B):
+        rb = set(rids[b].unique().tolist()) - {-1}
+        assert {0, 1, 2}.issubset(rb), (
+            f"row {b} missing regions: have {rb}, expected superset of {{0,1,2}}"
+        )
+
+    print(f"PASSED  (B={B}, unique values={sorted(unique_vals)})")
+
+
+def check_14_separator_token_stability(tokenizer) -> None:
+    """The literal '####' must tokenise consistently (alerts if > 1 token)."""
+    print("[sanity] 14 – '####' token stability …", end=" ")
+
+    ids = tokenizer.encode("####", add_special_tokens=False)
+    n_tok = len(ids)
+    if n_tok > 1:
+        print(f"WARN  ('####' tokenises into {n_tok} tokens: {ids})")
+    else:
+        print(f"PASSED  ('####' = 1 token, id={ids[0]})")
+
+
+def check_15_phase_metrics_finite(
+    teacher: torch.nn.Module,
+    student: torch.nn.Module,
+    tokenizer,
+    cfg: Dict[str, Any],
+) -> None:
+    """compute_entropy_by_phase must yield finite H_R, H_A on a real batch."""
+    print("[sanity] 15 – phase metrics finite …", end=" ")
+
+    from src.data.data_gsm8k import build_dataloader_cot
+    from src.evaluation.analysis_metrics import compute_entropy_by_phase
+    from src.losses.losses_kd import shift_for_causal_lm
+
+    loader = build_dataloader_cot(
+        tokenizer=tokenizer,
+        max_length=cfg["max_length"],
+        batch_size=2,
+        jsonl_path=cfg["cot_data_path"],
+        split="train",
+        filter_teacher_wrong=cfg.get("filter_teacher_wrong", False),
+        micro_overfit_n=4,
+        shuffle=False,
+        seed=cfg.get("seed", 42),
+    )
+    batch = next(iter(loader))
+
+    device = next(student.parameters()).device
+    batch = _to_device(batch, device)
+
+    with torch.no_grad():
+        s_logits = student(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        ).logits
+
+    shift_s, _, valid_mask = shift_for_causal_lm(
+        s_logits, batch["labels"], batch["attention_mask"],
+    )
+    shifted_regions = batch["region_ids"][:, 1:].contiguous()
+
+    out = compute_entropy_by_phase(shift_s, shifted_regions, valid_mask)
+
+    assert math.isfinite(out["H_R"]), f"H_R not finite: {out['H_R']}"
+    assert math.isfinite(out["H_A"]), f"H_A not finite: {out['H_A']}"
+    rho = out["rho"]
+    assert math.isfinite(rho), f"rho not finite: {rho}"
+    assert 0.05 <= rho <= 20.0, (
+        f"rho out of plausible range [0.05, 20.0]: {rho:.4f}"
+    )
+    print(
+        f"PASSED  (H_R={out['H_R']:.3f}, H_A={out['H_A']:.3f}, ρ={rho:.3f})"
+    )
+
+
+# ==================================================================
 # Public entry point
 # ==================================================================
 
@@ -673,6 +827,13 @@ def run_all_sanity_checks(
     check_fkl_temperature_sensitive(teacher, student, batch)
     check_ece_analytical()
     check_masking_prompt_len(tokenizer, max_length)
+
+    # --- CoT-specific checks (12 – 15) ---
+    if cfg.get("dataset") == "gsm8k_cot" and cfg.get("cot_data_path"):
+        check_12_jsonl_exists_and_valid(cfg)
+        check_13_region_ids_in_batch(tokenizer, cfg)
+        check_14_separator_token_stability(tokenizer)
+        check_15_phase_metrics_finite(teacher, student, tokenizer, cfg)
 
     print("=" * 60)
     print("ALL SANITY CHECKS PASSED")

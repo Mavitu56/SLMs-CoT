@@ -1,0 +1,37 @@
+teacher_name: Qwen/Qwen2.5-7B-Instruct
+student_name: Qwen/Qwen2.5-1.5B-Instruct
+teacher_load_mode: bf16
+student_dtype: bf16
+
+enable_gradient_checkpointing: true
+free_logits_after_loss: true
+
+dataset: gsm8k_cot
+cot_data_path: data/gsm8k_cot_qwen25_7b.jsonl
+filter_teacher_wrong: false
+
+kd_mode: fkl
+temperature: 1
+alpha: 0.5
+seed: 42
+
+max_length: 1024
+num_epochs: 3
+batch_size: 16
+grad_accum_steps: 4   # effective batch = 64
+lr: 4.0e-5
+weight_decay: 0.05
+warmup_ratio: 0.1
+scheduler: cosine
+max_grad_norm: 1.0
+
+# GSM8K generation eval (run after training)
+gsm8k_max_new_tokens: 512
+gsm8k_max_prompt_length: 384
+gsm8k_batch_size: 8
+gsm8k_eval_split: test
+
+log_every: 50
+save_dir: checkpoints/gsm8k_cot_fkl_T1_seed42
+log_file: logs/gsm8k_cot_fkl_T1_seed42.jsonl
+run_sanity: true

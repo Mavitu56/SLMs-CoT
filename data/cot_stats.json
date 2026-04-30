@@ -1,0 +1,38 @@
+{
+  "source": "/content/drive/MyDrive/SLM_results/gsm8k_cot_qwen25_7b.jsonl",
+  "splits": {
+    "train": {
+      "n": 7469,
+      "separator_rate": 0.998928906145401,
+      "teacher_accuracy": 0.9345293881376355,
+      "mean_total_len_tokens": 251.3444905609854,
+      "median_total_len_tokens": 241.0,
+      "p95_total_len_tokens": 361.0,
+      "p99_total_len_tokens": 443.0,
+      "max_total_len_tokens": 765,
+      "n_over_1024": 0
+    },
+    "test": {
+      "n": 1319,
+      "separator_rate": 0.9992418498862775,
+      "teacher_accuracy": 0.8749052312357847,
+      "mean_total_len_tokens": 258.8112206216831,
+      "median_total_len_tokens": 249.0,
+      "p95_total_len_tokens": 379.0,
+      "p99_total_len_tokens": 451.0,
+      "max_total_len_tokens": 594,
+      "n_over_1024": 0
+    }
+  },
+  "overall": {
+    "n": 8788,
+    "separator_rate": 0.9989758761948111,
+    "teacher_accuracy": 0.9255803368229404,
+    "mean_total_len_tokens": 252.46517979062358,
+    "median_total_len_tokens": 242.0,
+    "p95_total_len_tokens": 366.0,
+    "p99_total_len_tokens": 446.0,
+    "max_total_len_tokens": 765,
+    "n_over_1024": 0
+  }
+}
