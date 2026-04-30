@@ -176,6 +176,12 @@ def main() -> None:
         help="Directory for JSON results and plots.",
     )
     parser.add_argument(
+        "--drive-root", type=str, default=None,
+        help="Google Drive root (e.g. /content/drive/MyDrive/SLM_results). "
+             "Auto-derives output-dir as <drive-root>/<run_name>/analysis, "
+             "where run_name = {kd_mode}_T{temperature}_seed{seed}.",
+    )
+    parser.add_argument(
         "--no-teacher", action="store_true",
         help="Skip teacher loading (no KL metrics).",
     )
@@ -215,6 +221,17 @@ def main() -> None:
 
     # ---- Load config ----
     cfg = load_config(args.config)
+
+    # ---- Apply --drive-root (auto-derives --output-dir from config) ----
+    if args.drive_root is not None:
+        kd_mode = cfg["kd_mode"]
+        temperature = int(cfg["temperature"])
+        seed = cfg["seed"]
+        run_name = f"{kd_mode}_T{temperature}_seed{seed}"
+        args.output_dir = os.path.join(args.drive_root, run_name, "analysis")
+        print(f"Drive root: {args.drive_root}")
+        print(f"Run name:   {run_name}")
+        print(f"Output dir: {args.output_dir}")
 
     # ---- Build checkpoint map ----
     ckpt_map: dict[str, str] = {}
