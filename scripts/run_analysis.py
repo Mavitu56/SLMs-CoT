@@ -54,9 +54,10 @@ from src.training.train_manual import load_teacher, load_student
 DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "kd_qwen_gsm8k.yaml")
 
 
-def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
+def _build_eval_dataloader(cfg, tokenizer, split, micro_n, eval_batch_size=None):
     """Dispatch to the correct data module based on cfg['dataset']."""
     dataset_name = cfg.get("dataset", "gsm8k")
+    bs = eval_batch_size if eval_batch_size is not None else cfg.get("batch_size", 1)
 
     if dataset_name == "gsm8k_cot":
         from src.data.data_gsm8k import build_dataloader_cot
@@ -68,7 +69,7 @@ def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
         return build_dataloader_cot(
             tokenizer=tokenizer,
             max_length=cfg["max_length"],
-            batch_size=cfg.get("batch_size", 1),
+            batch_size=bs,
             jsonl_path=jsonl_path,
             split=split,
             filter_teacher_wrong=cfg.get("filter_teacher_wrong", False),
@@ -86,7 +87,7 @@ def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
         return build_dataloader(
             tokenizer=tokenizer,
             max_length=cfg["max_length"],
-            batch_size=cfg.get("batch_size", 1),
+            batch_size=bs,
             split=split,
             subject=cfg.get("mmlu_subject", None),
             micro_overfit_n=micro_n,
@@ -101,7 +102,7 @@ def _build_eval_dataloader(cfg, tokenizer, split, micro_n):
     return build_dataloader(
         tokenizer=tokenizer,
         max_length=cfg["max_length"],
-        batch_size=cfg.get("batch_size", 1),
+        batch_size=bs,
         split=split,
         micro_overfit_n=micro_n,
         shuffle=False,
@@ -187,6 +188,11 @@ def main() -> None:
         help="Limit evaluation to N batches (for quick debugging).",
     )
     parser.add_argument(
+        "--eval-batch-size", type=int, default=None,
+        help="Override batch_size for eval (training cfg uses larger batches; "
+             "eval needs smaller because teacher+student logits cost more VRAM).",
+    )
+    parser.add_argument(
         "--smooth-window", type=int, default=5,
         help="Moving-average window for per-position plots (1=no smoothing).",
     )
@@ -242,7 +248,10 @@ def main() -> None:
     # ---- DataLoader ----
     print(f"\n[data] Building eval dataloader (dataset={dataset_name}, split={eval_split}) …")
     micro_n = cfg.get("micro_overfit_n", None)
-    dataloader = _build_eval_dataloader(cfg, tokenizer, eval_split, micro_n)
+    dataloader = _build_eval_dataloader(
+        cfg, tokenizer, eval_split, micro_n,
+        eval_batch_size=args.eval_batch_size,
+    )
 
     # Optionally limit batches
     if args.max_batches is not None and args.max_batches > 0:
