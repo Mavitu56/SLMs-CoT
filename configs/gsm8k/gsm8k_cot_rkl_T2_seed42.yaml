@@ -17,8 +17,8 @@ seed: 42
 
 max_length: 1024
 num_epochs: 3
-batch_size: 16
-grad_accum_steps: 4   # effective batch = 64
+batch_size: 8
+grad_accum_steps: 8   # effective batch = 64 (D2: OOM mitigation for FKL/RKL bf16)
 lr: 4.0e-5
 weight_decay: 0.05
 warmup_ratio: 0.1
