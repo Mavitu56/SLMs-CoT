@@ -97,10 +97,10 @@ _GSM8K_CALC_ANNOTATION = re.compile(r"<<[^>]*>>")
 
 # Secondary extractor for the Fix 2 fallback: matches ``\boxed{<number>}``
 # produced by the teacher when it ignores the ``####`` target format.
-# NOTE: we need FOUR backslashes in the raw string so the compiled regex
-# has two, which in turn matches a single literal backslash — ``\b`` in
-# regex is a word boundary, not a literal backslash.
-_BOXED_REGEX = re.compile(r"\\\\boxed\{\s*(-?[\d,]+(?:\.\d+)?)\s*\}")
+# In a raw string, ``r"\\"`` is two characters (\\) which the regex engine
+# parses as a single literal backslash. ``r"\b"`` would be a word boundary,
+# so two backslashes in the source are required to match one literal.
+_BOXED_REGEX = re.compile(r"\\boxed\{\s*(-?[\d,]+(?:\.\d+)?)\s*\}")
 
 # ``####  <signed number, optional commas, optional decimal part>``
 SEPARATOR_REGEX = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")

@@ -393,14 +393,15 @@ def evaluate_model(
         }
 
     # ---- ρ = H_R / H_A (Hypothesis H1, Article II) ----
+    # Compute from raw (un-rounded) accumulators to preserve precision.
     region_R = _aggregate_region(REGION_REASONING)
     region_A = _aggregate_region(REGION_ANSWER)
-    if (
-        region_R["entropy"] is not None
-        and region_A["entropy"] is not None
-        and region_A["entropy"] > 1e-8
-    ):
-        rho = region_R["entropy"] / region_A["entropy"]
+    n_R_tot = region_acc[REGION_REASONING]["n_tokens"]
+    n_A_tot = region_acc[REGION_ANSWER]["n_tokens"]
+    if n_R_tot > 0 and n_A_tot > 0:
+        H_R_raw = region_acc[REGION_REASONING]["entropy"] / n_R_tot
+        H_A_raw = region_acc[REGION_ANSWER]["entropy"] / n_A_tot
+        rho = (H_R_raw / H_A_raw) if H_A_raw > 1e-8 else None
     else:
         rho = None
 
