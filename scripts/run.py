@@ -122,10 +122,17 @@ def main() -> None:
     if args.drive_root is not None:
         if args.output_dir is not None:
             print("WARNING: --drive-root overrides --output-dir")
-        kd_mode = cfg["kd_mode"]
-        temperature = int(cfg["temperature"])
-        seed = cfg["seed"]
-        run_name = f"{kd_mode}_T{temperature}_seed{seed}"
+        # Derive the run name from the CONFIG FILE NAME so ablations that share
+        # kd_mode/T/seed (e.g. fkl_T4_alpha0_seed42, fkl_T4_rw_seed42) each get
+        # their own folder and never overwrite the main fkl_T4_seed42 run.
+        cfg_stem = os.path.splitext(os.path.basename(args.config))[0]
+        # Strip a leading "gsm8k_cot_" prefix to keep folder names short and
+        # consistent with the existing seed42 layout (fkl_T4_seed42, ...).
+        run_name = cfg_stem
+        for prefix in ("gsm8k_cot_", "gsm8k_", "kd_"):
+            if run_name.startswith(prefix):
+                run_name = run_name[len(prefix):]
+                break
         args.output_dir = os.path.join(args.drive_root, run_name)
         print(f"Drive root: {args.drive_root}")
         print(f"Run name:   {run_name}")
