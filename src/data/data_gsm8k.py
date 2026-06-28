@@ -278,7 +278,11 @@ def build_dataloader(
         f"at max_length={max_length}"
     )
 
-    ds.set_format("torch")
+    # NOTE: do NOT call ds.set_format("torch"). The HF TorchFormatter imports
+    # VideoReader from torchvision.io, which is unavailable in some Colab
+    # torch/torchvision combos and raises ImportError inside the DataLoader
+    # worker. KDCollator already tensorises plain Python lists, so the default
+    # (list) format is both sufficient and portable.
 
     collator = KDCollator(
         pad_token_id=tokenizer.pad_token_id
@@ -543,7 +547,9 @@ def build_dataloader_cot(
         f"at max_length={max_length}"
     )
 
-    ds.set_format("torch")
+    # NOTE: do NOT call ds.set_format("torch") — see build_dataloader() above.
+    # KDCollator tensorises plain Python lists; the HF TorchFormatter's
+    # VideoReader import breaks on some Colab torch/torchvision combos.
 
     collator = KDCollator(
         pad_token_id=tokenizer.pad_token_id

@@ -20,6 +20,7 @@ from transformers import (
 )
 
 from src.losses.losses_kd import compute_total_loss
+from src.losses.losses_kd_weighted import compute_total_loss_weighted
 from src.training.utils_seed import set_seed
 
 
@@ -238,6 +239,11 @@ def train(cfg: Dict[str, Any]) -> None:
     save_dir = cfg.get("save_dir", "checkpoints")
     log_file = cfg.get("log_file", None)
     warmup_ratio = cfg.get("warmup_ratio", 0.1)
+    # Optional per-region loss reweighting (W3 ablation). None => original path.
+    region_loss_weights = cfg.get("region_loss_weights", None)
+    if region_loss_weights is not None:
+        region_loss_weights = {int(k): float(v) for k, v in region_loss_weights.items()}
+        print(f"[reweight] region_loss_weights = {region_loss_weights}")
 
     # ---- Optimiser ----
     optimizer = torch.optim.AdamW(
@@ -327,15 +333,28 @@ def train(cfg: Dict[str, Any]) -> None:
                 dtype_logged = True
 
             # ---- Loss ----
-            loss_total, loss_ce, loss_kd, n_valid = compute_total_loss(
-                teacher_logits=teacher_logits,
-                student_logits=student_logits,
-                labels=batch["labels"],
-                attention_mask=batch["attention_mask"],
-                T=T,
-                alpha=alpha,
-                kd_mode=kd_mode,
-            )
+            if region_loss_weights is not None:
+                loss_total, loss_ce, loss_kd, n_valid = compute_total_loss_weighted(
+                    teacher_logits=teacher_logits,
+                    student_logits=student_logits,
+                    labels=batch["labels"],
+                    attention_mask=batch["attention_mask"],
+                    region_ids=batch["region_ids"],
+                    T=T,
+                    alpha=alpha,
+                    kd_mode=kd_mode,
+                    region_weights=region_loss_weights,
+                )
+            else:
+                loss_total, loss_ce, loss_kd, n_valid = compute_total_loss(
+                    teacher_logits=teacher_logits,
+                    student_logits=student_logits,
+                    labels=batch["labels"],
+                    attention_mask=batch["attention_mask"],
+                    T=T,
+                    alpha=alpha,
+                    kd_mode=kd_mode,
+                )
 
             if free_logits_after_loss:
                 # Free logits and model output containers to reduce VRAM pressure.
