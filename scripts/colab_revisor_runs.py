@@ -192,6 +192,7 @@ def cell5_analysis(
     only=None,
     max_batches=None,
     gsm8k_batch_size=64,
+    eval_batch_size=2,
     no_teacher=False,
 ) -> None:
     """Roda run_analysis.py --run-gsm8k nos checkpoints do Drive.
@@ -199,15 +200,21 @@ def cell5_analysis(
     only:             lista de labels para um subconjunto (ex.: ["FKL_T4_seed123"]).
                       Use para cronometrar 1 run antes de disparar todos.
     max_batches:      limita batches da avaliação (smoke test). None = split inteiro.
-    gsm8k_batch_size: batch da GERAÇÃO greedy (gargalo). Na A100 80GB o student
-                      1.5B é pequeno, então 64 acelera muito vs. o default 8 do
-                      config. Reduza se houver OOM (improvável na A100).
-    no_teacher:       se True, pula o teacher 7B e NÃO calcula ECE/KL(T||S) —
-                      só a acurácia GSM8K. Mais rápido; use se já tem o ECE ou
-                      vai rodá-lo depois.
+    gsm8k_batch_size: batch da GERAÇÃO greedy (gargalo de TEMPO). Na A100 80GB o
+                      student 1.5B é pequeno, então 64 acelera muito a geração.
+    eval_batch_size:  batch do forward PROBABILÍSTICO (gargalo de MEMÓRIA). Aqui
+                      teacher 7B + student rodam juntos e cada softmax full-vocab
+                      (V=152064) em float32 ocupa ~5 GB POR tensor; com batch alto
+                      e max_length 1024 isso estoura a GPU (OOM silencioso, mata o
+                      processo sem traceback). Default 2 é seguro; suba com cautela.
+                      Não confunda com gsm8k_batch_size (geração não usa softmax
+                      full-vocab dense, então tolera batch bem maior).
+    no_teacher:       se True, pula o teacher 7B e NÃO calcula ECE/KL(T||S) — só a
+                      acurácia GSM8K. Reduz MUITO a memória (sem 2 forwards
+                      full-vocab nem KL). Use se já tem o ECE ou vai rodá-lo depois.
 
-    Tempo estimado na A100 80GB (cenário realista, gsm8k_batch_size=64):
-      ~5-6 min/checkpoint com teacher;  ~3-4 min/checkpoint com no_teacher=True.
+    Tempo estimado na A100 80GB (gsm8k_batch_size=64, eval_batch_size=2):
+      ~6-7 min/checkpoint com teacher;  ~4-5 min/checkpoint com no_teacher=True.
     """
     os.chdir(REPO_DIR)
     items = ANALYSIS_RUNS.items() if only is None else [
@@ -232,6 +239,7 @@ def cell5_analysis(
             "--output-dir", out_dir,
             "--run-gsm8k",
             "--gsm8k-batch-size", str(gsm8k_batch_size),
+            "--eval-batch-size", str(eval_batch_size),
         ]
         if no_teacher:
             cmd += ["--no-teacher"]
