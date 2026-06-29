@@ -163,9 +163,12 @@ def main() -> None:
             print(f"  frac with p2 > {thr:.2f}    = {row['frac_p2_gt'][str(thr)]:.4%}")
 
     if args.output:
+        out_dir = os.path.dirname(args.output)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
-        print(f"\n[save] -> {args.output}")
+        print(f"\n[save] -> {os.path.abspath(args.output)}")
 
     print(
         "\nReviewer note (W2): report the answer-region 'frac with p2 > 0.10'. "
