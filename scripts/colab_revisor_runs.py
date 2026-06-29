@@ -150,6 +150,76 @@ def cell4_extra_seeds() -> None:
 
 # %%
 # =====================================================================
+# Célula 5 — Acurácia GSM8K + ECE + KL (run_analysis.py --run-gsm8k)
+# =====================================================================
+# O run.py (células 3-4) só treina e plota loss. A acurácia GSM8K e as
+# métricas probabilísticas (ECE, KL(T||S), entropia) vêm de run_analysis.py,
+# um passo SEPARADO sobre os checkpoints. Aqui rodamos --run-gsm8k para os 7
+# runs novos E para os baselines seed42 (para a Tabela 2 / W1 ter média±DP na
+# mesma métrica). O resultado vai para {pasta}/analysis/analysis_results.json.
+#
+# Mapeamento: label -> (pasta_no_drive, stem_do_config). O config fornece
+# teacher/dataset; o checkpoint vem da pasta. Pasta != config nos baselines
+# antigos (pasta fkl_T4_seed42, config gsm8k_cot_fkl_T4_seed42), por isso o
+# mapeamento é explícito.
+ANALYSIS_RUNS = {
+    # --- Ablações (Review 1/2, W3) ---
+    "FKL_T4_alpha0":  ("fkl_T4_alpha0_seed42", "gsm8k_cot_fkl_T4_alpha0_seed42"),
+    "RKL_T1_alpha0":  ("rkl_T1_alpha0_seed42", "gsm8k_cot_rkl_T1_alpha0_seed42"),
+    "FKL_T4_rw":      ("fkl_T4_rw_seed42",     "gsm8k_cot_fkl_T4_rw_seed42"),
+    # --- Seeds extras (W1) ---
+    "CE_seed123":     ("ce_only_T1_seed123",   "gsm8k_cot_ce_only_T1_seed123"),
+    "CE_seed7":       ("ce_only_T1_seed7",     "gsm8k_cot_ce_only_T1_seed7"),
+    "FKL_T4_seed123": ("fkl_T4_seed123",       "gsm8k_cot_fkl_T4_seed123"),
+    "FKL_T4_seed7":   ("fkl_T4_seed7",         "gsm8k_cot_fkl_T4_seed7"),
+    # --- Baselines seed42 (sem acurácia ainda; necessários p/ comparação) ---
+    "CE_seed42":      ("ce_only_T1_seed42",    "gsm8k_cot_ce_only_T1_seed42"),
+    "FKL_T1_seed42":  ("fkl_T1_seed42",        "gsm8k_cot_fkl_T1_seed42"),
+    "FKL_T2_seed42":  ("fkl_T2_seed42",        "gsm8k_cot_fkl_T2_seed42"),
+    "FKL_T4_seed42":  ("fkl_T4_seed42",        "gsm8k_cot_fkl_T4_seed42"),
+    "RKL_T1_seed42":  ("rkl_T1_seed42",        "gsm8k_cot_rkl_T1_seed42"),
+    "RKL_T2_seed42":  ("rkl_T2_seed42",        "gsm8k_cot_rkl_T2_seed42"),
+    "RKL_T4_seed42":  ("rkl_T4_seed42",        "gsm8k_cot_rkl_T4_seed42"),
+}
+
+
+def cell5_analysis(only=None, max_batches=None) -> None:
+    """Roda run_analysis.py --run-gsm8k nos checkpoints do Drive.
+
+    only:        lista de labels para rodar um subconjunto (ex.: ["FKL_T4_seed123"]).
+                 Útil para medir o tempo de UM run antes de disparar todos.
+    max_batches: limita os batches de avaliação (smoke test). None = split inteiro.
+
+    ATENÇÃO: --run-gsm8k faz GERAÇÃO sobre o test (1318 exemplos); é lento.
+    Cada checkpoint pode levar dezenas de minutos. Comece com only=[...] em 1 run.
+    """
+    os.chdir(REPO_DIR)
+    items = ANALYSIS_RUNS.items() if only is None else [
+        (k, ANALYSIS_RUNS[k]) for k in only
+    ]
+    for label, (folder, cfg_stem) in items:
+        ckpt = os.path.join(DRIVE, folder, "checkpoints", "final")
+        out_dir = os.path.join(DRIVE, folder, "analysis")
+        cfg_path = f"configs/gsm8k/{cfg_stem}.yaml"
+        if not os.path.isdir(ckpt):
+            print(f"[skip] {label}: checkpoint não encontrado em {ckpt}")
+            continue
+        print(f"\n===== Analisando {label} ({folder}) =====")
+        cmd = [
+            sys.executable, "scripts/run_analysis.py",
+            "--config", cfg_path,
+            "--checkpoint", ckpt,
+            "--label", label,
+            "--output-dir", out_dir,
+            "--run-gsm8k",
+        ]
+        if max_batches is not None:
+            cmd += ["--max-batches", str(max_batches)]
+        run(cmd)
+
+
+# %%
+# =====================================================================
 # Execução direta: roda o pipeline inteiro na ordem barato -> caro.
 # (No Colab, prefira chamar as funções célula a célula.)
 # =====================================================================
@@ -158,3 +228,4 @@ if __name__ == "__main__":
     cell2_analysis_no_training()
     cell3_ablations()
     cell4_extra_seeds()
+    cell5_analysis()
