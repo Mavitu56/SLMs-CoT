@@ -37,10 +37,15 @@ BRANCH = "kd-ablations-reweighting"
 DRIVE = "/content/drive/MyDrive/SLM_results"
 
 
-def run(cmd: list[str], cwd: str | None = None) -> None:
-    """Roda um comando, ecoando-o, e aborta se falhar (mostra a saída)."""
+def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> int:
+    """Roda um comando, ecoando-o. Por padrão aborta se falhar (check=True).
+
+    A saída (stdout/stderr) é herdada do processo pai, então aparece direto no
+    notebook. Retorna o returncode (útil quando check=False).
+    """
     print(f"\n$ {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, cwd=cwd, check=True)
+    proc = subprocess.run(cmd, cwd=cwd, check=check)
+    return proc.returncode
 
 
 # %%
@@ -208,12 +213,15 @@ def cell5_analysis(
     items = ANALYSIS_RUNS.items() if only is None else [
         (k, ANALYSIS_RUNS[k]) for k in only
     ]
+    import time
+    failed, done = [], []
     for label, (folder, cfg_stem) in items:
         ckpt = os.path.join(DRIVE, folder, "checkpoints", "final")
         out_dir = os.path.join(DRIVE, folder, "analysis")
         cfg_path = f"configs/gsm8k/{cfg_stem}.yaml"
         if not os.path.isdir(ckpt):
             print(f"[skip] {label}: checkpoint não encontrado em {ckpt}")
+            failed.append((label, "checkpoint ausente"))
             continue
         print(f"\n===== Analisando {label} ({folder}) =====")
         cmd = [
@@ -229,7 +237,26 @@ def cell5_analysis(
             cmd += ["--no-teacher"]
         if max_batches is not None:
             cmd += ["--max-batches", str(max_batches)]
-        run(cmd)
+        # check=False: não aborta o lote inteiro se UM checkpoint falhar;
+        # o erro do run_analysis.py aparece direto no notebook acima.
+        t0 = time.time()
+        rc = run(cmd, check=False)
+        dt = time.time() - t0
+        if rc == 0:
+            done.append((label, dt))
+            print(f"[ok] {label} em {dt/60:.1f} min")
+        else:
+            failed.append((label, f"returncode {rc}"))
+            print(f"[FALHOU] {label} (returncode {rc}) — veja o traceback acima")
+
+    # ---- Resumo ----
+    print("\n" + "=" * 60)
+    print(f"  cell5_analysis: {len(done)} ok, {len(failed)} falha(s)")
+    for label, dt in done:
+        print(f"    ok     {label:16s} {dt/60:5.1f} min")
+    for label, why in failed:
+        print(f"    FALHOU {label:16s} {why}")
+    print("=" * 60)
 
 
 # %%
