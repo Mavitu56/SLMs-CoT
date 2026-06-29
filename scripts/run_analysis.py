@@ -216,11 +216,22 @@ def main() -> None:
         "--run-gsm8k", action="store_true",
         help="Run GSM8K exact-match evaluation on the CoT JSONL test split.",
     )
+    parser.add_argument(
+        "--gsm8k-batch-size", type=int, default=None,
+        help="Override cfg['gsm8k_batch_size'] for the generation eval. On an "
+             "A100 the student is tiny, so a larger batch (e.g. 64) greatly "
+             "speeds up greedy generation, the dominant cost.",
+    )
 
     args = parser.parse_args()
 
     # ---- Load config ----
     cfg = load_config(args.config)
+
+    # Override generation batch size (generation dominates --run-gsm8k runtime).
+    if args.gsm8k_batch_size is not None:
+        cfg["gsm8k_batch_size"] = args.gsm8k_batch_size
+        print(f"[override] gsm8k_batch_size = {args.gsm8k_batch_size}")
 
     # ---- Apply --drive-root (auto-derives --output-dir from config) ----
     if args.drive_root is not None:

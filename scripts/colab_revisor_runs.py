@@ -183,15 +183,26 @@ ANALYSIS_RUNS = {
 }
 
 
-def cell5_analysis(only=None, max_batches=None) -> None:
+def cell5_analysis(
+    only=None,
+    max_batches=None,
+    gsm8k_batch_size=64,
+    no_teacher=False,
+) -> None:
     """Roda run_analysis.py --run-gsm8k nos checkpoints do Drive.
 
-    only:        lista de labels para rodar um subconjunto (ex.: ["FKL_T4_seed123"]).
-                 Útil para medir o tempo de UM run antes de disparar todos.
-    max_batches: limita os batches de avaliação (smoke test). None = split inteiro.
+    only:             lista de labels para um subconjunto (ex.: ["FKL_T4_seed123"]).
+                      Use para cronometrar 1 run antes de disparar todos.
+    max_batches:      limita batches da avaliação (smoke test). None = split inteiro.
+    gsm8k_batch_size: batch da GERAÇÃO greedy (gargalo). Na A100 80GB o student
+                      1.5B é pequeno, então 64 acelera muito vs. o default 8 do
+                      config. Reduza se houver OOM (improvável na A100).
+    no_teacher:       se True, pula o teacher 7B e NÃO calcula ECE/KL(T||S) —
+                      só a acurácia GSM8K. Mais rápido; use se já tem o ECE ou
+                      vai rodá-lo depois.
 
-    ATENÇÃO: --run-gsm8k faz GERAÇÃO sobre o test (1318 exemplos); é lento.
-    Cada checkpoint pode levar dezenas de minutos. Comece com only=[...] em 1 run.
+    Tempo estimado na A100 80GB (cenário realista, gsm8k_batch_size=64):
+      ~5-6 min/checkpoint com teacher;  ~3-4 min/checkpoint com no_teacher=True.
     """
     os.chdir(REPO_DIR)
     items = ANALYSIS_RUNS.items() if only is None else [
@@ -212,7 +223,10 @@ def cell5_analysis(only=None, max_batches=None) -> None:
             "--label", label,
             "--output-dir", out_dir,
             "--run-gsm8k",
+            "--gsm8k-batch-size", str(gsm8k_batch_size),
         ]
+        if no_teacher:
+            cmd += ["--no-teacher"]
         if max_batches is not None:
             cmd += ["--max-batches", str(max_batches)]
         run(cmd)
