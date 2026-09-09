@@ -35,21 +35,57 @@ def _align_vocab(
     return teacher_logits, student_logits
 
 
+def _model_forward(model: torch.nn.Module, batch: Dict[str, torch.Tensor]):
+    """Execute model forward with support for both text-only and multimodal tensors."""
+    kwargs = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+    }
+    if "pixel_values" in batch and batch["pixel_values"] is not None:
+        kwargs["pixel_values"] = batch["pixel_values"]
+    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
+        kwargs["image_grid_thw"] = batch["image_grid_thw"]
+    return model(**kwargs)
+
+
 def _get_one_batch(
     tokenizer,
     max_length: int,
     micro_n: int = 4,
     batch_size: int = 1,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Return a single batch from Dolly (train)."""
-    loader = build_dataloader(
-        tokenizer=tokenizer,
-        max_length=max_length,
-        batch_size=batch_size,
-        split="train",
-        micro_overfit_n=micro_n,
-        shuffle=False,
-    )
+    """Return a single batch from the configured dataset."""
+    if cfg and cfg.get("dataset") == "scienceqa_cot" and cfg.get("cot_data_path") and os.path.isfile(cfg["cot_data_path"]):
+        from src.data.data_scienceqa import build_dataloader_cot
+        loader = build_dataloader_cot(
+            processor=tokenizer,
+            max_length=max_length,
+            batch_size=batch_size,
+            jsonl_path=cfg["cot_data_path"],
+            split="train",
+            micro_overfit_n=micro_n,
+            shuffle=False,
+        )
+    elif cfg and cfg.get("dataset") == "scienceqa_human":
+        from src.data.data_scienceqa import build_dataloader_human_rationale
+        loader = build_dataloader_human_rationale(
+            processor=tokenizer,
+            max_length=max_length,
+            batch_size=batch_size,
+            split="train",
+            micro_overfit_n=micro_n,
+            shuffle=False,
+        )
+    else:
+        loader = build_dataloader(
+            tokenizer=tokenizer,
+            max_length=max_length,
+            batch_size=batch_size,
+            split="train",
+            micro_overfit_n=micro_n,
+            shuffle=False,
+        )
     batch = next(iter(loader))
     return batch
 
@@ -58,8 +94,16 @@ def _to_device(batch: Dict[str, torch.Tensor], device: torch.device):
     return {k: v.to(device) for k, v in batch.items()}
 
 
-def _load_small_model(name: str, device: torch.device):
+def _load_small_model(name: str, device: torch.device, is_vlm: bool = False):
     """Load a small model in bf16 (used for sanity checks)."""
+    if is_vlm:
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            name,
+            torch_dtype=torch.bfloat16,
+            device_map={"": device},
+        )
+        return model
     model = AutoModelForCausalLM.from_pretrained(
         name,
         torch_dtype=torch.bfloat16,
@@ -763,6 +807,50 @@ def check_15_phase_metrics_finite(
     )
 
 
+def check_vision_tokens_masked(batch: Dict[str, torch.Tensor], processor: Any) -> None:
+    """Verify that vision placeholder tokens (<|image_pad|>) have labels = -100."""
+    print("[sanity] VLM – Vision tokens masked (-100) …", end=" ")
+    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    image_pad_id = tok.convert_tokens_to_ids("<|image_pad|>")
+    if image_pad_id is None or image_pad_id < 0:
+        print("SKIPPED (no <|image_pad|> token)")
+        return
+
+    for i in range(batch["input_ids"].shape[0]):
+        vision_mask = (batch["input_ids"][i] == image_pad_id)
+        if vision_mask.any():
+            assert (batch["labels"][i][vision_mask] == -100).all(), (
+                f"Vision tokens must have labels=-100! Found unmasked tokens at index {i}"
+            )
+    print("PASSED")
+
+
+def check_teacher_student_same_image(
+    teacher: torch.nn.Module,
+    student: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+) -> None:
+    """Verify teacher and student frozen ViT extract identical visual embeddings."""
+    print("[sanity] VLM – Vision tower feature parity …", end=" ")
+    if "pixel_values" not in batch or batch["pixel_values"] is None:
+        print("SKIPPED (no images in batch)")
+        return
+
+    device = next(student.parameters()).device
+    pv = batch["pixel_values"].to(device)
+    grid = batch["image_grid_thw"].to(device)
+
+    if hasattr(teacher, "visual") and hasattr(student, "visual"):
+        with torch.no_grad():
+            t_vis = teacher.visual(pv, grid_thw=grid)
+            s_vis = student.visual(pv, grid_thw=grid)
+        diff = (t_vis - s_vis).abs().max().item()
+        assert diff < 1e-4, f"Visual feature mismatch: max diff = {diff}"
+        print(f"PASSED (max diff = {diff:.2e})")
+    else:
+        print("SKIPPED (models lack .visual attribute)")
+
+
 # ==================================================================
 # Public entry point
 # ==================================================================
@@ -777,8 +865,13 @@ def run_all_sanity_checks(
     T = cfg.get("temperature", 2.0)
     max_length = cfg.get("max_length", 512)
     student_name = cfg.get("student_name", "Qwen/Qwen2.5-1.5B-Instruct")
+    is_vlm = (
+        cfg.get("model_type") == "vlm"
+        or "VL" in cfg.get("student_name", "")
+        or "VL" in cfg.get("teacher_name", "")
+    )
 
-    batch = _get_one_batch(tokenizer, max_length, micro_n=4, batch_size=1)
+    batch = _get_one_batch(tokenizer, max_length, micro_n=4, batch_size=1, cfg=cfg)
 
     print("=" * 60)
     print("SANITY CHECKS")
@@ -795,14 +888,8 @@ def run_all_sanity_checks(
     device = next(student.parameters()).device
     _batch_dev = _to_device(batch, device)
     with torch.no_grad():
-        _t_logits = teacher(
-            input_ids=_batch_dev["input_ids"],
-            attention_mask=_batch_dev["attention_mask"],
-        ).logits
-        _s_logits = student(
-            input_ids=_batch_dev["input_ids"],
-            attention_mask=_batch_dev["attention_mask"],
-        ).logits
+        _t_logits = _model_forward(teacher, _batch_dev).logits
+        _s_logits = _model_forward(student, _batch_dev).logits
     _t_logits, _s_logits = _align_vocab(_t_logits, _s_logits)
     _, _, _normal_kd, _ = compute_total_loss(
         _t_logits, _s_logits, _batch_dev["labels"], _batch_dev["attention_mask"],
@@ -834,6 +921,14 @@ def run_all_sanity_checks(
         check_13_region_ids_in_batch(tokenizer, cfg)
         check_14_separator_token_stability(tokenizer)
         check_15_phase_metrics_finite(teacher, student, tokenizer, cfg)
+
+    # --- ScienceQA VLM checks ---
+    if cfg.get("dataset") in ("scienceqa_cot", "scienceqa_human") or is_vlm:
+        tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+        check_14_separator_token_stability(tok)
+        if "pixel_values" in batch:
+            check_vision_tokens_masked(batch, tokenizer)
+            check_teacher_student_same_image(teacher, student, batch)
 
     print("=" * 60)
     print("ALL SANITY CHECKS PASSED")

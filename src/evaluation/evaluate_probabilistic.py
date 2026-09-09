@@ -202,6 +202,7 @@ def evaluate_model(
     all_correct: List[torch.Tensor] = []
 
     # --- Per-region accumulators ---
+    # --- Per-region accumulators ---
     region_acc: Dict[int, Dict[str, float]] = {}
     region_conf:    Dict[int, List[torch.Tensor]] = {}
     region_correct: Dict[int, List[torch.Tensor]] = {}
@@ -212,6 +213,14 @@ def evaluate_model(
         }
         region_conf[rid]    = []
         region_correct[rid] = []
+
+    # --- Modality accumulators (with-image vs without-image) ---
+    modality_acc: Dict[str, Dict[str, float]] = {
+        "with_image": {"entropy": 0.0, "maxprob": 0.0, "nll": 0.0, "kl": 0.0, "n_tokens": 0},
+        "without_image": {"entropy": 0.0, "maxprob": 0.0, "nll": 0.0, "kl": 0.0, "n_tokens": 0},
+    }
+    modality_conf: Dict[str, List[torch.Tensor]] = {"with_image": [], "without_image": []}
+    modality_correct: Dict[str, List[torch.Tensor]] = {"with_image": [], "without_image": []}
 
     # --- Per-position accumulators (response-relative indexing) ---
     max_resp_pos = cfg["max_length"] - 1   # max possible response length
@@ -225,20 +234,24 @@ def evaluate_model(
     for batch in dataloader:
         batch = {k: v.to(device) for k, v in batch.items()}
 
+        # Build kwargs for multimodal forward pass
+        fwd_kwargs = {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+        }
+        if "pixel_values" in batch and batch["pixel_values"] is not None:
+            fwd_kwargs["pixel_values"] = batch["pixel_values"]
+        if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
+            fwd_kwargs["image_grid_thw"] = batch["image_grid_thw"]
+
         # ---- Student forward ----
-        s_out = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        )
+        s_out = student(**fwd_kwargs)
         s_logits = s_out.logits.detach()
 
         # ---- Teacher forward (if available) ----
         t_logits = None
         if teacher is not None:
-            t_out = teacher(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-            )
+            t_out = teacher(**fwd_kwargs)
             t_logits = t_out.logits.detach()
             t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
@@ -305,6 +318,25 @@ def evaluate_model(
                 # Accumulate per-region ECE data
                 region_conf[rid].append(_max_prob[rmask].cpu())
                 region_correct[rid].append((_preds[rmask] == shift_labels[rmask]).float().cpu())
+
+        # ---- Per-modality scalar metrics (with-image vs without-image) ----
+        if "has_image" in batch:
+            for b in range(batch["input_ids"].shape[0]):
+                is_img = bool(batch["has_image"][b].item())
+                mkey = "with_image" if is_img else "without_image"
+                b_mask = valid_mask[b:b+1]  # [1, L-1]
+                bn = int(b_mask.sum().item())
+                if bn == 0:
+                    continue
+                macc = modality_acc[mkey]
+                macc["entropy"] += mean_entropy(shift_s[b:b+1], b_mask).item() * bn
+                macc["maxprob"] += mean_max_probability(shift_s[b:b+1], b_mask).item() * bn
+                macc["nll"]     += mean_nll(shift_s[b:b+1], shift_labels[b:b+1], b_mask).item() * bn
+                macc["n_tokens"] += bn
+                if shift_t is not None:
+                    macc["kl"] += mean_kl(shift_t[b:b+1], shift_s[b:b+1], b_mask).item() * bn
+                modality_conf[mkey].append(_max_prob[b:b+1][b_mask].cpu())
+                modality_correct[mkey].append((_preds[b:b+1][b_mask] == shift_labels[b:b+1][b_mask]).float().cpu())
 
         # ---- Per-position curves (response-relative indexing) ----
         B_cur = shift_s.size(0)
@@ -392,6 +424,30 @@ def evaluate_model(
             "n_tokens": rn,
         }
 
+    # Per-modality aggregation
+    def _aggregate_modality(mkey: str) -> Dict[str, float | None]:
+        macc = modality_acc[mkey]
+        mn = macc["n_tokens"]
+        if mn == 0:
+            return {
+                "entropy": None, "maxprob": None,
+                "nll": None, "ppl": None,
+                "kl": None, "ece": None, "n_tokens": 0,
+            }
+        m_nll = macc["nll"] / mn
+        m_flat_conf    = torch.cat(modality_conf[mkey])    if modality_conf[mkey]    else torch.tensor([])
+        m_flat_correct = torch.cat(modality_correct[mkey]) if modality_correct[mkey] else torch.tensor([])
+        m_ece = _ece_from_flat(m_flat_conf, m_flat_correct).item()
+        return {
+            "entropy": round(macc["entropy"] / mn, 6),
+            "maxprob": round(macc["maxprob"] / mn, 6),
+            "nll":     round(m_nll, 6),
+            "ppl":     round(math.exp(m_nll), 4),
+            "kl":      round(macc["kl"] / mn, 6) if teacher is not None else None,
+            "ece":     round(m_ece, 6),
+            "n_tokens": mn,
+        }
+
     # ---- ρ = H_R / H_A (Hypothesis H1, Article II) ----
     # Compute from raw (un-rounded) accumulators to preserve precision.
     region_R = _aggregate_region(REGION_REASONING)
@@ -417,6 +473,9 @@ def evaluate_model(
         "region_prompt":    _aggregate_region(REGION_PROMPT),
         "region_reasoning": region_R,
         "region_answer":    region_A,
+        # Per-modality (ScienceQA)
+        "modality_with_image":    _aggregate_modality("with_image"),
+        "modality_without_image": _aggregate_modality("without_image"),
         # Hypothesis H1 ratio
         "rho_HR_HA": round(rho, 6) if rho is not None else None,
         # Per-position curves
@@ -463,6 +522,21 @@ def evaluate_model(
             f"nll={rd['nll']:.4f}  ppl={rd['ppl']:.2f}  "
             f"ece={rd['ece']:.4f}{kl_str}"
         )
+
+    # Modality breakdown (ScienceQA)
+    for mname, mkey in [("With Img", "modality_with_image"),
+                        ("No Img",   "modality_without_image")]:
+        md = results.get(mkey, {})
+        n_tok = md.get("n_tokens", 0)
+        if n_tok > 0:
+            kl_str = f"  kl={md['kl']:.4f}" if md.get("kl") is not None else ""
+            print(
+                f"  [{mname:>9}] ({n_tok:>6} tok)  "
+                f"H={md['entropy']:.4f}  mp={md['maxprob']:.4f}  "
+                f"nll={md['nll']:.4f}  ppl={md['ppl']:.2f}  "
+                f"ece={md['ece']:.4f}{kl_str}"
+            )
+
     print(f"{'='*62}\n")
 
     return results

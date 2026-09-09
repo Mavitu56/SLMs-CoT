@@ -1,0 +1,37 @@
+teacher_name: Qwen/Qwen2.5-VL-7B-Instruct
+student_name: Qwen/Qwen2.5-VL-3B-Instruct
+teacher_load_mode: bf16
+student_dtype: bf16
+model_type: vlm
+
+min_pixels: 200704
+max_pixels: 401408
+freeze_vision_tower: true
+
+enable_gradient_checkpointing: true
+free_logits_after_loss: true
+
+dataset: scienceqa_cot
+cot_data_path: data/scienceqa_cot_qwen25_vl_7b.jsonl
+filter_teacher_wrong: false
+filter_no_separator: true
+
+kd_mode: rkl
+temperature: 4
+alpha: 0.5
+seed: 42
+
+max_length: 1536
+num_epochs: 3
+batch_size: 4
+grad_accum_steps: 16   # effective batch = 64
+lr: 4.0e-5
+weight_decay: 0.05
+warmup_ratio: 0.1
+scheduler: cosine
+max_grad_norm: 1.0
+
+log_every: 25
+save_dir: checkpoints/scienceqa_cot_rkl_T4_seed42
+log_file: logs/scienceqa_cot_rkl_T4_seed42.jsonl
+run_sanity: false

@@ -19,6 +19,12 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+except ImportError:
+    Qwen2_5_VLForConditionalGeneration = None
+    AutoProcessor = None
+
 from src.losses.losses_kd import compute_total_loss
 from src.losses.losses_kd_weighted import compute_total_loss_weighted
 from src.training.utils_seed import set_seed
@@ -28,11 +34,49 @@ from src.training.utils_seed import set_seed
 # Model loading helpers
 # ------------------------------------------------------------------
 
-def load_teacher(name: str, load_mode: str) -> AutoModelForCausalLM:
+def load_teacher(name: str, load_mode: str, is_vlm: bool = False) -> torch.nn.Module:
     """Load the teacher model according to ``load_mode`` (4bit | 8bit | bf16).
 
-    The teacher is always frozen and set to eval.
+    The teacher is always frozen and set to eval. Supports both Causal LM and VLM.
     """
+    if is_vlm:
+        if Qwen2_5_VLForConditionalGeneration is None:
+            raise ImportError(
+                "transformers>=4.49.0 is required for Qwen2.5-VL support."
+            )
+        if load_mode == "bf16":
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+        elif load_mode == "4bit":
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                name,
+                quantization_config=bnb_cfg,
+                device_map="auto",
+            )
+        elif load_mode == "8bit":
+            bnb_cfg = BitsAndBytesConfig(load_in_8bit=True)
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                name,
+                quantization_config=bnb_cfg,
+                device_map="auto",
+            )
+        else:
+            raise ValueError(f"Unknown teacher_load_mode: {load_mode!r}")
+
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        return model
+
     if load_mode == "4bit":
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -69,7 +113,12 @@ def load_teacher(name: str, load_mode: str) -> AutoModelForCausalLM:
     return model
 
 
-def load_student(name: str, dtype_str: str) -> AutoModelForCausalLM:
+def load_student(
+    name: str,
+    dtype_str: str,
+    is_vlm: bool = False,
+    freeze_vision_tower: bool = True,
+) -> torch.nn.Module:
     """Load the student model in the requested dtype."""
     dtype_map = {
         "bf16": torch.bfloat16,
@@ -77,6 +126,23 @@ def load_student(name: str, dtype_str: str) -> AutoModelForCausalLM:
         "fp32": torch.float32,
     }
     dtype = dtype_map.get(dtype_str, torch.bfloat16)
+
+    if is_vlm:
+        if Qwen2_5_VLForConditionalGeneration is None:
+            raise ImportError(
+                "transformers>=4.49.0 is required for Qwen2.5-VL support."
+            )
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            name,
+            torch_dtype=dtype,
+            device_map="auto",
+        )
+        if freeze_vision_tower and hasattr(model, "visual"):
+            for p in model.visual.parameters():
+                p.requires_grad = False
+            print("[vlm] student vision tower (model.visual) frozen ✓")
+        model.train()
+        return model
 
     model = AutoModelForCausalLM.from_pretrained(
         name,
@@ -92,16 +158,17 @@ def load_student(name: str, dtype_str: str) -> AutoModelForCausalLM:
 # ------------------------------------------------------------------
 
 def _save_checkpoint(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
+    model: torch.nn.Module,
+    tokenizer: Any,
     save_dir: str,
     tag: str,
 ) -> None:
-    """Save student model + tokenizer to ``save_dir/tag``."""
+    """Save student model + tokenizer/processor to ``save_dir/tag``."""
     path = os.path.join(save_dir, tag)
     os.makedirs(path, exist_ok=True)
     model.save_pretrained(path)
-    tokenizer.save_pretrained(path)
+    if hasattr(tokenizer, "save_pretrained"):
+        tokenizer.save_pretrained(path)
     print(f"[ckpt] saved → {path}")
 
 
@@ -113,6 +180,41 @@ def _build_dataloader(cfg: Dict[str, Any], tokenizer):
     """Build the training DataLoader based on config['dataset']."""
     dataset_name = cfg.get("dataset", "gsm8k")
     micro_n = cfg.get("micro_overfit_n", None)
+
+    if dataset_name == "scienceqa_cot":
+        from src.data.data_scienceqa import build_dataloader_cot
+
+        jsonl_path = cfg.get("cot_data_path")
+        if not jsonl_path:
+            raise ValueError(
+                "dataset='scienceqa_cot' requires cfg['cot_data_path'] "
+                "(e.g. 'data/scienceqa_cot_qwen25_vl_7b.jsonl')."
+            )
+        return build_dataloader_cot(
+            processor=tokenizer,
+            max_length=cfg["max_length"],
+            batch_size=cfg["batch_size"],
+            jsonl_path=jsonl_path,
+            split="train",
+            filter_teacher_wrong=cfg.get("filter_teacher_wrong", False),
+            filter_no_separator=cfg.get("filter_no_separator", True),
+            micro_overfit_n=micro_n,
+            shuffle=True,
+            seed=cfg.get("seed", 42),
+        )
+
+    if dataset_name == "scienceqa_human":
+        from src.data.data_scienceqa import build_dataloader_human_rationale
+
+        return build_dataloader_human_rationale(
+            processor=tokenizer,
+            max_length=cfg["max_length"],
+            batch_size=cfg["batch_size"],
+            split="train",
+            micro_overfit_n=micro_n,
+            shuffle=True,
+            seed=cfg.get("seed", 42),
+        )
 
     if dataset_name == "gsm8k_cot":
         # CoT pathway: teacher-generated rationale from Phase 1.1 JSONL
@@ -143,7 +245,7 @@ def _build_dataloader(cfg: Dict[str, Any], tokenizer):
     else:
         raise ValueError(
             f"Unknown dataset: {dataset_name!r}. "
-            f"Supported: 'dolly', 'gsm8k', 'gsm8k_cot'."
+            f"Supported: 'dolly', 'gsm8k', 'gsm8k_cot', 'scienceqa_cot', 'scienceqa_human'."
         )
 
     return build_dataloader(
@@ -184,16 +286,44 @@ def train(cfg: Dict[str, Any]) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # ---- Tokenizer (shared) ----
-    tokenizer = AutoTokenizer.from_pretrained(cfg["student_name"])
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    is_vlm = (
+        cfg.get("model_type") == "vlm"
+        or "VL" in cfg.get("student_name", "")
+        or "VL" in cfg.get("teacher_name", "")
+    )
+
+    # ---- Tokenizer / Processor ----
+    if is_vlm:
+        if AutoProcessor is None:
+            raise ImportError(
+                "transformers>=4.49.0 is required for Qwen2.5-VL support."
+            )
+        min_pixels = cfg.get("min_pixels", 256 * 28 * 28)
+        max_pixels = cfg.get("max_pixels", 512 * 28 * 28)
+        processor = AutoProcessor.from_pretrained(
+            cfg["student_name"],
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        if processor.tokenizer.pad_token_id is None:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        tokenizer = processor
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(cfg["student_name"])
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
     # ---- Models ----
+    freeze_vision_tower = cfg.get("freeze_vision_tower", True)
     print(f"Loading teacher: {cfg['teacher_name']}  (mode={cfg['teacher_load_mode']})")
-    teacher = load_teacher(cfg["teacher_name"], cfg["teacher_load_mode"])
+    teacher = load_teacher(cfg["teacher_name"], cfg["teacher_load_mode"], is_vlm=is_vlm)
     print(f"Loading student: {cfg['student_name']}  (dtype={cfg['student_dtype']})")
-    student = load_student(cfg["student_name"], cfg["student_dtype"])
+    student = load_student(
+        cfg["student_name"],
+        cfg["student_dtype"],
+        is_vlm=is_vlm,
+        freeze_vision_tower=freeze_vision_tower,
+    )
 
     # Optional memory-saving toggles controlled by YAML
     enable_gradient_checkpointing = cfg.get("enable_gradient_checkpointing", False)
@@ -214,9 +344,10 @@ def train(cfg: Dict[str, Any]) -> None:
         )
     # Verify that shared token ids map to the same tokens
     teacher_tok = AutoTokenizer.from_pretrained(cfg["teacher_name"])
+    tok_check_s = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
     for i in range(min(V_teacher, V_student)):
         t_tok = teacher_tok.convert_ids_to_tokens(i)
-        s_tok = tokenizer.convert_ids_to_tokens(i)
+        s_tok = tok_check_s.convert_ids_to_tokens(i)
         assert t_tok == s_tok, (
             f"Token id {i} mismatch: teacher='{t_tok}' vs student='{s_tok}'. "
             f"Cannot safely truncate teacher logits."
@@ -294,24 +425,28 @@ def train(cfg: Dict[str, Any]) -> None:
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
+            # Build kwargs for multimodal forward
+            fwd_kwargs = {
+                "input_ids": batch["input_ids"],
+                "attention_mask": batch["attention_mask"],
+            }
+            if "pixel_values" in batch and batch["pixel_values"] is not None:
+                fwd_kwargs["pixel_values"] = batch["pixel_values"]
+            if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
+                fwd_kwargs["image_grid_thw"] = batch["image_grid_thw"]
+
             # ---- Teacher forward (frozen, no_grad) ----
             # Skip teacher entirely for ce_only (no KD component)
             if kd_mode != 'ce_only':
                 with torch.no_grad():
-                    teacher_out = teacher(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                    )
+                    teacher_out = teacher(**fwd_kwargs)
                 teacher_logits = teacher_out.logits.detach()
             else:
                 # Dummy logits — compute_total_loss won't use them in ce_only
                 teacher_logits = torch.empty(0, device=device)
 
             # ---- Student forward ----
-            student_out = student(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-            )
+            student_out = student(**fwd_kwargs)
             student_logits = student_out.logits
 
             # ---- Truncate teacher vocab to match student ----

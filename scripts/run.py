@@ -128,8 +128,9 @@ def main() -> None:
         cfg_stem = os.path.splitext(os.path.basename(args.config))[0]
         # Strip a leading "gsm8k_cot_" prefix to keep folder names short and
         # consistent with the existing seed42 layout (fkl_T4_seed42, ...).
+        # Strip prefixes to keep folder names clean and short
         run_name = cfg_stem
-        for prefix in ("gsm8k_cot_", "gsm8k_", "kd_"):
+        for prefix in ("scienceqa_cot_", "scienceqa_human_", "scienceqa_", "gsm8k_cot_", "gsm8k_", "kd_"):
             if run_name.startswith(prefix):
                 run_name = run_name[len(prefix):]
                 break
@@ -151,12 +152,35 @@ def main() -> None:
     if cfg.get("run_sanity", False):
         print("\n>>> Running sanity checks …\n")
 
-        tokenizer = AutoTokenizer.from_pretrained(cfg["student_name"])
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        is_vlm = (
+            cfg.get("model_type") == "vlm"
+            or "VL" in cfg.get("student_name", "")
+            or "VL" in cfg.get("teacher_name", "")
+        )
 
-        teacher = load_teacher(cfg["teacher_name"], cfg["teacher_load_mode"])
-        student = load_student(cfg["student_name"], cfg["student_dtype"])
+        if is_vlm:
+            from transformers import AutoProcessor
+            min_pixels = cfg.get("min_pixels", 256 * 28 * 28)
+            max_pixels = cfg.get("max_pixels", 512 * 28 * 28)
+            tokenizer = AutoProcessor.from_pretrained(
+                cfg["student_name"],
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+            if tokenizer.tokenizer.pad_token_id is None:
+                tokenizer.tokenizer.pad_token = tokenizer.tokenizer.eos_token
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(cfg["student_name"])
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+        teacher = load_teacher(cfg["teacher_name"], cfg["teacher_load_mode"], is_vlm=is_vlm)
+        student = load_student(
+            cfg["student_name"],
+            cfg["student_dtype"],
+            is_vlm=is_vlm,
+            freeze_vision_tower=cfg.get("freeze_vision_tower", True),
+        )
 
         run_all_sanity_checks(teacher, student, tokenizer, cfg)
 
