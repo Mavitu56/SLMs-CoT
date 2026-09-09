@@ -133,8 +133,10 @@ def cell2_verify_models() -> None:
     from transformers import AutoConfig
     cfg_t = AutoConfig.from_pretrained(teacher_name)
     cfg_s = AutoConfig.from_pretrained(student_name)
-    print(f"  Teacher vocab_size no config: {cfg_t.vocab_size} (1188 * 128)")
-    print(f"  Student vocab_size no config: {cfg_s.vocab_size} (1187 * 128)")
+    vocab_t = getattr(cfg_t, "vocab_size", None) or getattr(getattr(cfg_t, "text_config", None), "vocab_size", None)
+    vocab_s = getattr(cfg_s, "vocab_size", None) or getattr(getattr(cfg_s, "text_config", None), "vocab_size", None)
+    print(f"  Teacher vocab_size no config: {vocab_t} (1188 * 128)")
+    print(f"  Student vocab_size no config: {vocab_s} (1187 * 128)")
     print("  -> Alinhamento automático via _align_vocab() corta teacher para 151936 ✓")
 
     del proc_s, proc_t
@@ -359,5 +361,37 @@ def cell8_evaluate_probabilistic() -> None:
 
 
 if __name__ == "__main__":
-    # Quando executado como script, executa setup
-    cell1_setup()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Colab ScienceQA Multimodal Runner")
+    parser.add_argument(
+        "--cell",
+        type=str,
+        default="1",
+        help="Célula para executar: 1..8, 'all', ou lista separada por vírgula (ex: '1,2'). Padrão: '1'",
+    )
+    args = parser.parse_args()
+
+    cell_map = {
+        "1": ("Setup & Dependências", cell1_setup),
+        "2": ("Verificação de Modelos & Vocabulário", cell2_verify_models),
+        "3": ("Geração CoT Piloto (100)", cell3_generate_pilot_cot),
+        "4": ("Geração CoT Completa", cell4_generate_full_cot),
+        "5": ("Smoke Test de Treino", cell5_smoke_test_training),
+        "6": ("Sweep de Treino (8 configs)", cell6_run_full_sweep),
+        "7": ("Avaliação de Acurácia", cell7_evaluate_accuracy),
+        "8": ("Avaliação Probabilística", cell8_evaluate_probabilistic),
+    }
+
+    if args.cell.lower() == "all":
+        targets = ["1", "2", "3", "4", "5", "6", "7", "8"]
+    else:
+        targets = [c.strip() for c in args.cell.split(",") if c.strip()]
+
+    for c in targets:
+        if c in cell_map:
+            name, func = cell_map[c]
+            print(f"\n>>> Executando Célula {c}: {name} ...\n")
+            func()
+        else:
+            print(f"Célula desconhecida: {c!r}. Opções válidas: 1 a 8 ou 'all'.")

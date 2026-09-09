@@ -131,16 +131,10 @@ def check_teacher_frozen(
     # Teacher forward (no_grad)
     teacher.eval()
     with torch.no_grad():
-        t_out = teacher(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        )
+        t_out = _model_forward(teacher, batch)
 
     # Student forward
-    s_out = student(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-    )
+    s_out = _model_forward(student, batch)
 
     t_logits, s_logits = _align_vocab(t_out.logits, s_out.logits)
     loss_total, _, _, _ = compute_total_loss(
@@ -180,14 +174,8 @@ def check_kd_mode_combinations(
     batch = _to_device(batch, device)
 
     with torch.no_grad():
-        t_logits = teacher(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
-        s_logits = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
+        t_logits = _model_forward(teacher, batch).logits
+        s_logits = _model_forward(student, batch).logits
 
     t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
@@ -312,14 +300,8 @@ def check_kl_non_negative(
     batch = _to_device(batch, device)
 
     with torch.no_grad():
-        t_logits = teacher(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
-        s_logits = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
+        t_logits = _model_forward(teacher, batch).logits
+        s_logits = _model_forward(student, batch).logits
 
     t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
@@ -355,14 +337,8 @@ def check_mask_all_ignored(
     batch["labels"][:] = -100
 
     with torch.no_grad():
-        t_logits = teacher(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
-        s_logits = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
+        t_logits = _model_forward(teacher, batch).logits
+        s_logits = _model_forward(student, batch).logits
 
     t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
@@ -485,14 +461,8 @@ def check_rkl_temperature_invariant(
     batch = _to_device(batch, device)
 
     with torch.no_grad():
-        t_logits = teacher(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
-        s_logits = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
+        t_logits = _model_forward(teacher, batch).logits
+        s_logits = _model_forward(student, batch).logits
 
     t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
@@ -528,14 +498,8 @@ def check_fkl_temperature_sensitive(
     batch = _to_device(batch, device)
 
     with torch.no_grad():
-        t_logits = teacher(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
-        s_logits = student(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-        ).logits
+        t_logits = _model_forward(teacher, batch).logits
+        s_logits = _model_forward(student, batch).logits
 
     t_logits, s_logits = _align_vocab(t_logits, s_logits)
 

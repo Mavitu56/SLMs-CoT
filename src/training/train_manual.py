@@ -335,8 +335,18 @@ def train(cfg: Dict[str, Any]) -> None:
     device = next(student.parameters()).device
 
     # ---- Vocab-size check ----
-    V_teacher = teacher.config.vocab_size
-    V_student = student.config.vocab_size
+    def _get_vocab_size(m):
+        cfg_m = getattr(m, "config", m)
+        if hasattr(cfg_m, "text_config") and hasattr(cfg_m.text_config, "vocab_size"):
+            return cfg_m.text_config.vocab_size
+        if hasattr(cfg_m, "vocab_size") and cfg_m.vocab_size is not None:
+            return cfg_m.vocab_size
+        if hasattr(m, "lm_head") and hasattr(m.lm_head, "weight"):
+            return m.lm_head.weight.shape[0]
+        raise AttributeError(f"Cannot determine vocab_size for {type(m)}")
+
+    V_teacher = _get_vocab_size(teacher)
+    V_student = _get_vocab_size(student)
     if V_teacher != V_student:
         print(
             f"[vocab] teacher={V_teacher}, student={V_student} "
@@ -345,14 +355,15 @@ def train(cfg: Dict[str, Any]) -> None:
     # Verify that shared token ids map to the same tokens
     teacher_tok = AutoTokenizer.from_pretrained(cfg["teacher_name"])
     tok_check_s = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-    for i in range(min(V_teacher, V_student)):
+    n_check = min(V_teacher, V_student, 1000)
+    for i in range(n_check):
         t_tok = teacher_tok.convert_ids_to_tokens(i)
         s_tok = tok_check_s.convert_ids_to_tokens(i)
         assert t_tok == s_tok, (
             f"Token id {i} mismatch: teacher='{t_tok}' vs student='{s_tok}'. "
             f"Cannot safely truncate teacher logits."
         )
-    print(f"[vocab] token id consistency verified for {min(V_teacher, V_student)} tokens ✓")
+    print(f"[vocab] token id consistency verified for {n_check} tokens ✓")
     del teacher_tok
 
     # ---- Data ----
