@@ -133,8 +133,8 @@ def cell2_verify_models() -> None:
     from transformers import AutoConfig
     cfg_t = AutoConfig.from_pretrained(teacher_name)
     cfg_s = AutoConfig.from_pretrained(student_name)
-    vocab_t = getattr(cfg_t, "vocab_size", None) or getattr(getattr(cfg_t, "text_config", None), "vocab_size", None)
-    vocab_s = getattr(cfg_s, "vocab_size", None) or getattr(getattr(cfg_s, "text_config", None), "vocab_size", None)
+    vocab_t = cfg_t.text_config.vocab_size if hasattr(cfg_t, "text_config") else getattr(cfg_t, "vocab_size", None)
+    vocab_s = cfg_s.text_config.vocab_size if hasattr(cfg_s, "text_config") else getattr(cfg_s, "vocab_size", None)
     print(f"  Teacher vocab_size no config: {vocab_t} (1188 * 128)")
     print(f"  Student vocab_size no config: {vocab_s} (1187 * 128)")
     print("  -> Alinhamento automático via _align_vocab() corta teacher para 151936 ✓")
