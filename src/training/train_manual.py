@@ -534,15 +534,17 @@ def train(cfg: Dict[str, Any]) -> None:
                 global_step += 1
 
                 # ---- Logging ----
-                if global_step % log_every == 0:
+                if global_step % log_every == 0 or global_step == 1:
                     avg_total = accum_loss_total / max(accum_micro_steps, 1)
                     avg_ce = accum_loss_ce / max(accum_micro_steps, 1)
                     avg_kd = accum_loss_kd / max(accum_micro_steps, 1)
                     current_lr = scheduler.get_last_lr()[0]
+                    pct = (global_step / total_optimizer_steps) * 100.0
                     print(
-                        f"[step {global_step:>5d}/{total_optimizer_steps}]  "
+                        f"[step {global_step:>5d}/{total_optimizer_steps} ({pct:>5.1f}%)]  "
                         f"loss={avg_total:.4f}  ce={avg_ce:.4f}  kd={avg_kd:.4f}  "
-                        f"tokens={accum_n_tokens}  lr={current_lr:.2e}"
+                        f"tokens={accum_n_tokens}  lr={current_lr:.2e}",
+                        flush=True
                     )
                     if log_fh is not None:
                         log_fh.write(json.dumps({
@@ -575,9 +577,13 @@ def train(cfg: Dict[str, Any]) -> None:
             global_step += 1
             micro_count = 0  # reset for next epoch
 
+        # ---- End-of-epoch checkpoint (preserves progress against disconnection) ----
+        print(f"\n[checkpoint] Salvando checkpoint da época {epoch}/{num_epochs} em {save_dir}/latest_epoch ...", flush=True)
+        _save_checkpoint(student, tokenizer, save_dir, tag="latest_epoch")
+
     # ---- Final checkpoint ----
     _save_checkpoint(student, tokenizer, save_dir, tag="final")
     if log_fh is not None:
         log_fh.close()
-        print(f"[log] saved → {log_file}")
-    print(f"\nTraining complete. Total optimizer steps: {global_step}")
+        print(f"[log] saved → {log_file}", flush=True)
+    print(f"\nTraining complete. Total optimizer steps: {global_step}", flush=True)

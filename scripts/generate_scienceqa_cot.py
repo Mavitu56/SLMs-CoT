@@ -324,6 +324,28 @@ def compute_stats(jsonl_path: str) -> Dict[str, Any]:
     return stats
 
 
+def _sync_to_drive(local_path: str, drive_path: str) -> None:
+    """Safely sync local file to Google Drive using atomic copy."""
+    if not local_path or not drive_path or not os.path.isfile(local_path):
+        return
+    try:
+        drive_dir = os.path.dirname(drive_path)
+        if drive_dir:
+            os.makedirs(drive_dir, exist_ok=True)
+        import shutil
+        tmp_target = drive_path + ".tmp"
+        shutil.copyfile(local_path, tmp_target)
+        if os.name == "nt":
+            if os.path.exists(drive_path):
+                os.remove(drive_path)
+            os.rename(tmp_target, drive_path)
+        else:
+            os.replace(tmp_target, drive_path)
+        print(f"  💾 [Drive Sync] Progresso salvo no Google Drive: {drive_path}", flush=True)
+    except Exception as e:
+        print(f"  ⚠️ [Drive Sync Aviso] Falha ao sincronizar com Google Drive: {e}", flush=True)
+
+
 # ------------------------------------------------------------------
 # Main Execution Orchestrator
 # ------------------------------------------------------------------
@@ -335,6 +357,10 @@ def main() -> None:
     parser.add_argument("--output-path", type=str, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--stats-path", type=str, default=DEFAULT_STATS_PATH)
     parser.add_argument("--images-dir", type=str, default=DEFAULT_IMAGES_DIR)
+    parser.add_argument("--drive-sync-path", type=str, default=None,
+                        help="Optional Google Drive path to periodically sync JSONL")
+    parser.add_argument("--sync-every", type=int, default=50,
+                        help="Sync to Drive every N generated examples (default: 50)")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-per-split", type=int, default=None,
                         help="Limit examples per split (for testing/piloting)")
@@ -344,22 +370,32 @@ def main() -> None:
                         help="Save PIL images to disk for fast offline loading")
     args = parser.parse_args()
 
+    print("\n" + "═" * 70, flush=True)
+    print("🤖 GERAÇÃO DE CHAIN-OF-THOUGHT (Qwen2.5-VL-7B-Instruct)", flush=True)
+    print("═" * 70, flush=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"[Etapa 1/6] Dispositivo de execução: {device}", flush=True)
+
+    # If drive sync path exists and local output path does not or is smaller, restore from Drive
+    if args.drive_sync_path and os.path.isfile(args.drive_sync_path):
+        if not os.path.isfile(args.output_path) or os.path.getsize(args.output_path) < os.path.getsize(args.drive_sync_path):
+            print(f"  Restaurando progresso prévio do Google Drive: {args.drive_sync_path} -> {args.output_path}", flush=True)
+            import shutil
+            os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
+            shutil.copyfile(args.drive_sync_path, args.output_path)
 
     # 1. Load Processors
-    print(f"Loading teacher processor: {args.teacher_name}")
+    print(f"[Etapa 2/6] Carregando processadores do Professor e Aluno...", flush=True)
     processor = AutoProcessor.from_pretrained(
         args.teacher_name,
         min_pixels=256 * 28 * 28,
         max_pixels=512 * 28 * 28,
     )
-
-    print(f"Loading student processor: {args.student_name}")
     student_processor = AutoProcessor.from_pretrained(args.student_name)
 
     # 2. Load Teacher Model (bf16, eval, frozen)
-    print(f"Loading teacher model: {args.teacher_name} in bf16 ...")
+    print(f"[Etapa 3/6] Carregando modelo do Professor: {args.teacher_name} em bf16 ...", flush=True)
     teacher = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.teacher_name,
         torch_dtype=torch.bfloat16,
@@ -370,22 +406,23 @@ def main() -> None:
         p.requires_grad = False
 
     # 3. Load ScienceQA Splits
-    print("Loading ScienceQA from HuggingFace (derek-thomas/ScienceQA) ...")
+    print("[Etapa 4/6] Carregando splits do ScienceQA (derek-thomas/ScienceQA) ...", flush=True)
     loaded_splits = {}
     for s in args.splits:
         loaded_splits[s] = datasets.load_dataset("derek-thomas/ScienceQA", split=s)
-        print(f"  Split {s!r}: {len(loaded_splits[s])} examples")
+        print(f"  • Split {s!r}: {len(loaded_splits[s])} exemplos", flush=True)
 
     train_ds = loaded_splits.get("train", datasets.load_dataset("derek-thomas/ScienceQA", split="train"))
 
-    # 4. Build Few-Shot Messages
-    print(f"Building few-shot messages using exemplars: {FEW_SHOT_INDICES}")
+    # 4. Build Few-Shot Messages & Resume check
+    print(f"[Etapa 5/6] Preparando few-shot exemplars {FEW_SHOT_INDICES} e checando progresso...", flush=True)
     few_shot_messages = build_few_shot_messages(train_ds, FEW_SHOT_INDICES)
 
-    # 5. Check already completed records (resume)
     done_keys = load_done_keys(args.output_path)
     if done_keys:
-        print(f"Found {len(done_keys)} completed records in {args.output_path}. Resuming...")
+        print(f"  ✓ Encontrados {len(done_keys)} registros prévios em {args.output_path}. Retomando sem perda de progresso!", flush=True)
+    else:
+        print("  ✓ Nenhum registro prévio. Iniciando do zero.", flush=True)
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     if args.save_images and args.images_dir:
@@ -394,6 +431,7 @@ def main() -> None:
     img_dir_param = args.images_dir if args.save_images else None
 
     # 6. Generation Loop
+    print("\n[Etapa 6/6] Iniciando loop de geração com CoT...", flush=True)
     out_fh = open(args.output_path, "a", encoding="utf-8")
     t0 = time.time()
     n_generated = 0
@@ -403,11 +441,13 @@ def main() -> None:
         for split_name in args.splits:
             ds = loaded_splits[split_name]
             total_in_split = len(ds)
-            print(f"\n>>> Starting split: {split_name} ({total_in_split} items)")
+            print(f"\n┌──────────────────────────────────────────────────────────", flush=True)
+            print(f"│ ▶ Split: {split_name.upper()} ({total_in_split} itens no total)", flush=True)
+            print(f"└──────────────────────────────────────────────────────────", flush=True)
 
             for idx in range(total_in_split):
                 if args.max_per_split and idx >= args.max_per_split:
-                    print(f"Reached max_per_split={args.max_per_split} for {split_name}")
+                    print(f"Alcançado limite max_per_split={args.max_per_split} para {split_name}", flush=True)
                     break
 
                 # Skip few-shot exemplars on train split to prevent data leakage
@@ -435,33 +475,67 @@ def main() -> None:
                     n_generated += 1
                     n_correct += int(rec["is_teacher_correct"])
 
-                    if n_generated % 25 == 0:
+                    # Flush regularly to disk
+                    if n_generated % 5 == 0:
                         out_fh.flush()
+
+                    # Visual progress reporting
+                    should_log = (
+                        n_generated in (1, 5, 10, 25, 50, 75, 100)
+                        or n_generated % 25 == 0
+                        or idx == total_in_split - 1
+                    )
+                    if should_log:
                         elapsed = time.time() - t0
-                        s_per_it = elapsed / n_generated
-                        acc = (n_correct / n_generated) * 100.0
+                        s_per_it = elapsed / max(n_generated, 1)
+                        acc = (n_correct / max(n_generated, 1)) * 100.0
+                        pct = ((idx + 1) / total_in_split) * 100.0
+                        remaining_ex = total_in_split - (idx + 1)
+                        eta_sec = remaining_ex * s_per_it
+                        if eta_sec < 3600:
+                            eta_str = f"{eta_sec/60:.1f}m"
+                        else:
+                            eta_str = f"{eta_sec/3600:.1f}h"
                         print(
-                            f"[{split_name} {idx:>5d}/{total_in_split}] "
-                            f"done={n_generated}  acc={acc:.1f}%  "
-                            f"speed={s_per_it:.2f}s/ex"
+                            f"[{split_name} | {idx+1:>5d}/{total_in_split} ({pct:>5.1f}%)] "
+                            f"gerados={n_generated}  acurácia={acc:.1f}%  "
+                            f"velocidade={s_per_it:.2f}s/ex  ETA={eta_str}",
+                            flush=True
                         )
+
+                    # Periodic Drive sync
+                    if args.drive_sync_path and n_generated % args.sync_every == 0:
+                        out_fh.flush()
+                        _sync_to_drive(args.output_path, args.drive_sync_path)
+
                 except Exception as ex:
-                    print(f"[ERROR] failed on {split_name} idx {idx}: {ex}")
+                    print(f"[ERRO] Falha no split {split_name} idx {idx}: {ex}", flush=True)
                     continue
+
+            # Sync to drive at end of split
+            if args.drive_sync_path:
+                out_fh.flush()
+                _sync_to_drive(args.output_path, args.drive_sync_path)
 
     finally:
         out_fh.flush()
         out_fh.close()
 
-    print(f"\nGeneration pass complete. Total newly generated: {n_generated}")
+    print(f"\n✓ Geração concluída com sucesso! Total gerado nesta sessão: {n_generated}", flush=True)
 
     # 7. Compute and save stats
     stats = compute_stats(args.output_path)
     os.makedirs(os.path.dirname(args.stats_path) or ".", exist_ok=True)
     with open(args.stats_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
-    print(f"Stats written to: {args.stats_path}")
-    print(json.dumps(stats, indent=2))
+    print(f"Estatísticas salvas em: {args.stats_path}", flush=True)
+    print(json.dumps(stats, indent=2), flush=True)
+
+    # Final sync to Drive
+    if args.drive_sync_path:
+        _sync_to_drive(args.output_path, args.drive_sync_path)
+        drive_stats = os.path.join(os.path.dirname(args.drive_sync_path), os.path.basename(args.stats_path))
+        _sync_to_drive(args.stats_path, drive_stats)
 
 
 if __name__ == "__main__":
