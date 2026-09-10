@@ -512,11 +512,13 @@ def main() -> None:
                         help="Dataset splits to generate (e.g. train test)")
     parser.add_argument("--save-images", action="store_true", default=True,
                         help="Save PIL images to disk for fast offline loading")
-    parser.add_argument("--batch-size", type=int, default=1,
+    default_batch_size = 8 if torch.cuda.is_available() else 1
+    default_attn_impl = "sdpa" if torch.cuda.is_available() else None
+    parser.add_argument("--batch-size", type=int, default=default_batch_size,
                         help="Number of examples to generate simultaneously. "
                              "Higher values use more VRAM but increase throughput. "
                              "Recommended: 8 for 80GB VRAM, 4 for 40GB, 1 for 24GB.")
-    parser.add_argument("--attn-impl", type=str, default=None,
+    parser.add_argument("--attn-impl", type=str, default=default_attn_impl,
                         choices=["flash_attention_2", "sdpa", "eager"],
                         help="Attention implementation. 'flash_attention_2' is fastest "
                              "(requires flash-attn package). 'sdpa' uses PyTorch native "

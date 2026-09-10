@@ -201,6 +201,8 @@ def cell3_generate_pilot_cot() -> None:
         "--stats-path", pilot_stats,
         "--max-per-split", "100",
         "--splits", "train", "test",
+        "--batch-size", "8",
+        "--attn-impl", "sdpa",
     ], cwd=REPO_DIR, step_title="Geração CoT Piloto (100 amostras)")
 
     print(f"\n[Passo 2/2] Validando arquivo piloto gerado...", flush=True)
@@ -244,6 +246,8 @@ def cell4_generate_full_cot() -> None:
         "--drive-sync-path", drive_data,
         "--sync-every", "50",
         "--splits", "train", "test",
+        "--batch-size", "8",
+        "--attn-impl", "sdpa",
     ], cwd=REPO_DIR, step_title="Geração CoT Completa com Sincronização Contínua")
 
     print("\n[Passo 3/3] Sincronização final e validação...", flush=True)
