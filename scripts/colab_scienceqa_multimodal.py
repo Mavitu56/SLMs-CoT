@@ -138,17 +138,7 @@ def cell1_setup() -> None:
         "matplotlib>=3.7.0",
     ], step_title="Instalação de Pacotes Pip")
 
-    # 5. Instalação opcional do flash-attn para aceleração máxima (A100)
-    print("\n[Passo 5/4] Tentando instalar flash-attn para aceleração na A100...", flush=True)
-    try:
-        run_cmd([
-            sys.executable, "-m", "pip", "install", "-q",
-            "flash-attn", "--no-build-isolation"
-        ], check=False, step_title="Instalação flash-attn (opcional para máxima velocidade)")
-    except Exception as e:
-        print(f"  ℹ️ flash-attn não instalado ({e}). O pipeline usará SDPA nativo do PyTorch.", flush=True)
-
-    print("\n✓ CÉLULA 1 CONCLUÍDA COM SUCESSO!\n", flush=True)
+    print("\n✓ CÉLULA 1 CONCLUÍDA COM SUCESSO! (SDPA nativo do PyTorch ativo)\n", flush=True)
 
 
 # %%
@@ -206,11 +196,7 @@ def cell3_generate_pilot_cot() -> None:
     pilot_stats = f"{REPO_DIR}/data/scienceqa_cot_pilot_stats.json"
 
     batch_size = os.environ.get("COT_BATCH_SIZE", "16")
-    try:
-        import flash_attn  # noqa: F401
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        attn_impl = "sdpa"
+    attn_impl = os.environ.get("COT_ATTN_IMPL", "sdpa")
 
     print(f"[Passo 1/2] Arquivo alvo de saída: {pilot_output}", flush=True)
     run_cmd([
@@ -257,11 +243,7 @@ def cell4_generate_full_cot() -> None:
         print("  ℹ️ Nenhum backup prévio encontrado. Iniciando geração do zero.", flush=True)
 
     batch_size = os.environ.get("COT_BATCH_SIZE", "16")
-    try:
-        import flash_attn  # noqa: F401
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        attn_impl = "sdpa"
+    attn_impl = os.environ.get("COT_ATTN_IMPL", "sdpa")
 
     print(f"\n[Passo 2/3] Iniciando geração completa (batch_size={batch_size}, attn={attn_impl})...", flush=True)
     run_cmd([
