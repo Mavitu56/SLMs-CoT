@@ -137,6 +137,17 @@ def cell1_setup() -> None:
         "rouge-score>=0.1.2",
         "matplotlib>=3.7.0",
     ], step_title="Instalação de Pacotes Pip")
+
+    # 5. Instalação opcional do flash-attn para aceleração máxima (A100)
+    print("\n[Passo 5/4] Tentando instalar flash-attn para aceleração na A100...", flush=True)
+    try:
+        run_cmd([
+            sys.executable, "-m", "pip", "install", "-q",
+            "flash-attn", "--no-build-isolation"
+        ], check=False, step_title="Instalação flash-attn (opcional para máxima velocidade)")
+    except Exception as e:
+        print(f"  ℹ️ flash-attn não instalado ({e}). O pipeline usará SDPA nativo do PyTorch.", flush=True)
+
     print("\n✓ CÉLULA 1 CONCLUÍDA COM SUCESSO!\n", flush=True)
 
 
@@ -194,6 +205,13 @@ def cell3_generate_pilot_cot() -> None:
     pilot_output = f"{REPO_DIR}/data/scienceqa_cot_pilot_100.jsonl"
     pilot_stats = f"{REPO_DIR}/data/scienceqa_cot_pilot_stats.json"
 
+    batch_size = os.environ.get("COT_BATCH_SIZE", "16")
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "sdpa"
+
     print(f"[Passo 1/2] Arquivo alvo de saída: {pilot_output}", flush=True)
     run_cmd([
         sys.executable, "-u", f"{REPO_DIR}/scripts/generate_scienceqa_cot.py",
@@ -201,9 +219,9 @@ def cell3_generate_pilot_cot() -> None:
         "--stats-path", pilot_stats,
         "--max-per-split", "100",
         "--splits", "train", "test",
-        "--batch-size", "8",
-        "--attn-impl", "sdpa",
-    ], cwd=REPO_DIR, step_title="Geração CoT Piloto (100 amostras)")
+        "--batch-size", str(batch_size),
+        "--attn-impl", attn_impl,
+    ], cwd=REPO_DIR, step_title=f"Geração CoT Piloto (100 amostras, bs={batch_size}, attn={attn_impl})")
 
     print(f"\n[Passo 2/2] Validando arquivo piloto gerado...", flush=True)
     if os.path.isfile(pilot_output):
@@ -238,7 +256,14 @@ def cell4_generate_full_cot() -> None:
     else:
         print("  ℹ️ Nenhum backup prévio encontrado. Iniciando geração do zero.", flush=True)
 
-    print("\n[Passo 2/3] Iniciando geração completa (com backup automático no Drive a cada 50 exemplos)...", flush=True)
+    batch_size = os.environ.get("COT_BATCH_SIZE", "16")
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "sdpa"
+
+    print(f"\n[Passo 2/3] Iniciando geração completa (batch_size={batch_size}, attn={attn_impl})...", flush=True)
     run_cmd([
         sys.executable, "-u", f"{REPO_DIR}/scripts/generate_scienceqa_cot.py",
         "--output-path", output_path,
@@ -246,9 +271,9 @@ def cell4_generate_full_cot() -> None:
         "--drive-sync-path", drive_data,
         "--sync-every", "50",
         "--splits", "train", "test",
-        "--batch-size", "8",
-        "--attn-impl", "sdpa",
-    ], cwd=REPO_DIR, step_title="Geração CoT Completa com Sincronização Contínua")
+        "--batch-size", str(batch_size),
+        "--attn-impl", attn_impl,
+    ], cwd=REPO_DIR, step_title=f"Geração CoT Completa (bs={batch_size}, attn={attn_impl})")
 
     print("\n[Passo 3/3] Sincronização final e validação...", flush=True)
     try:
