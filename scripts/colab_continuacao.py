@@ -442,8 +442,8 @@ def evaluate_model_batched(
     model: Qwen2_5_VLForConditionalGeneration,
     processor: AutoProcessor,
     records: List[Dict[str, Any]],
-    batch_size: int = 16,
-    max_new_tokens: int = 384,
+    batch_size: int = 48,
+    max_new_tokens: int = 256,
 ) -> Dict[str, Any]:
     device = next(model.parameters()).device
     model.eval()
@@ -457,9 +457,21 @@ def evaluate_model_batched(
     correct_no_img = 0
     subject_stats: Dict[str, Dict[str, int]] = {}
 
+    # Configurar stop tokens explícitos (<|im_end|> e eos) para não gerar além do fim da resposta
+    eos_token_ids = [processor.tokenizer.eos_token_id]
+    try:
+        im_end_id = processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if im_end_id is not None and im_end_id not in eos_token_ids:
+            eos_token_ids.append(im_end_id)
+    except Exception:
+        pass
+
     t_start = time.time()
     n_batches = (len(records) + batch_size - 1) // batch_size
-    print(f"  Iniciando avaliação de {len(records)} exemplos em {n_batches} batches (bs={batch_size})...", flush=True)
+    vram_alloc = torch.cuda.memory_allocated(device) / (1024**3)
+    vram_total = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    print(f"  VRAM inicial: {vram_alloc:.1f}GB / {vram_total:.1f}GB", flush=True)
+    print(f"  Avaliando {len(records)} exemplos em {n_batches} batches (bs={batch_size}, max_tokens={max_new_tokens})...\n", flush=True)
 
     original_padding_side = processor.tokenizer.padding_side
     processor.tokenizer.padding_side = "left"
@@ -499,6 +511,8 @@ def evaluate_model_batched(
                 do_sample=False,
                 temperature=None,
                 top_p=None,
+                eos_token_id=eos_token_ids,
+                pad_token_id=processor.tokenizer.pad_token_id,
             )
 
             for i, (gold_letter, has_image, subject) in enumerate(batch_meta):
@@ -530,7 +544,7 @@ def evaluate_model_batched(
                     sub_entry["correct"] += 1
 
             del inputs, output_ids
-            torch.cuda.empty_cache()
+            # NÃO chamamos torch.cuda.empty_cache() dentro do loop para evitar sincronização CPU/GPU forçada!
 
             # Feedback de progresso
             elapsed = time.time() - t_start
@@ -540,6 +554,7 @@ def evaluate_model_batched(
             eta_str = f"{remaining/60:.1f}m" if remaining < 3600 else f"{remaining/3600:.1f}h"
             acc_pct = (correct / max(total, 1)) * 100.0
             pct = (total / len(records)) * 100.0
+            vram_now = torch.cuda.memory_allocated(device) / (1024**3)
 
             if current_batch <= 5 or current_batch % 5 == 0 or current_batch == n_batches:
                 acc_img_pct = (correct_with_img / max(total_with_img, 1)) * 100.0 if total_with_img > 0 else 0.0
@@ -547,8 +562,8 @@ def evaluate_model_batched(
                 print(
                     f"  [Batch {current_batch:>3d}/{n_batches} ({pct:>5.1f}%)] "
                     f"avaliados={total:>4d}/{len(records)} | "
-                    f"acurácia={acc_pct:.1f}% (img={acc_img_pct:.1f}%, texto={acc_noimg_pct:.1f}%) | "
-                    f"vel={s_per_ex:.2f}s/ex | ETA={eta_str}",
+                    f"acc={acc_pct:.1f}% (img={acc_img_pct:.1f}%, texto={acc_noimg_pct:.1f}%) | "
+                    f"VRAM={vram_now:.1f}GB | vel={s_per_ex:.2f}s/ex | ETA={eta_str}",
                     flush=True,
                 )
     finally:
@@ -631,8 +646,11 @@ else:
         else:
             pending.append((ckpt, r_name, out_json))
 
+    BATCH_SIZE = 48        # 48 a 64 utiliza ~25-35 GB de VRAM na A100 e acelera 3x a 4x
+    MAX_NEW_TOKENS = 256   # 90%+ dos raciocínios têm < 250 tokens; evita alucinações longas
+
     # --- 4. Executar Avaliações ---
-    print(f"\n[Passo 3/3] Avaliando {len(pending)} checkpoints pendentes (batch_size=16)...", flush=True)
+    print(f"\n[Passo 3/3] Avaliando {len(pending)} checkpoints pendentes (batch_size={BATCH_SIZE})...", flush=True)
     eval_start = time.time()
 
     for idx, (ckpt, run_name, out_json) in enumerate(pending, 1):
@@ -655,8 +673,8 @@ else:
             model=model,
             processor=processor,
             records=records,
-            batch_size=16,
-            max_new_tokens=384,
+            batch_size=BATCH_SIZE,
+            max_new_tokens=MAX_NEW_TOKENS,
         )
 
         with open(out_json, "w", encoding="utf-8") as f:
