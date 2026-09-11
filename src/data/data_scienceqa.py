@@ -198,6 +198,14 @@ def tokenise_scienceqa_example(
 
     # Handle image
     image = example.get("image", None)
+    if image is None and example.get("image_path"):
+        img_p = example["image_path"]
+        if os.path.isfile(img_p):
+            try:
+                image = Image.open(img_p).convert("RGB")
+            except Exception:
+                image = None
+
     if image is not None:
         if Image is not None and not isinstance(image, Image.Image):
             if isinstance(image, str) and os.path.isfile(image):

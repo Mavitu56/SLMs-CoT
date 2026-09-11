@@ -428,10 +428,16 @@ def train(cfg: Dict[str, Any]) -> None:
     accum_micro_steps = 0
     micro_count = 0
     global_step = 0
-    dtype_logged = False
+    import time
+    t_train_start = time.time()
+    t_last_log = time.time()
+
+    # Ensure responsive logging (at least every 10 steps) so the user gets frequent updates
+    if log_every > 10:
+        log_every = 5
 
     for epoch in range(1, num_epochs + 1):
-        print(f"--- Epoch {epoch}/{num_epochs} ---")
+        print(f"\n--- Epoch {epoch}/{num_epochs} ({len(loader)} batches, ~{len(loader)//grad_accum_steps} optimizer steps) ---", flush=True)
 
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -540,10 +546,19 @@ def train(cfg: Dict[str, Any]) -> None:
                     avg_kd = accum_loss_kd / max(accum_micro_steps, 1)
                     current_lr = scheduler.get_last_lr()[0]
                     pct = (global_step / total_optimizer_steps) * 100.0
+
+                    elapsed_total = time.time() - t_train_start
+                    s_per_step = elapsed_total / max(global_step, 1)
+                    rem_steps = total_optimizer_steps - global_step
+                    eta_sec = rem_steps * s_per_step
+                    eta_str = f"{eta_sec/60:.1f}m" if eta_sec < 3600 else f"{eta_sec/3600:.1f}h"
+                    tok_per_sec = accum_n_tokens / max(time.time() - t_last_log, 1e-4)
+                    t_last_log = time.time()
+
                     print(
-                        f"[step {global_step:>5d}/{total_optimizer_steps} ({pct:>5.1f}%)]  "
-                        f"loss={avg_total:.4f}  ce={avg_ce:.4f}  kd={avg_kd:.4f}  "
-                        f"tokens={accum_n_tokens}  lr={current_lr:.2e}",
+                        f"[ep {epoch}/{num_epochs} | step {global_step:>4d}/{total_optimizer_steps} ({pct:>5.1f}%)]  "
+                        f"loss={avg_total:.4f} (ce={avg_ce:.4f} kd={avg_kd:.4f})  "
+                        f"tok/s={tok_per_sec:.0f}  lr={current_lr:.2e}  ETA={eta_str}",
                         flush=True
                     )
                     if log_fh is not None:
@@ -555,6 +570,8 @@ def train(cfg: Dict[str, Any]) -> None:
                             "loss_kd": round(avg_kd, 6),
                             "n_tokens": accum_n_tokens,
                             "lr": round(current_lr, 8),
+                            "tok_per_sec": round(tok_per_sec, 1),
+                            "elapsed_sec": round(elapsed_total, 1),
                         }) + "\n")
                         log_fh.flush()
                     accum_loss_total = 0.0

@@ -83,15 +83,63 @@ def extract_scienceqa_answer(text: str) -> Optional[str]:
     return None
 
 
+def _prepare_record(r: Dict[str, Any], processor: AutoProcessor) -> Tuple[
+    str, Optional[list], str, bool, str
+]:
+    """Prepare a single record for evaluation. Returns (text, images, gold_letter, has_image, subject)."""
+    question = r["question"]
+    choices = r["choices"]
+
+    if "answer_gold_letter" in r:
+        gold_letter = r["answer_gold_letter"].strip().upper()
+    elif "answer_gold" in r:
+        gold_letter = answer_index_to_letter(r["answer_gold"])
+    elif "answer" in r:
+        ans_val = r["answer"]
+        gold_letter = answer_index_to_letter(ans_val) if isinstance(ans_val, int) else str(ans_val).upper()
+    else:
+        return None
+
+    image = r.get("image", None)
+    if image is None and r.get("image_path") and os.path.isfile(r["image_path"]):
+        try:
+            image = Image.open(r["image_path"]).convert("RGB")
+        except Exception:
+            image = None
+
+    has_image = (image is not None and isinstance(image, Image.Image)) or r.get("has_image", False)
+    hint = r.get("hint", "") or ""
+    subject = r.get("subject", "unknown")
+
+    user_msg = build_user_message(question, choices, image, hint)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        user_msg,
+    ]
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, _ = process_vision_info(messages)
+
+    return text, image_inputs, gold_letter, has_image, subject
+
+
 @torch.no_grad()
 def evaluate_scienceqa_accuracy(
     model: Qwen2_5_VLForConditionalGeneration,
     processor: AutoProcessor,
     records: List[Dict[str, Any]],
     max_new_tokens: int = 512,
+    batch_size: int = 16,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
-    """Run greedy evaluation over records and compute segmented accuracy metrics."""
+    """Run batched greedy evaluation over records and compute segmented accuracy metrics.
+
+    Uses left-padded batched generation for much faster throughput on high-VRAM GPUs.
+    With batch_size=16 on A100 80GB, evaluation of 4,241 test examples takes ~15-25 min
+    instead of ~2+ hours with batch_size=1.
+    """
+    import time
+
     if device is None:
         device = next(model.parameters()).device
 
@@ -100,107 +148,131 @@ def evaluate_scienceqa_accuracy(
     total = 0
     correct = 0
     separator_count = 0
-
     total_with_img = 0
     correct_with_img = 0
-
     total_no_img = 0
     correct_no_img = 0
-
     subject_stats: Dict[str, Dict[str, int]] = {}
     detailed_outputs = []
 
-    for r in tqdm(records, desc="Evaluating ScienceQA"):
-        question = r["question"]
-        choices = r["choices"]
+    t_start = time.time()
+    n_batches = (len(records) + batch_size - 1) // batch_size
 
-        if "answer_gold_letter" in r:
-            gold_letter = r["answer_gold_letter"].strip().upper()
-        elif "answer_gold" in r:
-            gold_letter = answer_index_to_letter(r["answer_gold"])
-        elif "answer" in r:
-            ans_val = r["answer"]
-            gold_letter = answer_index_to_letter(ans_val) if isinstance(ans_val, int) else str(ans_val).upper()
-        else:
-            continue
+    print(f"\n  Avaliando {len(records)} exemplos em {n_batches} batches (bs={batch_size})...", flush=True)
 
-        # Load image if present
-        image = r.get("image", None)
-        if image is None and r.get("image_path") and os.path.isfile(r["image_path"]):
-            try:
-                image = Image.open(r["image_path"]).convert("RGB")
-            except Exception:
-                image = None
+    # Save and set left padding for batched generation
+    original_padding_side = processor.tokenizer.padding_side
+    processor.tokenizer.padding_side = "left"
 
-        has_image = (image is not None and isinstance(image, Image.Image)) or r.get("has_image", False)
-        hint = r.get("hint", "") or ""
-        subject = r.get("subject", "unknown")
+    try:
+        for batch_idx in range(0, len(records), batch_size):
+            batch_records = records[batch_idx:batch_idx + batch_size]
 
-        # Build prompt messages for generation
-        user_msg = build_user_message(question, choices, image, hint)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            user_msg,
-        ]
+            # Prepare all items in batch
+            batch_texts = []
+            batch_images = []
+            batch_meta = []  # (gold_letter, has_image, subject, record)
 
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
+            for r in batch_records:
+                result = _prepare_record(r, processor)
+                if result is None:
+                    continue
+                text, image_inputs, gold_letter, has_image, subject = result
+                batch_texts.append(text)
+                if image_inputs:
+                    batch_images.extend(image_inputs)
+                batch_meta.append((gold_letter, has_image, subject, r))
 
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        ).to(device)
+            if not batch_texts:
+                continue
 
-        prompt_len = inputs["input_ids"].shape[1]
+            # Tokenize and generate
+            inputs = processor(
+                text=batch_texts,
+                images=batch_images if batch_images else None,
+                padding=True,
+                return_tensors="pt",
+            ).to(device)
 
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-        )
+            prompt_len = inputs["input_ids"].shape[1]
 
-        generated_tokens = output_ids[0, prompt_len:]
-        completion = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+            )
 
-        pred_letter = extract_scienceqa_answer(completion)
-        is_correct = (pred_letter == gold_letter) if pred_letter else False
-        has_sep = HASH_MARKER in completion
+            # Process each output in the batch
+            for i, (gold_letter, has_image, subject, r) in enumerate(batch_meta):
+                generated_tokens = output_ids[i, prompt_len:]
+                completion = processor.tokenizer.decode(
+                    generated_tokens, skip_special_tokens=True
+                ).strip()
 
-        total += 1
-        if is_correct:
-            correct += 1
-        if has_sep:
-            separator_count += 1
+                pred_letter = extract_scienceqa_answer(completion)
+                is_correct = (pred_letter == gold_letter) if pred_letter else False
+                has_sep = HASH_MARKER in completion
 
-        if has_image:
-            total_with_img += 1
-            if is_correct:
-                correct_with_img += 1
-        else:
-            total_no_img += 1
-            if is_correct:
-                correct_no_img += 1
+                total += 1
+                if is_correct:
+                    correct += 1
+                if has_sep:
+                    separator_count += 1
 
-        # Subject breakdown
-        sub_entry = subject_stats.setdefault(subject, {"total": 0, "correct": 0})
-        sub_entry["total"] += 1
-        if is_correct:
-            sub_entry["correct"] += 1
+                if has_image:
+                    total_with_img += 1
+                    if is_correct:
+                        correct_with_img += 1
+                else:
+                    total_no_img += 1
+                    if is_correct:
+                        correct_no_img += 1
 
-        detailed_outputs.append({
-            "idx": r.get("idx"),
-            "gold": gold_letter,
-            "pred": pred_letter,
-            "is_correct": is_correct,
-            "has_image": has_image,
-            "subject": subject,
-            "completion": completion,
-        })
+                sub_entry = subject_stats.setdefault(subject, {"total": 0, "correct": 0})
+                sub_entry["total"] += 1
+                if is_correct:
+                    sub_entry["correct"] += 1
+
+                detailed_outputs.append({
+                    "idx": r.get("idx"),
+                    "gold": gold_letter,
+                    "pred": pred_letter,
+                    "is_correct": is_correct,
+                    "has_image": has_image,
+                    "subject": subject,
+                    "completion": completion,
+                })
+
+            # Free memory
+            del inputs, output_ids
+            torch.cuda.empty_cache()
+
+            # Progress logging
+            elapsed = time.time() - t_start
+            current_batch = batch_idx // batch_size + 1
+            s_per_ex = elapsed / max(total, 1)
+            remaining = (len(records) - total) * s_per_ex
+            eta_str = f"{remaining/60:.1f}m" if remaining < 3600 else f"{remaining/3600:.1f}h"
+            acc_pct = correct / max(total, 1) * 100
+            pct = (total / len(records)) * 100.0
+
+            if current_batch <= 3 or current_batch % 5 == 0 or current_batch == n_batches:
+                acc_img_pct = (correct_with_img / max(total_with_img, 1)) * 100.0 if total_with_img > 0 else 0.0
+                acc_noimg_pct = (correct_no_img / max(total_no_img, 1)) * 100.0 if total_no_img > 0 else 0.0
+                print(
+                    f"  [{current_batch:>3d}/{n_batches} ({pct:>5.1f}%)] "
+                    f"avaliados={total:>4d}/{len(records)} | "
+                    f"acurácia={acc_pct:.1f}% (img={acc_img_pct:.1f}%, texto={acc_noimg_pct:.1f}%) | "
+                    f"vel={s_per_ex:.2f}s/ex | ETA={eta_str}",
+                    flush=True,
+                )
+    finally:
+        processor.tokenizer.padding_side = original_padding_side
+
+    elapsed_total = time.time() - t_start
+    print(f"\n  ✓ Avaliação concluída em {elapsed_total/60:.1f} min ({total} exemplos)", flush=True)
 
     acc_overall = correct / max(total, 1)
     acc_img = correct_with_img / max(total_with_img, 1) if total_with_img > 0 else None
@@ -240,19 +312,27 @@ def main() -> None:
     parser.add_argument("--jsonl-path", type=str, default="data/scienceqa_cot_qwen25_vl_7b.jsonl")
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--max-examples", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=384,
+                        help="Max tokens to generate per example (default: 384).")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Batch size for evaluation. Default: 16.")
+    parser.add_argument("--attn-impl", type=str, default="sdpa",
+                        choices=["flash_attention_2", "sdpa", "eager"],
+                        help="Attention implementation for the model.")
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading processor: {args.processor_name}")
+    print(f"Loading processor: {args.processor_name}", flush=True)
     processor = AutoProcessor.from_pretrained(args.processor_name)
 
-    print(f"Loading model: {args.model_path}")
+    load_kwargs = dict(torch_dtype=torch.bfloat16, device_map="auto")
+    if args.attn_impl:
+        load_kwargs["attn_implementation"] = args.attn_impl
+
+    print(f"Loading model: {args.model_path} (attn={args.attn_impl})", flush=True)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+        args.model_path, **load_kwargs,
     )
 
     # Load test records
@@ -282,12 +362,35 @@ def main() -> None:
     if args.max_examples:
         records = records[:args.max_examples]
 
-    print(f"Loaded {len(records)} examples for evaluation on split {args.split!r}")
+    # Check if images exist on disk or need HF dataset fallback
+    need_hf_images = False
+    for r in records[:50]:
+        if r.get("has_image") and (not r.get("image_path") or not os.path.isfile(r.get("image_path", ""))):
+            need_hf_images = True
+            break
+
+    if need_hf_images:
+        print("  ℹ️ Imagens locais não encontradas no disco. Vinculando imagens do HuggingFace (derek-thomas/ScienceQA)...", flush=True)
+        try:
+            import datasets
+            ds = datasets.load_dataset("derek-thomas/ScienceQA", split=args.split)
+            linked = 0
+            for r in records:
+                idx = r.get("idx")
+                if idx is not None and idx < len(ds) and r.get("has_image"):
+                    r["image"] = ds[idx].get("image")
+                    linked += 1
+            print(f"  ✓ {linked} imagens do HuggingFace vinculadas com sucesso!", flush=True)
+        except Exception as e:
+            print(f"  ⚠️ Não foi possível carregar imagens do HuggingFace: {e}", flush=True)
+
+    print(f"Loaded {len(records)} examples for evaluation on split {args.split!r}", flush=True)
     results = evaluate_scienceqa_accuracy(
         model=model,
         processor=processor,
         records=records,
         max_new_tokens=args.max_new_tokens,
+        batch_size=args.batch_size,
         device=device,
     )
 

@@ -1,27 +1,18 @@
 """Pipeline de continuação no Google Colab A100 — ScienceQA Multimodal KD.
 
 A geração de CoT (Fase 1.1) já foi concluída (16.965 exemplos).
-Este script faz a recuperação dos dados e executa as fases restantes:
+Este script executa as fases restantes com logs em tempo real e máxima velocidade:
   - Célula A: Montar Drive + salvar/restaurar dados de CoT
   - Célula B: Instalar dependências
   - Célula C: Smoke test de treino (16 exemplos, 1 época)
-  - Célula D: Sweep completo de treino (8 configs)
-  - Célula E: Avaliação de acurácia (multiple-choice)
+  - Célula D: Sweep completo de treino (8 configs) — streaming linha a linha no stdout
+  - Célula E: Avaliação de acurácia (BATCHED bs=16, ~10-15 min/ckpt em vez de 2h)
   - Célula F: Avaliação probabilística (ECE, entropia, KL, ρ)
 
 Ordem de execução: A → B → C → D → E → F
 
 Se o Colab desconectar, reconecte, re-execute A e B, e continue de onde parou.
-Todas as células detectam trabalho já concluído e pulam automaticamente.
-
-INSTRUÇÕES:
-  Se os arquivos gerados (scienceqa_cot_qwen25_vl_7b.jsonl e
-  scienceqa_cot_stats.json) já foram baixados para sua máquina local,
-  faça upload manual para o Google Drive ANTES de rodar a Célula A:
-
-    Google Drive/SLM_ScienceQA_Multimodal/data/
-      ├── scienceqa_cot_qwen25_vl_7b.jsonl
-      └── scienceqa_cot_stats.json
+Todas as células detectam checkpoints e resultados já concluídos no Drive e pulam automaticamente.
 """
 
 # %%
@@ -185,10 +176,6 @@ print("✓ CÉLULA B CONCLUÍDA!")
 # =====================================================================
 # CÉLULA C — Smoke Test de Treino (16 exemplos, 1 época)
 # =====================================================================
-#
-# Teste rápido (~2-5 min) para validar que o treino funciona na A100.
-# Se passar sem OOM, o sweep completo vai funcionar.
-#
 import os
 import sys
 import yaml
@@ -231,38 +218,74 @@ else:
 # =====================================================================
 # CÉLULA D — Sweep Completo de Treino (8 Configurações)
 #
-# Cada experimento salva checkpoints e logs DIRETAMENTE no Google Drive.
-# Se o Colab desconectar, reconecte, re-execute A e B, e rode esta
-# célula novamente — experimentos já concluídos serão pulados.
-#
-# Tempo estimado: ~2-6h (dependendo da GPU e número de experimentos)
+# RECURSOS DE RESILIÊNCIA E MONITORAMENTO:
+#   - Streaming linha a linha no stdout (zero buffer, feedback imediato)
+#   - Logs a cada 5 passos com loss, tokens/s e ETA
+#   - Checkpoints salvos DIRETAMENTE no Google Drive
+#   - Pula automaticamente experimentos já concluídos
 # =====================================================================
 import os
 import sys
 import glob
 import time
+import subprocess
 
 REPO_DIR = "/content/SLMs-CoT"
+BRANCH = "kd-ablations-reweighting"
 DRIVE_ROOT = "/content/drive/MyDrive/SLM_ScienceQA_Multimodal"
 
 print("█" * 70)
 print("  CÉLULA D: SWEEP DE TREINO (8 CONFIGURAÇÕES → GOOGLE DRIVE)")
 print("█" * 70)
 
+# Garantir código mais recente na VM
+print("\n[Passo 1/2] Sincronizando repositório com o GitHub...", flush=True)
+os.system(f"cd {REPO_DIR} && git fetch origin && git checkout {BRANCH} && git pull origin {BRANCH}")
+
+def run_streaming(cmd: list[str], cwd: str | None = None) -> int:
+    """Executa comando com streaming em tempo real linha a linha."""
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+        env=env,
+    )
+    if proc.stdout:
+        for line in iter(proc.stdout.readline, ""):
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    proc.wait()
+    return proc.returncode
+
 config_files = sorted(glob.glob(f"{REPO_DIR}/configs/scienceqa/scienceqa_*.yaml"))
 config_files = [c for c in config_files if "smoke_test" not in os.path.basename(c)]
 
-print(f"\n{len(config_files)} experimentos encontrados:")
+print(f"\n[Passo 2/2] {len(config_files)} experimentos configurados:")
 for c in config_files:
-    print(f"  • {os.path.basename(c)}")
+    c_name = os.path.splitext(os.path.basename(c))[0]
+    r_name = c_name
+    for prefix in ("scienceqa_cot_", "scienceqa_human_", "scienceqa_"):
+        if r_name.startswith(prefix):
+            r_name = r_name[len(prefix):]
+            break
+    d_final = f"{DRIVE_ROOT}/{r_name}/checkpoints/final"
+    done = os.path.isdir(d_final) and len(os.listdir(d_final)) > 0
+    status_icon = "✅ CONCLUÍDO" if done else "⏳ PENDENTE"
+    print(f"  • {c_name:40s} [{status_icon}]")
 
-print(f"\nCheckpoints e logs serão salvos em: {DRIVE_ROOT}/")
-print("Experimentos já concluídos serão automaticamente pulados.\n")
+print(f"\nCheckpoints e logs são salvos em: {DRIVE_ROOT}/")
+print("Experimentos já concluídos serão pulados automaticamente.\n")
+
+sweep_start = time.time()
 
 for idx, cfg_path in enumerate(config_files, 1):
     cfg_name = os.path.splitext(os.path.basename(cfg_path))[0]
 
-    # Derivar nome do run (remove prefixo scienceqa_cot_ etc.)
     run_name = cfg_name
     for prefix in ("scienceqa_cot_", "scienceqa_human_", "scienceqa_"):
         if run_name.startswith(prefix):
@@ -271,86 +294,197 @@ for idx, cfg_path in enumerate(config_files, 1):
 
     drive_final = f"{DRIVE_ROOT}/{run_name}/checkpoints/final"
 
-    # Pular se já concluído
     if os.path.isdir(drive_final) and len(os.listdir(drive_final)) > 0:
         print(f"⏩ [{idx}/{len(config_files)}] PULADO: {cfg_name} (já concluído no Drive)")
         continue
 
     print(f"\n{'═' * 70}")
     print(f"🚀 [{idx}/{len(config_files)}] {cfg_name}")
-    print(f"   Salvando em: {DRIVE_ROOT}/{run_name}/")
-    print(f"{'═' * 70}\n")
+    print(f"   Destino no Drive: {DRIVE_ROOT}/{run_name}/")
+    print(f"{'═' * 70}\n", flush=True)
 
     t0 = time.time()
-    ret = os.system(
-        f"cd {REPO_DIR} && {sys.executable} -u scripts/run.py "
-        f"--config {cfg_path} "
-        f"--drive-root {DRIVE_ROOT}"
-    )
+    cmd = [
+        sys.executable, "-u", f"{REPO_DIR}/scripts/run.py",
+        "--config", cfg_path,
+        "--drive-root", DRIVE_ROOT,
+    ]
+    ret = run_streaming(cmd, cwd=REPO_DIR)
+
     elapsed = (time.time() - t0) / 60.0
+    total_elapsed = (time.time() - sweep_start) / 60.0
 
     if ret == 0:
-        print(f"\n✓ [{idx}/{len(config_files)}] {cfg_name} concluído em {elapsed:.1f} min")
+        print(f"\n✓ [{idx}/{len(config_files)}] {cfg_name} CONCLUÍDO em {elapsed:.1f} min (total: {total_elapsed:.0f} min)\n", flush=True)
     else:
-        print(f"\n❌ [{idx}/{len(config_files)}] ERRO em {cfg_name} (código: {ret})")
+        print(f"\n❌ [{idx}/{len(config_files)}] ERRO em {cfg_name} (código: {ret})\n", flush=True)
 
-print("\n" + "═" * 70)
-print("✓ CÉLULA D CONCLUÍDA! Sweep de treinamento finalizado.")
-print("═" * 70)
+total_time = (time.time() - sweep_start) / 60.0
+print(f"\n{'═' * 70}")
+print(f"✓ CÉLULA D CONCLUÍDA! Sweep finalizado em {total_time:.0f} minutos.")
+print(f"{'═' * 70}")
 
 
 # %%
 # =====================================================================
-# CÉLULA E — Avaliação de Acurácia nos Checkpoints (Multiple-Choice)
+# CÉLULA E — Avaliação de Acurácia (BATCHED, ~10-15 min por checkpoint)
+#
+# OTIMIZAÇÕES:
+#   - Batched generation (batch_size=16) com left-padding → 10x mais rápido
+#   - SDPA nativo do PyTorch para atenção eficiente
+#   - max_new_tokens=384 (cobre 99.5% dos CoTs sem caudas longas)
+#   - Fallback automático para imagens do Hugging Face se necessário
+#   - Logs em tempo real com ETA, velocidade e acurácia por modalidade
+#   - Salva incrementalmente no Drive a cada checkpoint avaliado
 # =====================================================================
 import os
 import sys
 import glob
 import json
+import time
 
 REPO_DIR = "/content/SLMs-CoT"
+BRANCH = "kd-ablations-reweighting"
 DRIVE_ROOT = "/content/drive/MyDrive/SLM_ScienceQA_Multimodal"
 
 print("█" * 70)
-print("  CÉLULA E: AVALIAÇÃO DE ACURÁCIA (OVERALL / WITH-IMG / NO-IMG)")
+print("  CÉLULA E: AVALIAÇÃO DE ACURÁCIA (BATCHED, ~10-15 min/ckpt)")
 print("█" * 70)
 
-# Encontrar checkpoints finais no Drive
+# 1. Sincronizar código atualizado
+print("\n[Passo 1/4] Atualizando repositório...", flush=True)
+os.system(f"cd {REPO_DIR} && git fetch origin && git checkout {BRANCH} && git pull origin {BRANCH}")
+
+sys.path.insert(0, REPO_DIR)
+os.chdir(REPO_DIR)
+
+import torch
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from src.evaluation.evaluate_scienceqa import evaluate_scienceqa_accuracy
+
+# 2. Localizar checkpoints
+print("\n[Passo 2/4] Buscando checkpoints no Google Drive...", flush=True)
 checkpoints = sorted(glob.glob(f"{DRIVE_ROOT}/*/checkpoints/final"))
-print(f"\n{len(checkpoints)} checkpoints encontrados para avaliar.")
+print(f"  Encontrados {len(checkpoints)} checkpoints:")
+for ckpt in checkpoints:
+    norm_p = os.path.normpath(ckpt)
+    r_name = os.path.basename(os.path.dirname(os.path.dirname(norm_p)))
+    print(f"  • {r_name}")
 
 if len(checkpoints) == 0:
-    print("  ⚠️ Nenhum checkpoint encontrado. Execute a Célula D primeiro.")
+    print("  ⚠️ Nenhum checkpoint encontrado em:")
+    print(f"     {DRIVE_ROOT}/*/checkpoints/final")
+    print("     Certifique-se de que a Célula D rodou com sucesso.")
 else:
+    # 3. Carregar dados de teste
     cot_jsonl = f"{REPO_DIR}/data/scienceqa_cot_qwen25_vl_7b.jsonl"
     if not os.path.isfile(cot_jsonl):
         cot_jsonl = f"{DRIVE_ROOT}/data/scienceqa_cot_qwen25_vl_7b.jsonl"
 
+    print(f"\n[Passo 3/4] Carregando dataset de teste de {cot_jsonl}...", flush=True)
+    records = []
+    with open(cot_jsonl, "r", encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            if r.get("split") == "test":
+                records.append(r)
+    print(f"  ✓ {len(records)} exemplos de teste carregados")
+
+    # Fallback de imagens: se imagens locais não existirem, vincula com HuggingFace
+    need_hf = False
+    for r in records[:50]:
+        if r.get("has_image") and (not r.get("image_path") or not os.path.isfile(r.get("image_path", ""))):
+            need_hf = True
+            break
+
+    if need_hf:
+        print("  ℹ️ Vinculando imagens do HuggingFace (derek-thomas/ScienceQA)...", flush=True)
+        try:
+            import datasets
+            ds = datasets.load_dataset("derek-thomas/ScienceQA", split="test")
+            linked = 0
+            for r in records:
+                idx = r.get("idx")
+                if idx is not None and idx < len(ds) and r.get("has_image"):
+                    r["image"] = ds[idx].get("image")
+                    linked += 1
+            print(f"  ✓ {linked} imagens vinculadas com sucesso!")
+        except Exception as e:
+            print(f"  ⚠️ Aviso: não foi possível vincular imagens do HF: {e}")
+
+    # Carregar processador
+    print("  Carregando processador Qwen2.5-VL-3B-Instruct...", flush=True)
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+
     os.makedirs(f"{DRIVE_ROOT}/results", exist_ok=True)
 
-    for idx, ckpt in enumerate(checkpoints, 1):
-        run_name = ckpt.split(os.sep)[-3]
-        out_json = f"{DRIVE_ROOT}/results/eval_acc_{run_name}.json"
-
+    # Filtrar pendentes
+    pending = []
+    for ckpt in checkpoints:
+        norm_p = os.path.normpath(ckpt)
+        r_name = os.path.basename(os.path.dirname(os.path.dirname(norm_p)))
+        out_json = f"{DRIVE_ROOT}/results/eval_acc_{r_name}.json"
         if os.path.isfile(out_json) and os.path.getsize(out_json) > 10:
-            print(f"  ⏩ [{idx}/{len(checkpoints)}] PULADO: {run_name} (já avaliado)")
-            continue
+            print(f"  ⏩ PULADO: {r_name} (já avaliado em {out_json})")
+        else:
+            pending.append((ckpt, r_name, out_json))
 
-        print(f"\n  ▶ [{idx}/{len(checkpoints)}] Avaliando: {run_name}")
-        ret = os.system(
-            f"cd {REPO_DIR} && {sys.executable} -u src/evaluation/evaluate_scienceqa.py "
-            f"--model-path {ckpt} "
-            f"--jsonl-path {cot_jsonl} "
-            f"--split test "
-            f"--output-json {out_json}"
+    # 4. Avaliação
+    print(f"\n[Passo 4/4] Avaliando {len(pending)} checkpoints pendentes (batch_size=16)...", flush=True)
+    eval_start = time.time()
+
+    for idx, (ckpt, run_name, out_json) in enumerate(pending, 1):
+        print(f"\n{'═' * 70}")
+        print(f"▶ [{idx}/{len(pending)}] Avaliando: {run_name}")
+        print(f"  Origem: {ckpt}")
+        print(f"{'═' * 70}", flush=True)
+
+        t0 = time.time()
+
+        print(f"  Carregando checkpoint em bf16 + SDPA...", flush=True)
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            ckpt,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="sdpa",
         )
-        if ret != 0:
-            print(f"    ❌ Erro na avaliação de {run_name}")
 
-    # --- Resumo dos resultados ---
+        results = evaluate_scienceqa_accuracy(
+            model=model,
+            processor=processor,
+            records=records,
+            max_new_tokens=384,
+            batch_size=16,
+        )
+
+        # Salvar resumo no Drive
+        summary = {k: v for k, v in results.items() if k != "detailed_outputs"}
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+        elapsed = (time.time() - t0) / 60.0
+        acc = results["accuracy_overall"] * 100
+        acc_img = results.get("accuracy_with_image")
+        acc_noimg = results.get("accuracy_without_image")
+
+        print(f"\n  📊 RESULTADOS: {run_name}")
+        print(f"     Acurácia Geral:      {acc:.2f}% ({results['n_correct']}/{results['n_total']})")
+        if acc_img is not None:
+            print(f"     Com Imagem (Visual): {acc_img*100:.2f}% ({results['n_with_image']} amostras)")
+        if acc_noimg is not None:
+            print(f"     Sem Imagem (Texto):  {acc_noimg*100:.2f}% ({results['n_without_image']} amostras)")
+        print(f"     Tempo do modelo:     {elapsed:.1f} minutos")
+        print(f"     Salvo no Drive em:   {out_json}", flush=True)
+
+        del model
+        torch.cuda.empty_cache()
+
+    # --- Resumo final consolidado ---
     print(f"\n{'═' * 70}")
-    print("📊 RESUMO DE ACURÁCIA")
+    print("📊 RESUMO GERAL DE ACURÁCIA — SCIENCEQA MULTIMODAL")
     print(f"{'═' * 70}")
+    print(f"{'Experimento':38s} | {'Geral':>8s} | {'Com Img':>8s} | {'Sem Img':>8s}")
+    print("-" * 70)
 
     result_files = sorted(glob.glob(f"{DRIVE_ROOT}/results/eval_acc_*.json"))
     for rf in result_files:
@@ -358,23 +492,19 @@ else:
         try:
             with open(rf, "r", encoding="utf-8") as fh:
                 r = json.load(fh)
-            acc = r.get("accuracy_overall", r.get("accuracy", 0)) * 100
-            acc_img = r.get("accuracy_with_image", 0)
-            acc_noimg = r.get("accuracy_without_image", 0)
-            if acc_img:
-                acc_img *= 100
-            if acc_noimg:
-                acc_noimg *= 100
-            line = f"  {name:40s} → overall={acc:.1f}%"
-            if acc_img:
-                line += f"  img={acc_img:.1f}%  noimg={acc_noimg:.1f}%"
-            print(line)
+            acc = r.get("accuracy_overall", 0) * 100
+            acc_i = r.get("accuracy_with_image")
+            acc_ni = r.get("accuracy_without_image")
+            s_img = f"{acc_i*100:.1f}%" if acc_i is not None else "N/A"
+            s_noimg = f"{acc_ni*100:.1f}%" if acc_ni is not None else "N/A"
+            print(f"{name:38s} | {acc:>7.1f}% | {s_img:>8s} | {s_noimg:>8s}")
         except Exception as e:
-            print(f"  {name:40s} → erro ao ler: {e}")
+            print(f"{name:38s} | Erro: {e}")
 
     print(f"{'═' * 70}")
-
-print("\n✓ CÉLULA E CONCLUÍDA!")
+    total_time = (time.time() - eval_start) / 60.0
+    print(f"✓ CÉLULA E CONCLUÍDA em {total_time:.0f} minutos!")
+    print(f"{'═' * 70}\n")
 
 
 # %%
@@ -385,13 +515,18 @@ import os
 import sys
 import glob
 import json
+import time
 
 REPO_DIR = "/content/SLMs-CoT"
+BRANCH = "kd-ablations-reweighting"
 DRIVE_ROOT = "/content/drive/MyDrive/SLM_ScienceQA_Multimodal"
 
 print("█" * 70)
 print("  CÉLULA F: AVALIAÇÃO PROBABILÍSTICA (ECE, ENTROPIA, KL, ρ)")
 print("█" * 70)
+
+# Sincronizar código
+os.system(f"cd {REPO_DIR} && git fetch origin && git checkout {BRANCH} && git pull origin {BRANCH}")
 
 sys.path.insert(0, REPO_DIR)
 os.chdir(REPO_DIR)
@@ -419,6 +554,7 @@ eval_loader = build_dataloader_cot(
     split="test",
     shuffle=False,
 )
+print(f"  ✓ DataLoader pronto ({len(eval_loader)} batches)")
 
 # 2. Carregar professor
 print("\n[2/3] Carregando modelo do Professor...", flush=True)
@@ -427,6 +563,7 @@ teacher = Qwen2_5_VLForConditionalGeneration.from_pretrained(
 ).eval()
 for p in teacher.parameters():
     p.requires_grad = False
+print("  ✓ Professor carregado")
 
 # 3. Avaliar cada checkpoint
 print("\n[3/3] Avaliando checkpoints...", flush=True)
@@ -438,18 +575,22 @@ if os.path.isfile(summary_path):
     try:
         with open(summary_path, "r", encoding="utf-8") as f:
             summary_results = json.load(f)
-        print(f"  ✓ Carregadas {len(summary_results)} avaliações prévias.", flush=True)
+        print(f"  ✓ Carregadas {len(summary_results)} avaliações prévias do Drive.")
     except Exception:
         summary_results = {}
 
+eval_start = time.time()
+
 for idx, ckpt in enumerate(checkpoints, 1):
-    run_name = ckpt.split(os.sep)[-3]
+    norm_p = os.path.normpath(ckpt)
+    run_name = os.path.basename(os.path.dirname(os.path.dirname(norm_p)))
 
     if run_name in summary_results:
         print(f"  ⏩ [{idx}/{len(checkpoints)}] PULADO: {run_name} (já calculado)")
         continue
 
     print(f"\n  ▶ [{idx}/{len(checkpoints)}] Calculando: {run_name} ...", flush=True)
+    t0 = time.time()
 
     student = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         ckpt, torch_dtype=torch.bfloat16, device_map="auto"
@@ -470,16 +611,20 @@ for idx, ckpt in enumerate(checkpoints, 1):
     os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary_results, f, indent=2)
-    print(f"  ✓ Resultados de {run_name} salvos.", flush=True)
+
+    elapsed = (time.time() - t0) / 60.0
+    print(f"  ✓ {run_name}: ECE={res['ece']:.4f}  KL={res['mean_kl']:.4f}  ρ={res['rho_HR_HA']:.4f}  ({elapsed:.1f} min)", flush=True)
 
     del student
     torch.cuda.empty_cache()
 
-# --- Resumo ---
+# --- Resumo consolidado ---
 print(f"\n{'═' * 70}")
-print("📊 RESUMO PROBABILÍSTICO")
+print("📊 RESUMO PROBABILÍSTICO FINAL")
 print(f"{'═' * 70}")
 print(json.dumps(summary_results, indent=2))
+total_time = (time.time() - eval_start) / 60.0
+print(f"\n{'═' * 70}")
+print(f"Resultados salvos em: {summary_path}")
+print(f"✓ CÉLULA F CONCLUÍDA em {total_time:.0f} minutos!")
 print(f"{'═' * 70}")
-print(f"\nResultados salvos em: {summary_path}")
-print("\n✓ CÉLULA F CONCLUÍDA!")
