@@ -230,6 +230,8 @@ def evaluate_model(
     ent_pos_cnt = torch.zeros(max_resp_pos, dtype=torch.float32, device=device)
     mp_pos_sum  = torch.zeros(max_resp_pos, dtype=torch.float32, device=device)
     mp_pos_cnt  = torch.zeros(max_resp_pos, dtype=torch.float32, device=device)
+    import time
+    t_loop_start = time.time()
 
     for batch in dataloader:
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -369,8 +371,23 @@ def evaluate_model(
                 if kl_tokens_batch is not None:
                     kl_pos_sum[rel_pos] += kl_tokens_batch[b, abs_pos].item()
                     kl_pos_cnt[rel_pos] += 1.0
-
         n_batches += 1
+
+        total_b = len(dataloader)
+        if n_batches <= 3 or n_batches % 25 == 0 or n_batches == total_b:
+            elapsed = time.time() - t_loop_start
+            s_per_b = elapsed / max(n_batches, 1)
+            rem_b = total_b - n_batches
+            eta_m = (rem_b * s_per_b) / 60.0
+            cur_kl = (total_kl / max(total_tokens, 1)) if teacher is not None else 0.0
+            cur_ent = total_entropy / max(total_tokens, 1)
+            pct = (n_batches / total_b) * 100.0
+            print(
+                f"    [Batch {n_batches:>4d}/{total_b} ({pct:>5.1f}%)] "
+                f"tokens={total_tokens:>6d} | ent={cur_ent:.3f} | kl={cur_kl:.4f} | "
+                f"vel={s_per_b:.2f}s/b | ETA={eta_m:.1f}m",
+                flush=True,
+            )
 
     # ---- Aggregate ----
     if total_tokens == 0:

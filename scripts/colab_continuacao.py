@@ -762,29 +762,35 @@ if not os.path.isfile(cot_jsonl):
     cot_jsonl = f"{DRIVE_ROOT}/data/scienceqa_cot_qwen25_vl_7b.jsonl"
 
 # 1. DataLoader de teste
-print("\n[1/3] Carregando processador e DataLoader de teste...", flush=True)
+BATCH_SIZE = 8  # Forward pass rápido com aluno 3B + professor 7B
+print(f"\n[Passo 2/4] Carregando DataLoader de teste (batch_size={BATCH_SIZE})...", flush=True)
 proc = AutoProcessor.from_pretrained(student_name)
 eval_loader = build_dataloader_cot(
     processor=proc,
     max_length=1536,
-    batch_size=4,
+    batch_size=BATCH_SIZE,
     jsonl_path=cot_jsonl,
     split="test",
     shuffle=False,
 )
-print(f"  ✓ DataLoader pronto ({len(eval_loader)} batches)")
+print(f"  ✓ DataLoader pronto ({len(eval_loader)} batches)", flush=True)
 
 # 2. Carregar professor
-print("\n[2/3] Carregando modelo do Professor...", flush=True)
+print(f"\n[Passo 3/4] Carregando Professor ({teacher_name}) em bf16 + SDPA...", flush=True)
 teacher = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    teacher_name, torch_dtype=torch.bfloat16, device_map="auto"
+    teacher_name,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    attn_implementation="sdpa",
 ).eval()
 for p in teacher.parameters():
     p.requires_grad = False
-print("  ✓ Professor carregado")
+
+vram_teacher = torch.cuda.memory_allocated() / (1024**3)
+print(f"  ✓ Professor carregado na GPU (VRAM usada: {vram_teacher:.1f} GB)", flush=True)
 
 # 3. Avaliar cada checkpoint
-print("\n[3/3] Avaliando checkpoints...", flush=True)
+print("\n[Passo 4/4] Buscando checkpoints no Google Drive...", flush=True)
 checkpoints = sorted(glob.glob(f"{DRIVE_ROOT}/*/checkpoints/final"))
 summary_path = f"{DRIVE_ROOT}/results/probabilistic_summary.json"
 
@@ -797,21 +803,31 @@ if os.path.isfile(summary_path):
     except Exception:
         summary_results = {}
 
+pending = []
+for ckpt in checkpoints:
+    norm_p = os.path.normpath(ckpt)
+    r_name = os.path.basename(os.path.dirname(os.path.dirname(norm_p)))
+    if r_name in summary_results:
+        print(f"  ⏩ PULADO: {r_name} (já calculado)")
+    else:
+        pending.append((ckpt, r_name))
+
+print(f"\nIniciando avaliação de {len(pending)} checkpoints pendentes...\n", flush=True)
 eval_start = time.time()
 
-for idx, ckpt in enumerate(checkpoints, 1):
-    norm_p = os.path.normpath(ckpt)
-    run_name = os.path.basename(os.path.dirname(os.path.dirname(norm_p)))
+for idx, (ckpt, run_name) in enumerate(pending, 1):
+    print(f"{'═' * 70}")
+    print(f"▶ [{idx}/{len(pending)}] Avaliando Calibração e Incerteza: {run_name}")
+    print(f"  Origem: {ckpt}")
+    print(f"{'═' * 70}", flush=True)
 
-    if run_name in summary_results:
-        print(f"  ⏩ [{idx}/{len(checkpoints)}] PULADO: {run_name} (já calculado)")
-        continue
-
-    print(f"\n  ▶ [{idx}/{len(checkpoints)}] Calculando: {run_name} ...", flush=True)
     t0 = time.time()
 
     student = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        ckpt, torch_dtype=torch.bfloat16, device_map="auto"
+        ckpt,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="sdpa",
     ).eval()
 
     cfg_eval = {"max_length": 1536}
@@ -831,18 +847,38 @@ for idx, ckpt in enumerate(checkpoints, 1):
         json.dump(summary_results, f, indent=2)
 
     elapsed = (time.time() - t0) / 60.0
-    print(f"  ✓ {run_name}: ECE={res['ece']:.4f}  KL={res['mean_kl']:.4f}  ρ={res['rho_HR_HA']:.4f}  ({elapsed:.1f} min)", flush=True)
+    ece_img = res.get("modality_with_image", {}).get("ece", 0.0)
+    ece_noimg = res.get("modality_without_image", {}).get("ece", 0.0)
+
+    print(f"\n  📊 RESULTADOS: {run_name}")
+    print(f"     ECE Geral (Erro de Calibração): {res['ece']:.4f}")
+    print(f"     ECE Com Imagem:                 {ece_img:.4f}")
+    print(f"     ECE Sem Imagem:                 {ece_noimg:.4f}")
+    print(f"     KL Divergence (vs Professor):   {res['mean_kl']:.4f}")
+    print(f"     Entropia Média (Incerteza):     {res['mean_entropy']:.4f}")
+    print(f"     Correlação ρ(HR, HA):           {res['rho_HR_HA']:.4f}")
+    print(f"     Tempo do modelo:                {elapsed:.1f} minutos")
+    print(f"     Salvo no Drive em:              {summary_path}\n", flush=True)
 
     del student
     torch.cuda.empty_cache()
 
-# --- Resumo consolidado ---
+# --- Resumo Consolidado em Tabela ---
 print(f"\n{'═' * 70}")
-print("📊 RESUMO PROBABILÍSTICO FINAL")
+print("📊 RESUMO GERAL DE CALIBRAÇÃO E INCERTEZA (SCIENCEQA)")
 print(f"{'═' * 70}")
-print(json.dumps(summary_results, indent=2))
+print(f"{'Experimento':32s} | {'ECE (Geral)':>11s} | {'ECE (Img)':>10s} | {'KL Div':>8s} | {'Entropia':>8s}")
+print("-" * 75)
+
+for name, s in summary_results.items():
+    ece_g = f"{s.get('ece', 0.0):.4f}"
+    ece_i = f"{s.get('with_image_ece', 0.0):.4f}" if s.get('with_image_ece') is not None else "N/A"
+    kl_v = f"{s.get('mean_kl', 0.0):.4f}" if s.get('mean_kl') is not None else "N/A"
+    ent_v = f"{s.get('mean_entropy', 0.0):.4f}"
+    print(f"{name:32s} | {ece_g:>11s} | {ece_i:>10s} | {kl_v:>8s} | {ent_v:>8s}")
+
+print(f"{'═' * 70}")
 total_time = (time.time() - eval_start) / 60.0
-print(f"\n{'═' * 70}")
 print(f"Resultados salvos em: {summary_path}")
 print(f"✓ CÉLULA F CONCLUÍDA em {total_time:.0f} minutos!")
-print(f"{'═' * 70}")
+print(f"{'═' * 70}\n")
