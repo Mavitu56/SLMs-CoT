@@ -5,7 +5,7 @@
 #
 # RECURSOS:
 #   - Logs a cada 25 batches com tokens avaliados, KL, Entropia e ETA
-#   - Batch size 8 para forward pass rápido (aluno 3B + professor 7B em bf16)
+#   - Batch size 2 para estabilidade total de VRAM (aluno 3B + professor 7B juntos)
 #   - Pula automaticamente checkpoints que já foram avaliados
 #   - Salva incrementalmente no Google Drive após cada checkpoint
 #   - Tabela comparativa final consolidada de calibração e incerteza
