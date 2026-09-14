@@ -249,23 +249,28 @@ def evaluate_model(
         # ---- Student forward ----
         s_out = student(**fwd_kwargs)
         s_logits = s_out.logits.detach()
+        del s_out
 
         # ---- Teacher forward (if available) ----
         t_logits = None
         if teacher is not None:
             t_out = teacher(**fwd_kwargs)
             t_logits = t_out.logits.detach()
+            del t_out
             t_logits, s_logits = _align_vocab(t_logits, s_logits)
 
         # ---- Causal shift ----
         shift_s, shift_labels, valid_mask = shift_for_causal_lm(
             s_logits, batch["labels"], batch["attention_mask"],
         )
+        del s_logits
+
         shift_t = None
         if t_logits is not None:
             shift_t, _, _ = shift_for_causal_lm(
                 t_logits, batch["labels"], batch["attention_mask"],
             )
+            del t_logits
 
         # Shift region_ids the same way (drop first, keep [1:])
         has_regions = "region_ids" in batch
@@ -275,33 +280,55 @@ def evaluate_model(
 
         n_valid = int(valid_mask.sum().item())
         if n_valid == 0:
+            del shift_s
+            if shift_t is not None:
+                del shift_t
             continue
 
         # ---- Sequence count & average length ----
         total_sequences  += batch["input_ids"].shape[0]
         total_seq_length += int(batch["attention_mask"].sum().item())
 
-        # ---- Compute probs/preds once — reused for global and per-region ECE ----
-        _probs           = F.softmax(shift_s.float(), dim=-1)    # [B, L-1, V]
-        _max_prob, _preds = _probs.max(dim=-1)                    # [B, L-1]
+        # ---- Compute token-level distributions and free 3D tensors immediately ----
+        s_f32 = shift_s.float()
+        logp_s = F.log_softmax(s_f32, dim=-1)
+        del s_f32, shift_s
+
+        p_s = logp_s.exp()
+        ent_tokens = (-(p_s * logp_s).sum(dim=-1)).clamp_min(0.0)      # [B, L-1]
+        del p_s
+
+        maxprob_tokens, preds = logp_s.max(dim=-1)                     # [B, L-1]
+        maxprob_tokens = maxprob_tokens.exp()
+
+        safe_labels = shift_labels.clamp_min(0).unsqueeze(-1)
+        nll_tokens = -logp_s.gather(dim=-1, index=safe_labels).squeeze(-1)  # [B, L-1]
+
+        kl_tokens = None
+        if shift_t is not None:
+            t_f32 = shift_t.float()
+            del shift_t
+            p_t = F.softmax(t_f32, dim=-1)
+            del t_f32
+            logp_t = torch.log(p_t.clamp_min(1e-8))
+            kl_tokens = (p_t * (logp_t - logp_s)).sum(dim=-1).clamp_min(0.0)  # [B, L-1]
+            del p_t, logp_t
+
+        del logp_s  # ALL 3D VOCABULARY TENSORS FREED!
 
         # ---- Global scalar metrics ----
-        batch_entropy = mean_entropy(shift_s, valid_mask).item()
-        batch_maxprob = mean_max_probability(shift_s, valid_mask).item()
-        batch_nll     = mean_nll(shift_s, shift_labels, valid_mask).item()
-
-        total_entropy += batch_entropy * n_valid
-        total_maxprob += batch_maxprob * n_valid
-        total_nll     += batch_nll     * n_valid
+        valid_f = valid_mask.float()
+        total_entropy += (ent_tokens * valid_f).sum().item()
+        total_maxprob += (maxprob_tokens * valid_f).sum().item()
+        total_nll     += (nll_tokens * valid_f).sum().item()
         total_tokens  += n_valid
 
         # Accumulate confidence and correctness for global ECE
-        all_conf.append(_max_prob[valid_mask].cpu())
-        all_correct.append((_preds[valid_mask] == shift_labels[valid_mask]).float().cpu())
+        all_conf.append(maxprob_tokens[valid_mask].cpu())
+        all_correct.append((preds[valid_mask] == shift_labels[valid_mask]).float().cpu())
 
-        if shift_t is not None:
-            batch_kl = mean_kl(shift_t, shift_s, valid_mask).item()
-            total_kl += batch_kl * n_valid
+        if kl_tokens is not None:
+            total_kl += (kl_tokens * valid_f).sum().item()
 
         # ---- Per-region scalar metrics ----
         if has_regions and shifted_region_ids is not None:
@@ -310,16 +337,17 @@ def evaluate_model(
                 rn = int(rmask.sum().item())
                 if rn == 0:
                     continue
+                rmask_f = rmask.float()
                 racc = region_acc[rid]
-                racc["entropy"] += mean_entropy(shift_s, rmask).item() * rn
-                racc["maxprob"] += mean_max_probability(shift_s, rmask).item() * rn
-                racc["nll"]     += mean_nll(shift_s, shift_labels, rmask).item() * rn
+                racc["entropy"]  += (ent_tokens * rmask_f).sum().item()
+                racc["maxprob"]  += (maxprob_tokens * rmask_f).sum().item()
+                racc["nll"]      += (nll_tokens * rmask_f).sum().item()
                 racc["n_tokens"] += rn
-                if shift_t is not None:
-                    racc["kl"] += mean_kl(shift_t, shift_s, rmask).item() * rn
+                if kl_tokens is not None:
+                    racc["kl"]   += (kl_tokens * rmask_f).sum().item()
                 # Accumulate per-region ECE data
-                region_conf[rid].append(_max_prob[rmask].cpu())
-                region_correct[rid].append((_preds[rmask] == shift_labels[rmask]).float().cpu())
+                region_conf[rid].append(maxprob_tokens[rmask].cpu())
+                region_correct[rid].append((preds[rmask] == shift_labels[rmask]).float().cpu())
 
         # ---- Per-modality scalar metrics (with-image vs without-image) ----
         if "has_image" in batch:
@@ -330,29 +358,19 @@ def evaluate_model(
                 bn = int(b_mask.sum().item())
                 if bn == 0:
                     continue
+                b_mask_f = b_mask.float()
                 macc = modality_acc[mkey]
-                macc["entropy"] += mean_entropy(shift_s[b:b+1], b_mask).item() * bn
-                macc["maxprob"] += mean_max_probability(shift_s[b:b+1], b_mask).item() * bn
-                macc["nll"]     += mean_nll(shift_s[b:b+1], shift_labels[b:b+1], b_mask).item() * bn
+                macc["entropy"]  += (ent_tokens[b:b+1] * b_mask_f).sum().item()
+                macc["maxprob"]  += (maxprob_tokens[b:b+1] * b_mask_f).sum().item()
+                macc["nll"]      += (nll_tokens[b:b+1] * b_mask_f).sum().item()
                 macc["n_tokens"] += bn
-                if shift_t is not None:
-                    macc["kl"] += mean_kl(shift_t[b:b+1], shift_s[b:b+1], b_mask).item() * bn
-                modality_conf[mkey].append(_max_prob[b:b+1][b_mask].cpu())
-                modality_correct[mkey].append((_preds[b:b+1][b_mask] == shift_labels[b:b+1][b_mask]).float().cpu())
+                if kl_tokens is not None:
+                    macc["kl"]   += (kl_tokens[b:b+1] * b_mask_f).sum().item()
+                modality_conf[mkey].append(maxprob_tokens[b:b+1][b_mask].cpu())
+                modality_correct[mkey].append((preds[b:b+1][b_mask] == shift_labels[b:b+1][b_mask]).float().cpu())
 
         # ---- Per-position curves (response-relative indexing) ----
-        B_cur = shift_s.size(0)
-
-        # Compute per-token values once for the whole batch (GPU)
-        ent_tokens = token_entropy(shift_s)            # [B, L_cur]
-        mp_tokens  = token_max_probability(shift_s)    # [B, L_cur]
-        kl_tokens_batch = None
-        if shift_t is not None:
-            p_t = F.softmax(shift_t.float(), dim=-1)
-            logp_t = torch.log(p_t.clamp_min(1e-8))
-            logp_s = F.log_softmax(shift_s.float(), dim=-1)
-            kl_tokens_batch = (p_t * (logp_t - logp_s)).sum(dim=-1).clamp_min(0.0)
-
+        B_cur = ent_tokens.size(0)
         for b in range(B_cur):
             sample_mask = valid_mask[b]
             valid_positions = sample_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -366,11 +384,15 @@ def evaluate_model(
                     break
                 ent_pos_sum[rel_pos] += ent_tokens[b, abs_pos].item()
                 ent_pos_cnt[rel_pos] += 1.0
-                mp_pos_sum[rel_pos]  += mp_tokens[b, abs_pos].item()
+                mp_pos_sum[rel_pos]  += maxprob_tokens[b, abs_pos].item()
                 mp_pos_cnt[rel_pos]  += 1.0
-                if kl_tokens_batch is not None:
-                    kl_pos_sum[rel_pos] += kl_tokens_batch[b, abs_pos].item()
+                if kl_tokens is not None:
+                    kl_pos_sum[rel_pos] += kl_tokens[b, abs_pos].item()
                     kl_pos_cnt[rel_pos] += 1.0
+
+        del ent_tokens, maxprob_tokens, preds, nll_tokens
+        if kl_tokens is not None:
+            del kl_tokens
         n_batches += 1
 
         total_b = len(dataloader)
@@ -521,7 +543,7 @@ def evaluate_model(
         print(f"  Mean KL(T||S)    : {results['mean_kl']:.6f}")
     print(f"  ECE              : {results['ece']:.6f}")
     if results["rho_HR_HA"] is not None:
-        print(f"  ρ = H_R / H_A    : {results['rho_HR_HA']:.6f}")
+        print(f"  rho = H_R / H_A  : {results['rho_HR_HA']:.6f}")
 
     # Region breakdown
     for rname, rkey in [("Prompt",    "region_prompt"),

@@ -734,6 +734,7 @@ import sys
 import glob
 import json
 import time
+import gc
 
 REPO_DIR = "/content/SLMs-CoT"
 BRANCH = "kd-ablations-reweighting"
@@ -762,7 +763,9 @@ if not os.path.isfile(cot_jsonl):
     cot_jsonl = f"{DRIVE_ROOT}/data/scienceqa_cot_qwen25_vl_7b.jsonl"
 
 # 1. DataLoader de teste
-BATCH_SIZE = 8  # Forward pass rápido com aluno 3B + professor 7B
+# BATCH_SIZE=2 evita OOM quando Professor (7B) e Aluno (3B) estão juntos na VRAM
+# e reduz tensores float32 de 152k tokens de 7.5GB para 1.8GB por tensor.
+BATCH_SIZE = 2
 print(f"\n[Passo 2/4] Carregando DataLoader de teste (batch_size={BATCH_SIZE})...", flush=True)
 proc = AutoProcessor.from_pretrained(student_name)
 eval_loader = build_dataloader_cot(
@@ -872,6 +875,7 @@ for idx, (ckpt, run_name) in enumerate(pending, 1):
     print(f"     Salvo no Drive em:              {summary_path}\n", flush=True)
 
     del student
+    gc.collect()
     torch.cuda.empty_cache()
 
 # --- Resumo Consolidado em Tabela ---
