@@ -130,16 +130,27 @@ for idx, (ckpt, run_name) in enumerate(pending, 1):
         json.dump(summary_results, f, indent=2)
 
     elapsed = (time.time() - t0) / 60.0
-    ece_img = res.get("modality_with_image", {}).get("ece", 0.0)
-    ece_noimg = res.get("modality_without_image", {}).get("ece", 0.0)
+    ece_val = res.get("ece")
+    ece_img = res.get("modality_with_image", {}).get("ece") if res.get("modality_with_image") else None
+    ece_noimg = res.get("modality_without_image", {}).get("ece") if res.get("modality_without_image") else None
+    kl_val = res.get("mean_kl")
+    ent_val = res.get("mean_entropy")
+    rho_val = res.get("rho_HR_HA")
+
+    s_ece = f"{ece_val:.4f}" if ece_val is not None else "N/A"
+    s_ece_img = f"{ece_img:.4f}" if ece_img is not None else "N/A"
+    s_ece_noimg = f"{ece_noimg:.4f}" if ece_noimg is not None else "N/A"
+    s_kl = f"{kl_val:.4f}" if kl_val is not None else "N/A"
+    s_ent = f"{ent_val:.4f}" if ent_val is not None else "N/A"
+    s_rho = f"{rho_val:.4f}" if rho_val is not None else "N/A"
 
     print(f"\n  📊 RESULTADOS: {run_name}")
-    print(f"     ECE Geral (Erro de Calibração): {res['ece']:.4f}")
-    print(f"     ECE Com Imagem:                 {ece_img:.4f}")
-    print(f"     ECE Sem Imagem:                 {ece_noimg:.4f}")
-    print(f"     KL Divergence (vs Professor):   {res['mean_kl']:.4f}")
-    print(f"     Entropia Média (Incerteza):     {res['mean_entropy']:.4f}")
-    print(f"     Correlação ρ(HR, HA):           {res['rho_HR_HA']:.4f}")
+    print(f"     ECE Geral (Erro de Calibração): {s_ece}")
+    print(f"     ECE Com Imagem:                 {s_ece_img}")
+    print(f"     ECE Sem Imagem:                 {s_ece_noimg}")
+    print(f"     KL Divergence (vs Professor):   {s_kl}")
+    print(f"     Entropia Média (Incerteza):     {s_ent}")
+    print(f"     Correlação ρ(HR, HA):           {s_rho}")
     print(f"     Tempo do modelo:                {elapsed:.1f} minutos")
     print(f"     Salvo no Drive em:              {summary_path}\n", flush=True)
 
@@ -154,10 +165,10 @@ print(f"{'Experimento':32s} | {'ECE (Geral)':>11s} | {'ECE (Img)':>10s} | {'KL D
 print("-" * 75)
 
 for name, s in summary_results.items():
-    ece_g = f"{s.get('ece', 0.0):.4f}"
-    ece_i = f"{s.get('with_image_ece', 0.0):.4f}" if s.get('with_image_ece') is not None else "N/A"
-    kl_v = f"{s.get('mean_kl', 0.0):.4f}" if s.get('mean_kl') is not None else "N/A"
-    ent_v = f"{s.get('mean_entropy', 0.0):.4f}"
+    ece_g = f"{s.get('ece'):.4f}" if s.get('ece') is not None else "N/A"
+    ece_i = f"{s.get('with_image_ece'):.4f}" if s.get('with_image_ece') is not None else "N/A"
+    kl_v = f"{s.get('mean_kl'):.4f}" if s.get('mean_kl') is not None else "N/A"
+    ent_v = f"{s.get('mean_entropy'):.4f}" if s.get('mean_entropy') is not None else "N/A"
     print(f"{name:32s} | {ece_g:>11s} | {ece_i:>10s} | {kl_v:>8s} | {ent_v:>8s}")
 
 print(f"{'═' * 70}")

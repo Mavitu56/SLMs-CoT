@@ -504,6 +504,28 @@ def build_dataloader_cot(
     if micro_overfit_n is not None:
         records = records[:micro_overfit_n]
 
+    # Check if local image files exist on disk; if not, link with HuggingFace dataset
+    need_hf = False
+    for r in records[:50]:
+        if r.get("has_image") and (not r.get("image_path") or not os.path.isfile(r.get("image_path", ""))):
+            need_hf = True
+            break
+
+    if need_hf:
+        print(f"[data] Imagens locais não encontradas no disco. Vinculando imagens do HuggingFace (derek-thomas/ScienceQA split={split})...", flush=True)
+        try:
+            import datasets
+            ds = datasets.load_dataset("derek-thomas/ScienceQA", split=split)
+            linked = 0
+            for r in records:
+                idx = r.get("idx")
+                if idx is not None and idx < len(ds) and r.get("has_image"):
+                    r["image"] = ds[idx].get("image")
+                    linked += 1
+            print(f"[data] ✓ {linked} imagens vinculadas com sucesso ao split {split}!", flush=True)
+        except Exception as e:
+            print(f"[data] ⚠️ Não foi possível vincular imagens do HF: {e}", flush=True)
+
     print(
         f"[data] ScienceQA CoT split={split}: {len(records)} records loaded "
         f"(total_in_file={n_total}, dropped_no_sep={n_dropped_sep}, "
